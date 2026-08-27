@@ -367,8 +367,14 @@ class BacktestEngine:
     def find_entry_snapshot(self, day_df: pd.DataFrame):
         """Returns every option-chain row (all strikes/types) at the first
         trade_time >= entry_time. This is the full chain snapshot every
-        leg picks its strike from, so all legs enter at the same instant."""
-        candidate_times = day_df.loc[day_df["trade_time"] >= self.entry_time, "trade_time"]
+        leg picks its strike from, so all legs enter at the same instant.
+        Bounded by exit_time so special sessions outside the strategy's
+        window (e.g. the evening Muhurat session on 2024-11-01, bars
+        18:01-19:00) never produce an entry that has no exit bar."""
+        candidate_times = day_df.loc[
+            (day_df["trade_time"] >= self.entry_time) & (day_df["trade_time"] <= self.exit_time),
+            "trade_time",
+        ]
         if candidate_times.empty:
             return None
         first_time = candidate_times.min()
@@ -394,7 +400,11 @@ class BacktestEngine:
 
                 leg_result = self.evaluate_leg_exit(effective_leg_meta, leg_result, day_df)
                 leg_result["quantity_multiplier"] = QUANTITY * lot_size
-                leg_result["pnl"] = round((leg_result["exit_price"] - leg_result["entry_price"]) * QUANTITY * lot_size * (1 if effective_leg_meta["position_type"] == "BUY" else -1), 2)
+                if leg_result.get("status") == "EXIT_DONE":
+                    leg_result["pnl"] = round((leg_result["exit_price"] - leg_result["entry_price"]) * QUANTITY * lot_size * (1 if effective_leg_meta["position_type"] == "BUY" else -1), 2)
+                else:
+                    # e.g. OPEN_NO_EXIT_SIGNAL -- no exit bar exists, so no pnl
+                    leg_result["pnl"] = None
                 leg_result["is_reentry"] = False
                 leg_result["reentry_mode"] = None
                 result["legs"].append(leg_result)
