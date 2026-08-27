@@ -1,4 +1,4 @@
-from src.core.modules import np
+from src.core.modules import np, datetime
 
 class BacktestReportBuilder:
     """Builds summary_report_result + monthly_state_result from a
@@ -49,6 +49,17 @@ class BacktestReportBuilder:
             {"reportType": "Tradewise", "summaryReport": self._build_summary_block(trade_pnls, trade_dates, "Trades")},
         ]
 
+    @staticmethod
+    def _as_date(value):
+        """Trade results reach this builder either fresh from the engine
+        (datetime.date / pd.Timestamp) or from a cached, JSON-sanitized run
+        ('YYYY-MM-DD' / 'YYYY-MM-DD HH:MM:SS' strings) -- normalize both to
+        a datetime.date so the date arithmetic below works either way."""
+        if isinstance(value, str):
+            return datetime.strptime(value[:10], "%Y-%m-%d").date()
+        date_method = getattr(value, "date", None)
+        return date_method() if callable(date_method) else value
+
     def _collect_daily_pnls(self):
         """One combined pnl number per trading day (sum of that day's leg
         pnls), skipping days where nothing actually executed."""
@@ -58,7 +69,7 @@ class BacktestReportBuilder:
             if not day_pnls:
                 continue
             pnls.append(sum(day_pnls))
-            dates.append(day_result["trade_date"])
+            dates.append(self._as_date(day_result["trade_date"]))
         return pnls, dates
 
     def _build_monthly_state_result(self) -> list[dict]:
@@ -107,7 +118,7 @@ class BacktestReportBuilder:
                     continue
                 entry_dt = leg.get("entry_datetime")
                 pnls.append(leg["pnl"])
-                dates.append(entry_dt.date() if entry_dt is not None else day_result["trade_date"])
+                dates.append(self._as_date(entry_dt if entry_dt is not None else day_result["trade_date"]))
         return pnls, dates
 
     def _build_summary_block(self, pnls: list, dates: list, unit: str) -> dict:

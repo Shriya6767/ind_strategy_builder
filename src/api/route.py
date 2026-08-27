@@ -78,19 +78,17 @@ async def compare_backtest(request: dict):
 @router.post("/load-data")
 def load_data(request: LoadDataRequest):
     try:
-        loader = DataLoader(dte_type=request.dte_type)
+        loader = DataLoader(symbol=request.symbol)
         rows = loader.load(request.start_date, request.end_date)
         return {
             "success": True,
             "message": "Data loaded successfully.",
             "data": {
                 "symbol": request.symbol,
-                "dte_type": request.dte_type,
                 "rows": rows,
                 "date_range": f"{request.start_date} to {request.end_date}",
             }
         }
-
     except Exception as e:
         logger.exception(f"Failed to load data: {e}")
         raise HTTPException(
