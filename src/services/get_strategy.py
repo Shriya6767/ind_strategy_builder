@@ -270,6 +270,18 @@ class GetStrategyService:
         }
 
     @staticmethod
+    def _normalize_expiry_type(raw):
+        """Legacy SPX-era rows stored '0dte'/'1dte'; the Sensex engine takes
+        weekly / next weekly / monthly / next monthly. Old Ndte values (and
+        NULL) map to 'weekly' -- the nearest-expiry equivalent -- so
+        strategies saved before the migration still run."""
+        if not raw:
+            return "weekly"
+        if str(raw).strip().lower().endswith("dte"):
+            return "weekly"
+        return raw
+
+    @staticmethod
     def _normalize_leg(row):
         v = GetStrategyService._v
         return {
@@ -278,7 +290,7 @@ class GetStrategyService:
             "lot_size": v(row, "lot_size", int, 0),
             "position_type": v(row, "position_type", str, "BUY"),
             "option_type": v(row, "option_type", str, "call"),
-            "expiry_type": v(row, "expiry_type", str, "0dte"),
+            "expiry_type": GetStrategyService._normalize_expiry_type(v(row, "expiry_type", str)),
             "strike_criteria": v(row, "strike_criteria", str, "strike_type"),
              "atm_strike": v(row, "atm_strike", str, "0"),
             "strike_sign": v(row, "strike_sign", str, ""),

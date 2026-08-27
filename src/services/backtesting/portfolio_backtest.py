@@ -45,9 +45,9 @@ class PortfolioBacktestService:
 
         strategies = self._expand_strategies(overrides, start_date, end_date)
 
-        df_by_dte_type = self._load_dataframes(strategies, start_date, end_date)
+        df = self._load_dataframe(start_date, end_date)
 
-        results_by_id = self._run_strategies_in_parallel(strategies, df_by_dte_type)
+        results_by_id = self._run_strategies_in_parallel(strategies, df)
         failures = {sid: r["error"] for sid, r in results_by_id.items() if not r["ok"]}
         if failures:
             raise RuntimeError(f"Portfolio backtest failed for strategies: {failures}")
@@ -90,27 +90,12 @@ class PortfolioBacktestService:
 
 
     @staticmethod
-    def _resolve_dte_type(strategy_request: dict) -> str:
-        dte_filter = strategy_request["strategy"].get("dte_filter", 0)
-        dte_type = f"{dte_filter}dte"
-        if dte_type not in ("0dte", "1dte"):
-            raise ValueError(
-                f"strategy_id {strategy_request['strategy']['strategy_id']}: "
-                f"dte_filter={dte_filter!r} doesn't map to a supported dataset (0 or 1)."
-            )
-        return dte_type
-
-
-    @classmethod
-    def _load_dataframes(cls, strategies: list, start_date: str, end_date: str) -> dict:
-        dte_types_needed = {cls._resolve_dte_type(s) for s in strategies}
-
-        df_by_dte_type = {}
-        for dte_type in dte_types_needed:
-            loader = DataLoader(dte_type=dte_type)
-            loader.load(start_date, end_date)  # side effect: DataStore.set_df(df)
-            df_by_dte_type[dte_type] = DataStore.get_df()
-        return df_by_dte_type
+    def _load_dataframe(start_date: str, end_date: str):
+        """One load serves every strategy: each Sensex daily file carries
+        every live expiry, and legs pick their contract per expiry_type
+        (weekly / next weekly / monthly / next monthly) inside the engine."""
+        DataLoader().load(start_date, end_date)  # side effect: DataStore.set_df(df)
+        return DataStore.get_df()
 
 
     @staticmethod
@@ -144,14 +129,13 @@ class PortfolioBacktestService:
         return expanded
 
 
-    def _run_strategies_in_parallel(self, strategies: list[dict], df_by_dte_type: dict) -> dict:
+    def _run_strategies_in_parallel(self, strategies: list[dict], df) -> dict:
         max_workers = min(len(strategies), mp.cpu_count())
         results_by_id = {}
         with ProcessPoolExecutor(max_workers=max_workers, mp_context=_FORK_CTX) as pool:
             futures = {}
             for s in strategies:
                 sid = s["strategy"]["strategy_id"]
-                df = df_by_dte_type[self._resolve_dte_type(s)]
                 futures[pool.submit(_run_single_strategy, df, s)] = sid
             for future in as_completed(futures):
                 result = future.result()
@@ -169,7 +153,7 @@ class PortfolioBacktestService:
 
         filtered_trade_results = [
             day for day in output["trade_results"]
-            if day["trade_date"].weekday() in weekday_indices
+            if BacktestReportBuilder._as_date(day["trade_date"]).weekday() in weekday_indices
         ]
         report = BacktestReportBuilder(filtered_trade_results).build()
         return {**output, "trade_results": filtered_trade_results, **report}
@@ -177,13 +161,21 @@ class PortfolioBacktestService:
 
     @staticmethod
     def _apply_dte_filter(output: dict, period_selection: dict) -> dict:
+        """Keeps only trading days whose traded contract had the selected
+        days-to-expiry at entry (0 = entered on expiry day, 1 = the day
+        before, ...). Sensex results carry no dte column -- it's derived per
+        day from the first executed leg: expiration_date - entry date."""
         selected = period_selection.get("dte_selected")
-        selected_dtes = set(selected) if isinstance(selected, list) else {selected}
-        
+        selected_dtes = {int(v) for v in (selected if isinstance(selected, list) else [selected])}
+
+        as_date = BacktestReportBuilder._as_date
+
         def _day_dte(day_result):
             for leg in day_result["legs"]:
-                if leg.get("dte") is not None:
-                    return leg["dte"]
+                if leg.get("entry_price") is None or leg.get("expiration_date") is None:
+                    continue
+                entry_date = as_date(leg.get("entry_datetime") or day_result["trade_date"])
+                return (as_date(leg["expiration_date"]) - entry_date).days
             return None
 
         filtered_trade_results = [
@@ -211,6 +203,9 @@ class PortfolioBacktestService:
                 mode = period_selection.get("mode")
                 if mode == "weekdays":
                     output = self._apply_weekday_filter(output, period_selection)
+                # mode == "dte" is deliberately a pass-through: the engine's
+                # per-leg expiry_type already decides which contract trades,
+                # so the strategy result is returned unfiltered.
 
             slippage_percent = override.get("slippage_percent", 0)
             if slippage_percent:

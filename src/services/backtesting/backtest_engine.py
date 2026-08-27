@@ -1,4 +1,4 @@
-from src.core.modules import pd, np, datetime, timedelta, dt_time
+from src.core.modules import pd, np, datetime, date, timedelta, dt_time
 from src.core.constant import REENTRY_MODES, OVERALL_REENTRY_MODES, QUANTITY, COST_BUFFER_PCT
 from src.core.logger import get_logger
 from src.services.backtesting.report_builder import BacktestReportBuilder
@@ -7,9 +7,12 @@ from enum import Enum
 logger = get_logger(__name__)
 
 def _sanitize(obj):
-    """Recursively replaces NaN/NaT/np.nan floats with None so the result
-    is always JSON-serializable (json.dumps rejects NaN by default, which
-    is what was causing the 500 error)."""
+    """Recursively replaces NaN/NaT/np.nan floats with None and formats
+    every datetime as a plain string so the result is always
+    JSON-serializable, with no ISO 'T' or timezone suffix in the response:
+      datetimes  -> 'YYYY-MM-DD HH:MM:SS'  (IST wall-clock)
+      dates and midnight-only datetimes (expiration_date) -> 'YYYY-MM-DD'
+    """
     if isinstance(obj, dict):
         return {k: _sanitize(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -20,16 +23,27 @@ def _sanitize(obj):
         return None if np.isnan(obj) else float(obj)
     if isinstance(obj, np.integer):
         return int(obj)
-    if isinstance(obj, pd.Timestamp) and pd.isna(obj):
-        return None
+    if isinstance(obj, (pd.Timestamp, datetime)):
+        if pd.isna(obj):
+            return None
+        if obj.tzinfo is not None:
+            # tz-aware timestamps hold IST wall-clock -- drop the tz, keep the clock
+            obj = obj.tz_localize(None) if isinstance(obj, pd.Timestamp) else obj.replace(tzinfo=None)
+        if obj.hour == 0 and obj.minute == 0 and obj.second == 0:
+            return obj.strftime("%Y-%m-%d")
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(obj, date):
+        return obj.isoformat()
     return obj
     
 
 class BacktestEngine:
-    # BTST Day-1 cutoff default
-    _DEFAULT_DAY1_MARKET_CLOSE = "20:00:00"
-    # BTST Day-2 market open default
-    _DEFAULT_DAY2_MARKET_OPEN = "13:30:00"
+    # Sensex session is 09:15-15:30 IST. Bars are labeled by their
+    # COMPLETION minute (the 09:15:00-09:15:59 candle is stamped 09:16:00),
+    # so labels run 09:16:00-15:30:00. BTST Day-1 monitoring runs until the
+    # close; Day-2 carryover handling starts from the first completed bar.
+    _DEFAULT_DAY1_MARKET_CLOSE = "15:30:00"
+    _DEFAULT_DAY2_MARKET_OPEN = "09:16:00"
 
     def __init__(self, df: pd.DataFrame, request: dict):
         self.df = df.copy()
@@ -39,9 +53,7 @@ class BacktestEngine:
 
         self.strategy_type = self.strategy.get("strategy_type", "intraday").lower()
 
-        # BTST validation (only for BTST mode)
         if self.strategy_type == "btst":
-            self._validate_btst_configuration()
             self.held_from_previous_day = {}  # Positions held overnight
 
         self.entry_time = self._parse_entry_time()
@@ -61,18 +73,7 @@ class BacktestEngine:
         self._range_cache = {}
         self._ticker_series_cache = {}
         self._underlying_series_cache = None
-
-
-    def _validate_btst_configuration(self):
-        """Validate that BTST strategies only use 1DTE (not 0DTE)."""
-        for leg in self.legs:
-            expiry_type = str(leg.get("expiry_type", "")).lower().strip()
-            if "0dte" in expiry_type:
-                raise ValueError(
-                    "BTST Validation Error: Leg uses 0DTE. BTST requires 1DTE "
-                    "(overnight holding). Please select 1DTE for BTST strategies."
-                )
-        logger.info("BTST Validation OK: all legs use 1DTE")
+        self._day_expiry_map = {}  # expiry_type label -> expiry date, rebuilt per trading day
 
 
     def _parse_entry_time(self) -> dt_time:
@@ -105,13 +106,15 @@ class BacktestEngine:
 
     def _prepare_legs_meta(self) -> list[dict]:
         """Attach precomputed, engine-ready fields (mapped option_type,
-        resolved dte) to each leg so execute_leg doesn't re-derive them
-        every trading day."""
+        normalized expiry_type) to each leg so execute_leg doesn't re-derive
+        them every trading day. The expiry_type label is resolved to a
+        concrete expiry date per trading day in _build_day_expiry_map."""
         legs_meta = []
         for index, leg in enumerate(self.legs, start=1):
             meta = dict(leg)
             meta["leg_number"] = index
-            meta["dte"] = self._resolve_dte(leg)
+            meta["expiry_type"] = self._normalize_expiry_type(leg)
+            meta["option_type"] = self._map_option_type(leg)
             if leg.get("is_range_breakout"):
                 meta["_range_end_parsed"] = (datetime.strptime(leg.get("range_end_time"), "%H:%M:%S")).time()
 
@@ -126,7 +129,8 @@ class BacktestEngine:
     def _prepare_nested_leg_meta(self, parent_leg_meta: dict, leg_config: dict) -> dict:
         meta = dict(leg_config)
         meta["leg_number"] = parent_leg_meta["leg_number"]
-        meta["dte"] = self._resolve_dte(leg_config)
+        meta["expiry_type"] = self._normalize_expiry_type(leg_config)
+        meta["option_type"] = self._map_option_type(leg_config)
         if leg_config.get("is_range_breakout"):
             meta["_range_end_parsed"] = datetime.strptime(leg_config.get("range_end_time"), "%H:%M:%S").time()
         return meta
@@ -136,15 +140,102 @@ class BacktestEngine:
         return leg_meta.get("_sequential_leg_meta") or leg_meta
 
 
-    def _resolve_dte(self, leg: dict) -> int:
-        """expiry_type like '0dte' -> 0. Falls back to strategy.dte_filter
-        if the leg doesn't specify a parseable Ndte value."""
-        expiry_type = str(leg.get("expiry_type", "")).lower().strip()
-        if expiry_type.endswith("dte"):
-            digits = expiry_type[: -len("dte")]
-            if digits.isdigit():
-                return int(digits)
-        return self.strategy.get("dte_filter", 0)
+    VALID_EXPIRY_TYPES = ("weekly", "next_weekly", "monthly", "next_monthly")
+
+    @staticmethod
+    def _map_option_type(leg: dict) -> str:
+        raw = str(leg.get("option_type", "")).strip().lower()
+        if raw in ("call", "ce", "c"):
+            return "CE"
+        if raw in ("put", "pe", "p"):
+            return "PE"
+        raise ValueError(f"Unknown option_type {leg.get('option_type')!r} (expected call/put).")
+
+    def _normalize_expiry_type(self, leg: dict) -> str:
+        """'weekly' / 'next weekly' / 'monthly' / 'next monthly' (case and
+        space insensitive) -> canonical label used by _build_day_expiry_map."""
+        raw = str(leg.get("expiry_type", "weekly")).strip().lower().replace(" ", "_")
+        if raw not in self.VALID_EXPIRY_TYPES:
+            raise ValueError(
+                f"Unknown expiry_type {leg.get('expiry_type')!r} "
+                f"(expected one of: {', '.join(self.VALID_EXPIRY_TYPES)})."
+            )
+        return raw
+
+
+    def _build_expiry_calendar(self):
+        """Month -> last known expiry of that month, built ONCE from every
+        expiry observed across the whole loaded date range. A single day's
+        chain can't identify the monthly contract (early in a month the
+        monthly isn't listed yet, and far-out quarterlies would be mistaken
+        for it), but across the range the true last expiry of each month
+        shows up. Near the end of the range later months may be incomplete
+        -- load a range extending past the expiries you trade."""
+        self._monthly_expiry_by_month = {}
+        for expiry in sorted(pd.to_datetime(pd.unique(self.df["expiration_date"]))):
+            self._monthly_expiry_by_month[(expiry.year, expiry.month)] = expiry
+
+
+    def _build_day_expiry_map(self, trade_date, day_df: pd.DataFrame) -> dict:
+        """Resolves the expiry_type labels to concrete expiry dates for ONE
+        trading day:
+          weekly       -> nearest expiry in that day's chain (today itself
+                          on expiry day)
+          next_weekly  -> second-nearest expiry in that day's chain
+          monthly      -> last expiry of the current month (rolls to the
+                          next month once it has passed), from the
+                          range-wide calendar
+          next_monthly -> last expiry of the following month
+        BTST holds overnight, so same-day expiries are excluded there.
+        A label missing from the map -- or a resolved contract not listed in
+        that day's chain -- makes the leg report NO_CHAIN_DATA."""
+        min_date = pd.Timestamp(trade_date)
+        if self.strategy_type == "btst":
+            min_date += pd.Timedelta(days=1)
+
+        mapping = {}
+
+        day_expiries = sorted(
+            expiry for expiry in pd.to_datetime(pd.unique(day_df["expiration_date"]))
+            if expiry >= min_date
+        )
+        if day_expiries:
+            mapping["weekly"] = day_expiries[0]
+            if len(day_expiries) > 1:
+                mapping["next_weekly"] = day_expiries[1]
+
+        monthlies = [
+            last_expiry
+            for _, last_expiry in sorted(self._monthly_expiry_by_month.items())
+            if last_expiry >= min_date
+        ]
+        if monthlies:
+            mapping["monthly"] = monthlies[0]
+            if len(monthlies) > 1:
+                mapping["next_monthly"] = monthlies[1]
+        return mapping
+
+
+    def _resolve_leg_expiry(self, leg_meta: dict):
+        """The concrete expiry date this leg trades on the current day, or
+        None when the label can't be resolved that day (e.g. 'next monthly'
+        past the end of the loaded range, or nothing left to trade after
+        BTST excludes same-day expiries)."""
+        return self._day_expiry_map.get(leg_meta["expiry_type"])
+
+
+    def _filter_leg_chain(self, chain_snapshot: pd.DataFrame, leg_meta: dict) -> pd.DataFrame:
+        """All strikes of the leg's option type on the leg's resolved expiry
+        for the current day. Empty result -> caller treats it as no chain
+        (either the expiry label didn't resolve, or the resolved contract
+        has no bar at this snapshot minute)."""
+        expiry = self._resolve_leg_expiry(leg_meta)
+        if expiry is None:
+            return chain_snapshot.iloc[0:0]
+        return chain_snapshot[
+            (chain_snapshot["option_type"] == leg_meta["option_type"])
+            & (chain_snapshot["expiration_date"] == expiry)
+        ]
 
 
     def _get_leg_meta_by_number(self, leg_number: int) -> dict:
@@ -157,6 +248,7 @@ class BacktestEngine:
 
     def run(self):
         self.prepare_dataframe()
+        self._build_expiry_calendar()
         self.process_days()
         self._dedupe_carryover_legs()
         if self.strategy_type == "btst":
@@ -170,7 +262,7 @@ class BacktestEngine:
 
     def prepare_dataframe(self):
         self.df["datetime_utc"] = pd.to_datetime(self.df["datetime_utc"], utc=True)
-        self.df.sort_values("datetime_utc", inplace=True)
+        # self.df.sort_values("datetime_utc", inplace=True)
         self.df["trade_date"] = self.df["datetime_utc"].dt.date
         self.df["trade_time"] = self.df["datetime_utc"].dt.time
 
@@ -179,6 +271,7 @@ class BacktestEngine:
         grouped = self.df.groupby("trade_date", sort=False)
         logger.info(f"Total Trading Days: {len(grouped)}")
         for trade_date, day_df in grouped:
+            self._day_expiry_map = self._build_day_expiry_map(trade_date, day_df)
             if self.strategy_type == "btst":
                 self.process_day_btst(trade_date, day_df)
             else:
@@ -260,8 +353,7 @@ class BacktestEngine:
             if closed_today:
                 self.trade_results.append({
                     "trade_date": trade_date,
-                    "entry_datetime": closed_today[0].get("entry_datetime"),
-                    "legs": closed_today,
+                    "legs": closed_today
                 })
             return
 
@@ -288,12 +380,10 @@ class BacktestEngine:
         self._range_cache = {}
         self._ticker_series_cache = {}
         self._underlying_series_cache = None
-        entry_datetime = entry_snapshot["datetime_utc"].iloc[0]
 
         result = {
             "trade_date": trade_date,
-            "entry_datetime": entry_datetime,
-            "legs": [],
+            "legs": []
         }
 
         for leg_meta in self.legs_meta:
@@ -328,14 +418,12 @@ class BacktestEngine:
         self._ticker_series_cache = {}
         self._underlying_series_cache = None
         
-        entry_datetime = entry_snapshot["datetime_utc"].iloc[0]
         skip_tickers = skip_tickers or set()
         prior_legs = prior_legs or []
 
         result = {
             "trade_date": trade_date,
-            "entry_datetime": (prior_legs[0]["entry_datetime"] if prior_legs else entry_datetime),
-            "legs": list(prior_legs),
+            "legs": list(prior_legs)
         }
 
         for leg_meta in self.legs_meta:
@@ -402,19 +490,33 @@ class BacktestEngine:
         if sequential_leg_meta is not None:
             return self._execute_observation_leg(leg_meta, sequential_leg_meta, entry_snapshot, day_df)
 
-        leg_chain = entry_snapshot[
-            (entry_snapshot["option_type"] == leg_meta["option_type"])
-            & (entry_snapshot["dte"] == leg_meta["dte"])
-        ]
-        if leg_chain.empty:
+        expiry = self._resolve_leg_expiry(leg_meta)
+        if expiry is None:
             logger.warning(
-                f"No chain rows for leg {leg_meta['leg_number']} "
-                f"(option_type={leg_meta['option_type']}, dte={leg_meta['dte']})"
+                f"Leg {leg_meta['leg_number']}: no '{leg_meta['expiry_type']}' expiry "
+                f"available this trading day (resolvable: {list(self._day_expiry_map) or 'none'})"
             )
             return {
                 "leg": leg_meta["leg_number"],
                 "position": leg_meta["position_type"],
                 "option": leg_meta["option_type"],
+                "expiry_type": leg_meta["expiry_type"],
+                "status": "NO_EXPIRY_AVAILABLE",
+            }
+
+        leg_chain = self._filter_leg_chain(entry_snapshot, leg_meta)
+        if leg_chain.empty:
+            logger.warning(
+                f"Leg {leg_meta['leg_number']}: expiry {expiry.date()} resolved but no chain "
+                f"rows at the entry snapshot (option_type={leg_meta['option_type']}, "
+                f"expiry_type={leg_meta['expiry_type']})"
+            )
+            return {
+                "leg": leg_meta["leg_number"],
+                "position": leg_meta["position_type"],
+                "option": leg_meta["option_type"],
+                "expiry_type": leg_meta["expiry_type"],
+                "expiration_date": expiry,
                 "status": "NO_CHAIN_DATA",
             }
 
@@ -461,6 +563,12 @@ class BacktestEngine:
         return entry_result
 
 
+    @staticmethod
+    def _underlying_at(row):
+        """Spot price on a bar row, for reporting entry/exit context."""
+        value = row.get("underlying_price")
+        return round(float(value), 2) if value is not None else None
+
     def _build_entry_result(self, leg_meta, position_type, strike_row, fill_row, is_reentry=False, reentry_mode=None):
         return {
             "leg": leg_meta["leg_number"],
@@ -477,25 +585,41 @@ class BacktestEngine:
             "underlying_entry_price": round(float(fill_row["underlying_price"]), 2) if "underlying_price" in fill_row else None,
             "entry_reason": "REENTRY" if is_reentry else "ENTRY",
             "strike": strike_row["strike"],
+            "expiry_type": leg_meta["expiry_type"],
+            "expiration_date": strike_row.get("expiration_date"),
         }
 
 
     # Observation Leg -> Sequential Leg (trigger hand-off)
 
     def _execute_observation_leg(self, observation_meta, sequential_meta, entry_snapshot: pd.DataFrame, day_df: pd.DataFrame):
-        obs_chain = entry_snapshot[
-            (entry_snapshot["option_type"] == observation_meta["option_type"])
-            & (entry_snapshot["dte"] == observation_meta["dte"])
-        ]
-        if obs_chain.empty:
+        obs_expiry = self._resolve_leg_expiry(observation_meta)
+        if obs_expiry is None:
             logger.warning(
-                f"Leg {observation_meta['leg_number']}: no chain rows for observation leg "
-                f"(option_type={observation_meta['option_type']}, dte={observation_meta['dte']})"
+                f"Leg {observation_meta['leg_number']}: no '{observation_meta['expiry_type']}' "
+                f"expiry available for the observation leg this trading day "
+                f"(resolvable: {list(self._day_expiry_map) or 'none'})"
             )
             return {
                 "leg": observation_meta["leg_number"],
                 "position": observation_meta["position_type"],
                 "option": observation_meta["option_type"],
+                "expiry_type": observation_meta["expiry_type"],
+                "status": "NO_EXPIRY_AVAILABLE",
+            }
+
+        obs_chain = self._filter_leg_chain(entry_snapshot, observation_meta)
+        if obs_chain.empty:
+            logger.warning(
+                f"Leg {observation_meta['leg_number']}: no chain rows for observation leg "
+                f"(option_type={observation_meta['option_type']}, expiry_type={observation_meta['expiry_type']})"
+            )
+            return {
+                "leg": observation_meta["leg_number"],
+                "position": observation_meta["position_type"],
+                "option": observation_meta["option_type"],
+                "expiry_type": observation_meta["expiry_type"],
+                "expiration_date": obs_expiry,
                 "status": "NO_CHAIN_DATA",
             }
 
@@ -555,14 +679,11 @@ class BacktestEngine:
         if chain_snapshot is None:
             return None
 
-        leg_chain = chain_snapshot[
-            (chain_snapshot["option_type"] == sequential_meta["option_type"])
-            & (chain_snapshot["dte"] == sequential_meta["dte"])
-        ]
+        leg_chain = self._filter_leg_chain(chain_snapshot, sequential_meta)
         if leg_chain.empty:
             logger.warning(
                 f"Leg {sequential_meta['leg_number']}: no chain rows for sequential_leg "
-                f"(option_type={sequential_meta['option_type']}, dte={sequential_meta['dte']})"
+                f"(option_type={sequential_meta['option_type']}, expiry_type={sequential_meta['expiry_type']})"
             )
             return None
 
@@ -610,6 +731,7 @@ class BacktestEngine:
                 exit_row, exit_reason = hit
                 leg_result["exit_datetime"] = exit_row["datetime_utc"]
                 leg_result["exit_price"] = exit_row["close"]
+                leg_result["underlying_exit_price"] = self._underlying_at(exit_row)
                 leg_result["exit_reason"] = exit_reason
                 leg_result["status"] = "EXIT_DONE"
                 return leg_result
@@ -619,12 +741,14 @@ class BacktestEngine:
         if exit_row is None:
             leg_result["exit_datetime"] = None
             leg_result["exit_price"] = None
+            leg_result["underlying_exit_price"] = None
             leg_result["exit_reason"] = "NO_EXIT_DATA"
             leg_result["status"] = "OPEN_NO_EXIT_SIGNAL"
             return leg_result
 
         leg_result["exit_datetime"] = exit_row["datetime_utc"]
         leg_result["exit_price"] = exit_row["close"]
+        leg_result["underlying_exit_price"] = self._underlying_at(exit_row)
         leg_result["exit_reason"] = "TIME_EXIT"
         leg_result["status"] = "EXIT_DONE"
         return leg_result
@@ -653,6 +777,7 @@ class BacktestEngine:
             leg_result["status"] = "HELD_OVERNIGHT"
             leg_result["exit_datetime"] = None
             leg_result["exit_price"] = None
+            leg_result["underlying_exit_price"] = None
             leg_result["_trade_date"] = entry_datetime.date()
             return leg_result
 
@@ -662,6 +787,7 @@ class BacktestEngine:
             exit_row, exit_reason = hit
             leg_result["exit_datetime"] = exit_row["datetime_utc"]
             leg_result["exit_price"] = round(float(exit_row["close"]), 2)
+            leg_result["underlying_exit_price"] = self._underlying_at(exit_row)
             leg_result["exit_reason"] = exit_reason
             leg_result["status"] = "EXIT_DONE"
             return leg_result
@@ -669,6 +795,7 @@ class BacktestEngine:
         leg_result["status"] = "HELD_OVERNIGHT"
         leg_result["exit_datetime"] = None
         leg_result["exit_price"] = None
+        leg_result["underlying_exit_price"] = None
         leg_result["_trade_date"] = entry_datetime.date()
         return leg_result
 
@@ -695,6 +822,7 @@ class BacktestEngine:
         if used_series.empty:
             leg_result["exit_datetime"] = None
             leg_result["exit_price"] = None
+            leg_result["underlying_exit_price"] = None
             leg_result["exit_reason"] = "No Day-2 data for this ticker"
             leg_result["status"] = "OPEN_NO_EXIT_SIGNAL"
             return leg_result
@@ -704,6 +832,7 @@ class BacktestEngine:
             exit_row, exit_reason = hit
             leg_result["exit_datetime"] = exit_row["datetime_utc"]
             leg_result["exit_price"] = round(float(exit_row["close"]), 2)
+            leg_result["underlying_exit_price"] = self._underlying_at(exit_row)
             leg_result["exit_reason"] = exit_reason
             leg_result["status"] = "EXIT_DONE"
             return leg_result
@@ -718,6 +847,7 @@ class BacktestEngine:
 
         leg_result["exit_datetime"] = exit_datetime
         leg_result["exit_price"] = round(float(exit_row["close"]), 2)
+        leg_result["underlying_exit_price"] = self._underlying_at(exit_row)
         leg_result["exit_reason"] = "BTST_EXIT"
         leg_result["status"] = "EXIT_DONE"
         return leg_result
@@ -776,10 +906,10 @@ class BacktestEngine:
         prev_result = first_result
         current_leg_meta = leg_meta
         safety_cap = 50  # defensive upper bound
-        while safety_cap > 0 and prev_result.get("status") == "EXIT_DONE" and prev_result.get("exit_reason") in ("STOPLOSS", "TARGET"):
+        while safety_cap > 0 and prev_result.get("status") == "EXIT_DONE" and prev_result.get("exit_reason") in ("STOPLOSS_HIT", "TARGET_HIT"):
             safety_cap -= 1
 
-            if prev_result["exit_reason"] == "STOPLOSS":
+            if prev_result["exit_reason"] == "STOPLOSS_HIT":
                 if remaining_sl_reentries <= 0:
                     break
                 remaining_sl_reentries -= 1
@@ -973,7 +1103,7 @@ class BacktestEngine:
 
         exit_idx = int(hit_mask.argmax())
         exit_row = series.iloc[exit_idx]
-        exit_reason = "STOPLOSS" if stoploss_hit_mask[exit_idx] else "TARGET"
+        exit_reason = "STOPLOSS_HIT" if stoploss_hit_mask[exit_idx] else "TARGET_HIT"
         return exit_row, exit_reason
 
    
@@ -1323,10 +1453,7 @@ class BacktestEngine:
         if chain_snapshot is None:
             return None
 
-        leg_chain = chain_snapshot[
-            (chain_snapshot["option_type"] == leg_meta["option_type"])
-            & (chain_snapshot["dte"] == leg_meta["dte"])
-        ]
+        leg_chain = self._filter_leg_chain(chain_snapshot, leg_meta)
         if leg_chain.empty:
             return None
 
@@ -1375,10 +1502,7 @@ class BacktestEngine:
         if chain_snapshot is None:
             return None
 
-        leg_chain = chain_snapshot[
-            (chain_snapshot["option_type"] == leg_meta["option_type"])
-            & (chain_snapshot["dte"] == leg_meta["dte"])
-        ]
+        leg_chain = self._filter_leg_chain(chain_snapshot, leg_meta)
         if leg_chain.empty:
             return None
 
@@ -1408,10 +1532,7 @@ class BacktestEngine:
         if chain_snapshot is None:
             return None
 
-        leg_chain = chain_snapshot[
-            (chain_snapshot["option_type"] == lazy_leg_meta["option_type"])
-            & (chain_snapshot["dte"] == lazy_leg_meta["dte"])
-        ]
+        leg_chain = self._filter_leg_chain(chain_snapshot, lazy_leg_meta)
         if leg_chain.empty:
             return None
 
@@ -1621,9 +1742,6 @@ class BacktestEngine:
 
 
     def _calc_overall_trailing_sl_series(self, combined_mtm: np.ndarray, sl_threshold):
-        if self.strategy_type != "btst":
-            return sl_threshold
-
         if not self.strategy.get("is_overall_trail_sl") or sl_threshold is None:
             return sl_threshold
 
@@ -1724,25 +1842,47 @@ class BacktestEngine:
 
 
     def _truncate_legs_at_overall_breach(self, result: dict, active_legs: list, day_df: pd.DataFrame, breach_datetime, breach_reason: str) -> None:
+        """Once the overall SL/target fires, the strategy is flat as of the
+        breach candle: every leg still open is force-closed there, and any
+        entry that would only have happened AFTER the breach (delayed
+        momentum / range-breakout fills, per-leg re-entries) is CANCELLED
+        outright -- no fresh leg may enter once the overall exit has
+        triggered. Only legs spawned by an OVERALL re-entry cycle trade on
+        after this instant (they arrive as the next cycle's active_legs and
+        are judged against that cycle's own breach)."""
         active_ids = {id(leg) for leg in active_legs}
+
+        cancelled_ids = set()
+        for leg_result in active_legs:
+            entry_dt = leg_result.get("entry_datetime")
+            if entry_dt is not None and entry_dt > breach_datetime:
+                cancelled_ids.add(id(leg_result))
 
         kept_legs = []
         for leg_result in result["legs"]:
+            if id(leg_result) in cancelled_ids:
+                continue
             entry_dt = leg_result.get("entry_datetime")
             if entry_dt is not None and entry_dt > breach_datetime and id(leg_result) not in active_ids:
                 continue
             kept_legs.append(leg_result)
         result["legs"] = kept_legs
 
+        # A cancelled BTST leg may already be registered for overnight
+        # carryover -- drop it there too, it never entered.
+        if cancelled_ids and self.strategy_type == "btst":
+            for held_key, held_leg in list(self.held_from_previous_day.items()):
+                if id(held_leg) in cancelled_ids:
+                    del self.held_from_previous_day[held_key]
+
         exit_row_cache = {}
         for leg_result in active_legs:
+            if id(leg_result) in cancelled_ids:
+                continue
+
             if leg_result.get("exit_datetime") is not None:
                 if leg_result["exit_datetime"] <= breach_datetime:
                     continue
-
-            entry_dt = leg_result.get("entry_datetime")
-            if entry_dt is not None and entry_dt > breach_datetime:
-                continue
 
             ticker = leg_result["ticker"]
             if ticker not in exit_row_cache:
@@ -1759,6 +1899,7 @@ class BacktestEngine:
             lot_size = self._lot_size_by_leg.get(leg_result["leg"], 1)
             leg_result["exit_datetime"] = exit_row["datetime_utc"]
             leg_result["exit_price"] = round(float(exit_row["close"]), 2)
+            leg_result["underlying_exit_price"] = self._underlying_at(exit_row)
             leg_result["exit_reason"] = breach_reason
             leg_result["status"] = "EXIT_DONE"
             leg_result["is_held_overnight"] = False  
@@ -1777,10 +1918,7 @@ class BacktestEngine:
         for leg_meta in self.legs_meta:
             base_leg_meta = self._effective_leg_meta(leg_meta)
             lot_size = base_leg_meta.get("lot_size", 1)
-            leg_chain = chain_snapshot[
-                (chain_snapshot["option_type"] == base_leg_meta["option_type"])
-                & (chain_snapshot["dte"] == base_leg_meta["dte"])
-            ]
+            leg_chain = self._filter_leg_chain(chain_snapshot, base_leg_meta)
             if leg_chain.empty:
                 continue
 
@@ -1805,6 +1943,7 @@ class BacktestEngine:
                 entry_result["status"] = "HELD_OVERNIGHT"
                 entry_result["exit_datetime"] = None
                 entry_result["exit_price"] = None
+                entry_result["underlying_exit_price"] = None
                 entry_result["exit_reason"] = None
                 entry_result["quantity_multiplier"] = QUANTITY * lot_size
                 entry_result["pnl"] = None
