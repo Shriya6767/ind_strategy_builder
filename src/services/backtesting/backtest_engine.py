@@ -59,6 +59,15 @@ class BacktestEngine:
         self.entry_time = self._parse_entry_time()
         self.exit_time = self._parse_exit_time()
 
+        # BTST exits on Day 2, so its exit_time may be earlier in the clock
+        # than entry_time. For INTRADAY that's a contradiction -- fail loudly
+        # instead of silently producing zero trades.
+        if self.strategy_type != "btst" and self.exit_time <= self.entry_time:
+            raise ValueError(
+                f"INTRADAY strategy: exit_time ({self.exit_time}) must be after "
+                f"entry_time ({self.entry_time})."
+            )
+
         if self.strategy_type == "btst":
             self.day1_market_close = self._parse_day1_market_close()
             self.day2_market_open = self._parse_day2_market_open()
@@ -368,11 +377,16 @@ class BacktestEngine:
         """Returns every option-chain row (all strikes/types) at the first
         trade_time >= entry_time. This is the full chain snapshot every
         leg picks its strike from, so all legs enter at the same instant.
-        Bounded by exit_time so special sessions outside the strategy's
-        window (e.g. the evening Muhurat session on 2024-11-01, bars
-        18:01-19:00) never produce an entry that has no exit bar."""
+
+        The upper bound keeps entries out of special sessions beyond the
+        strategy's window (e.g. the evening Muhurat session on 2024-11-01,
+        bars 18:01-19:00): INTRADAY entries must leave room to exit the
+        same day (<= exit_time); BTST exits on Day 2, so its exit_time can
+        be earlier in the clock than entry_time -- Day-1 entries are
+        bounded by the session close instead."""
+        upper_bound = self.day1_market_close if self.strategy_type == "btst" else self.exit_time
         candidate_times = day_df.loc[
-            (day_df["trade_time"] >= self.entry_time) & (day_df["trade_time"] <= self.exit_time),
+            (day_df["trade_time"] >= self.entry_time) & (day_df["trade_time"] <= upper_bound),
             "trade_time",
         ]
         if candidate_times.empty:
