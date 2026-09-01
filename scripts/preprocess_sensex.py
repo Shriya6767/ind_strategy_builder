@@ -2,13 +2,23 @@
 
 Reads the raw daily spot + F&O parquet files, derives every column the
 backtest engine needs (strike, option_type, dte, underlying_price,
-distance_from_underlying, moneyness), and writes ONE merged file per
-trading day, mirroring the raw folder layout:
+underlying_high, underlying_low, distance_from_underlying, moneyness),
+and writes ONE merged file per trading day, mirroring the raw layout:
 
-    <SENSEX_PROCESSED_PATH>/<YYYY>/<MON_YYYY>/SENSEX_MERGED_DDMMYYYY.parquet
+    <SENSEX_PROCESSED_OHLC_PATH>/<YYYY>/<MON_YYYY>/SENSEX_MERGED_OHLC_DDMMYYYY.parquet
 
-Processes one day at a time (a day is ~85K option rows), so memory stays
-flat no matter how many years are converted. Days whose output file
+underlying_high / underlying_low are the spot's intrabar range for the
+minute. UNDERLYING_POINTS / UNDERLYING_PERCENT stop-losses and targets
+fire the moment spot TOUCHES the level, which the closing price alone
+cannot see -- without these two columns the engine can only trigger on a
+close, exiting minutes late and sometimes in the wrong direction.
+
+The older build without them lives under SENSEX_PROCESSED_PATH and is
+left untouched; this script no longer writes there.
+
+Processes one day at a time (a day is ~85K option rows) and writes each
+day's file before reading the next, so peak memory is one trading day
+regardless of how many years are converted. Days whose output file
 already exists are skipped, so the script is safe to re-run and resumes
 where it left off; pass --overwrite to rebuild them.
 
@@ -25,7 +35,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.core.modules import re, pd, np
-from src.core.config import SENSEX_SPOT_PATH, SENSEX_FNO_PATH, SENSEX_PROCESSED_PATH
+from src.core.config import SENSEX_SPOT_PATH, SENSEX_FNO_PATH, SENSEX_PROCESSED_OHLC_PATH
 
 # SENSEX01JUL2573200PE.BFO -> expiry 01JUL25, strike 73200, type PE.
 # Futures tickers (SENSEX22JUL25FUT.BFO, SENSEX-I.BFO) don't match and are dropped.
@@ -49,6 +59,8 @@ FINAL_COLUMNS = [
     "strike",
     "dte",
     "underlying_price",
+    "underlying_high",
+    "underlying_low",
     "underlying",
     "distance_from_underlying",
     "moneyness",
@@ -91,14 +103,21 @@ def parse_option_tickers(tickers) -> pd.DataFrame:
 
 def process_day(spot_path: str, fno_path: str) -> pd.DataFrame:
     """Merges one day's spot + option chain and derives the engine columns."""
-    spot = pd.read_parquet(spot_path, columns=["Ticker", "Date", "Time", "Close"])
+    spot = pd.read_parquet(spot_path, columns=["Ticker", "Date", "Time", "High", "Low", "Close"])
     spot = spot[spot["Ticker"] == SPOT_TICKER]
     if spot.empty:
         raise ValueError(f"No '{SPOT_TICKER}' rows in {spot_path}")
     spot = spot.assign(datetime_utc=build_datetime(spot))
+    # High/Low carry the spot's intrabar range, which UNDERLYING_POINTS /
+    # UNDERLYING_PERCENT exits need: those levels are touched during a
+    # minute, not only at its close.
     spot = (
-        spot[["datetime_utc", "Close"]]
-        .rename(columns={"Close": "underlying_price"})
+        spot[["datetime_utc", "Close", "High", "Low"]]
+        .rename(columns={
+            "Close": "underlying_price",
+            "High": "underlying_high",
+            "Low": "underlying_low",
+        })
         .drop_duplicates("datetime_utc")
     )
 
@@ -172,8 +191,8 @@ def main():
     parser.add_argument("--overwrite", action="store_true", help="Rebuild days whose output already exists.")
     args = parser.parse_args()
 
-    if not (SENSEX_SPOT_PATH and SENSEX_FNO_PATH and SENSEX_PROCESSED_PATH):
-        sys.exit("SENSEX_SPOT_PATH, SENSEX_FNO_PATH and SENSEX_PROCESSED_PATH must be set in .env")
+    if not (SENSEX_SPOT_PATH and SENSEX_FNO_PATH and SENSEX_PROCESSED_OHLC_PATH):
+        sys.exit("SENSEX_SPOT_PATH, SENSEX_FNO_PATH and SENSEX_PROCESSED_OHLC_PATH must be set in .env")
 
     start = pd.Timestamp(args.start) if args.start else None
     end = pd.Timestamp(args.end) if args.end else None
@@ -184,8 +203,6 @@ def main():
     if end is not None:
         days = [d for d in days if d[0] <= end]
 
-    print(f"Found {len(days)} raw trading day(s) to consider.")
-
     converted = skipped = missing_spot = failed = 0
     t0 = time.perf_counter()
 
@@ -193,15 +210,14 @@ def main():
         stamp = date.strftime("%d%m%Y")
         fno_path = os.path.join(SENSEX_FNO_PATH, year, month_dir, fno_name)
         spot_path = os.path.join(SENSEX_SPOT_PATH, year, month_dir, f"BSE_INDICES_{stamp}.parquet")
-        out_dir = os.path.join(SENSEX_PROCESSED_PATH, year, month_dir)
-        out_path = os.path.join(out_dir, f"SENSEX_MERGED_{stamp}.parquet")
+        out_dir = os.path.join(SENSEX_PROCESSED_OHLC_PATH, year, month_dir)
+        out_path = os.path.join(out_dir, f"SENSEX_MERGED_OHLC_{stamp}.parquet")
 
         if os.path.exists(out_path) and not args.overwrite:
             skipped += 1
             continue
 
         if not os.path.exists(spot_path):
-            print(f"  WARN {date.date()}: no spot file, day skipped.")
             missing_spot += 1
             continue
 
@@ -211,19 +227,13 @@ def main():
             df.to_parquet(out_path, index=False)
             converted += 1
         except Exception as exc:
-            print(f"  FAIL {date.date()}: {exc}")
             failed += 1
             continue
 
         if converted % 50 == 0:
             rate = converted / (time.perf_counter() - t0)
-            print(f"  ... {i}/{len(days)} days done ({rate:.1f} days/s)")
 
     elapsed = time.perf_counter() - t0
-    print(
-        f"\nDone in {elapsed:.1f}s -- converted {converted}, "
-        f"already existed {skipped}, missing spot {missing_spot}, failed {failed}."
-    )
     if failed:
         sys.exit(1)
 
