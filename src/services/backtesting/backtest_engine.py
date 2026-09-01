@@ -45,6 +45,13 @@ class BacktestEngine:
     _DEFAULT_DAY1_MARKET_CLOSE = "15:30:00"
     _DEFAULT_DAY2_MARKET_OPEN = "09:16:00"
 
+    # How old a last traded price may be and still be matched by the
+    # premium-based strike criteria. See _recently_priced.
+    PREMIUM_MAX_PRICE_AGE_MINUTES = 15
+
+    # Sensex options quote in 5-paisa ticks.
+    TICK_SIZE = 0.05
+
     def __init__(self, df: pd.DataFrame, request: dict):
         self.df = df.copy()
         self.strategy = request["strategy"]
@@ -72,6 +79,12 @@ class BacktestEngine:
             self.day1_market_close = self._parse_day1_market_close()
             self.day2_market_open = self._parse_day2_market_open()
 
+        # Entry-day scans (momentum / range-breakout fills, cost re-entries)
+        # must run to the Day-1 session close for BTST: there exit_time is
+        # the DAY-2 cutoff and can be earlier in the clock than entry_time,
+        # which would make a `trade_time <= exit_time` scan permanently empty.
+        self.entry_day_cutoff = self.day1_market_close if self.strategy_type == "btst" else self.exit_time
+
         # Precompute leg metadata
         self.legs_meta = self._prepare_legs_meta()
         self._lot_size_by_leg = {
@@ -82,6 +95,8 @@ class BacktestEngine:
         self._range_cache = {}
         self._ticker_series_cache = {}
         self._underlying_series_cache = None
+        self._snapshot_cache = {}  # snapshot minute -> as-of chain, per trading day
+        self._trail_skip_warned = set()  # leg numbers already warned about ignored trailing
         self._day_expiry_map = {}  # expiry_type label -> expiry date, rebuilt per trading day
 
 
@@ -160,6 +175,7 @@ class BacktestEngine:
             return "PE"
         raise ValueError(f"Unknown option_type {leg.get('option_type')!r} (expected call/put).")
 
+
     def _normalize_expiry_type(self, leg: dict) -> str:
         """'weekly' / 'next weekly' / 'monthly' / 'next monthly' (case and
         space insensitive) -> canonical label used by _build_day_expiry_map."""
@@ -236,8 +252,9 @@ class BacktestEngine:
     def _filter_leg_chain(self, chain_snapshot: pd.DataFrame, leg_meta: dict) -> pd.DataFrame:
         """All strikes of the leg's option type on the leg's resolved expiry
         for the current day. Empty result -> caller treats it as no chain
-        (either the expiry label didn't resolve, or the resolved contract
-        has no bar at this snapshot minute)."""
+        (either the expiry label didn't resolve, or nothing on that expiry
+        has traded at all yet today -- the snapshot carries every contract's
+        last trade forward, so a merely quiet contract is still present)."""
         expiry = self._resolve_leg_expiry(leg_meta)
         if expiry is None:
             return chain_snapshot.iloc[0:0]
@@ -262,10 +279,14 @@ class BacktestEngine:
         self._dedupe_carryover_legs()
         if self.strategy_type == "btst":
             self._flush_unclosed_final_holds()
+            self._regroup_btst_by_entry_date()
         logger.info("Backtest Completed.")
         return _sanitize({
             "trade_results": self.trade_results,
-            **BacktestReportBuilder(self.trade_results).build(),
+            **BacktestReportBuilder(
+                self.trade_results,
+                period=(self.strategy.get("start_date"), self.strategy.get("end_date")),
+            ).build(),
         })
  
 
@@ -278,9 +299,11 @@ class BacktestEngine:
 
     def process_days(self):
         grouped = self.df.groupby("trade_date", sort=False)
+        self._last_trade_date = self.df["trade_date"].max()
         logger.info(f"Total Trading Days: {len(grouped)}")
         for trade_date, day_df in grouped:
             self._day_expiry_map = self._build_day_expiry_map(trade_date, day_df)
+            self._snapshot_cache = {}
             if self.strategy_type == "btst":
                 self.process_day_btst(trade_date, day_df)
             else:
@@ -304,6 +327,38 @@ class BacktestEngine:
                         continue
                 kept_legs.append(leg)
             day_block["legs"] = kept_legs
+
+
+    def _regroup_btst_by_entry_date(self):
+        """BTST day blocks come out of the day loop keyed by the day a
+        position CLOSES (Day 2). The API/report convention is the opposite:
+        a trade belongs to the day it was ENTERED. Re-bucket every leg by
+        its entry date; overall_exits stay on the day they actually fired.
+        Also strips the internal _trade_date bookkeeping key."""
+        legs_by_date = {}
+        exits_by_date = {}
+        for day_block in self.trade_results:
+            for leg in day_block["legs"]:
+                leg.pop("_trade_date", None)
+                entry_dt = leg.get("entry_datetime")
+                bucket = entry_dt.date() if entry_dt is not None else day_block["trade_date"]
+                legs_by_date.setdefault(bucket, []).append(leg)
+            for overall_exit in day_block.get("overall_exits", []):
+                exit_dt = overall_exit.get("exit_datetime")
+                bucket = exit_dt.date() if exit_dt is not None else day_block["trade_date"]
+                exits_by_date.setdefault(bucket, []).append(overall_exit)
+
+        rebuilt = []
+        for trade_date in sorted(set(legs_by_date) | set(exits_by_date)):
+            legs = legs_by_date.get(trade_date, [])
+            block = {
+                "trade_date": trade_date,
+                "legs": legs
+            }
+            if trade_date in exits_by_date:
+                block["overall_exits"] = exits_by_date[trade_date]
+            rebuilt.append(block)
+        self.trade_results = rebuilt
 
 
     def process_day_intraday(self, trade_date, day_df):
@@ -355,6 +410,17 @@ class BacktestEngine:
                     else:
                         del self.held_from_previous_day[leg_key]
 
+        # BTST needs a Day 2 to close on: no fresh position is opened on the
+        # LAST day of the backtest window (AlgoTest convention) -- today only
+        # closes carryovers.
+        if trade_date == self._last_trade_date:
+            if closed_today:
+                self.trade_results.append({
+                    "trade_date": trade_date,
+                    "legs": closed_today
+                })
+            return
+
         # ========== PHASE 2: Find today's entry snapshot and enter new positions ==========
         entry_snapshot = self.find_entry_snapshot(day_df)
         if entry_snapshot is None or entry_snapshot.empty:
@@ -385,14 +451,13 @@ class BacktestEngine:
         be earlier in the clock than entry_time -- Day-1 entries are
         bounded by the session close instead."""
         upper_bound = self.day1_market_close if self.strategy_type == "btst" else self.exit_time
-        candidate_times = day_df.loc[
+        candidates = day_df.loc[
             (day_df["trade_time"] >= self.entry_time) & (day_df["trade_time"] <= upper_bound),
-            "trade_time",
+            "datetime_utc",
         ]
-        if candidate_times.empty:
+        if candidates.empty:
             return None
-        first_time = candidate_times.min()
-        return day_df.loc[day_df["trade_time"] == first_time]
+        return self._asof_chain_snapshot(day_df, candidates.min())
 
 
     def execute_strategy(self, trade_date, day_df: pd.DataFrame, entry_snapshot: pd.DataFrame):
@@ -593,6 +658,7 @@ class BacktestEngine:
         value = row.get("underlying_price")
         return round(float(value), 2) if value is not None else None
 
+
     def _build_entry_result(self, leg_meta, position_type, strike_row, fill_row, is_reentry=False, reentry_mode=None):
         return {
             "leg": leg_meta["leg_number"],
@@ -752,9 +818,9 @@ class BacktestEngine:
         if not subset.empty:
             hit = self._check_sl_target_hit(leg_meta, leg_result, subset)
             if hit is not None:
-                exit_row, exit_reason = hit
+                exit_row, exit_reason, exit_fill_price = hit
                 leg_result["exit_datetime"] = exit_row["datetime_utc"]
-                leg_result["exit_price"] = exit_row["close"]
+                leg_result["exit_price"] = exit_fill_price
                 leg_result["underlying_exit_price"] = self._underlying_at(exit_row)
                 leg_result["exit_reason"] = exit_reason
                 leg_result["status"] = "EXIT_DONE"
@@ -808,9 +874,9 @@ class BacktestEngine:
         hit = self._check_sl_target_hit(leg_meta, leg_result, subset)
         if hit is not None:
             # Individual leg SL/TGT hit before day1_market_close - exit today
-            exit_row, exit_reason = hit
+            exit_row, exit_reason, exit_fill_price = hit
             leg_result["exit_datetime"] = exit_row["datetime_utc"]
-            leg_result["exit_price"] = round(float(exit_row["close"]), 2)
+            leg_result["exit_price"] = exit_fill_price
             leg_result["underlying_exit_price"] = self._underlying_at(exit_row)
             leg_result["exit_reason"] = exit_reason
             leg_result["status"] = "EXIT_DONE"
@@ -853,9 +919,9 @@ class BacktestEngine:
 
         hit = self._check_sl_target_hit(leg_meta, leg_result, used_series)
         if hit is not None:
-            exit_row, exit_reason = hit
+            exit_row, exit_reason, exit_fill_price = hit
             leg_result["exit_datetime"] = exit_row["datetime_utc"]
-            leg_result["exit_price"] = round(float(exit_row["close"]), 2)
+            leg_result["exit_price"] = exit_fill_price
             leg_result["underlying_exit_price"] = self._underlying_at(exit_row)
             leg_result["exit_reason"] = exit_reason
             leg_result["status"] = "EXIT_DONE"
@@ -986,25 +1052,45 @@ class BacktestEngine:
         return new_legs
 
 
+    @staticmethod
+    def _is_spot_bullish(leg_meta: dict, position_type: str) -> bool:
+        """True when the leg gains as the UNDERLYING rises: long calls and
+        short puts. UNDERLYING_* SL/target levels must sit on the losing/
+        winning side of this spot exposure -- which depends on option type
+        AND position, not position alone (a SELL PE loses when spot FALLS,
+        so its underlying stoploss is BELOW entry spot)."""
+        return (leg_meta.get("option_type") == "CE") == (position_type == "BUY")
+
+
     def _calc_target_price(self, leg_meta: dict, entry_price: float, underlying_entry_price: float, position_type: str):
         if not leg_meta.get("is_target"):
             return None
         target_type = leg_meta.get("target_type")
         target_value = leg_meta.get("target_value")
-        # BUY profits as price rises, SELL profits as price falls.
+        # Premium: BUY profits as premium rises, SELL as it falls.
         direction = 1 if position_type == "BUY" else -1
+        # Spot: favorable direction follows the leg's spot exposure.
+        spot_direction = 1 if self._is_spot_bullish(leg_meta, position_type) else -1
 
         if target_type == "POINTS":
-            return round(entry_price + direction * target_value, 2)
+            return self._round_to_tick(entry_price + direction * target_value)
         elif target_type == "PERCENT":
-            return round(entry_price * (1 + direction * target_value / 100), 2)
+            return self._round_to_tick(entry_price * (1 + direction * target_value / 100))
         elif target_type == "UNDERLYING_POINTS":
-            return round(underlying_entry_price + direction * target_value, 2)
+            return round(underlying_entry_price + spot_direction * target_value, 2)
         elif target_type == "UNDERLYING_PERCENT":
-            return round(underlying_entry_price * (1 + direction * target_value / 100), 2)
+            return round(underlying_entry_price * (1 + spot_direction * target_value / 100), 2)
 
         logger.warning(f"Leg {leg_meta['leg_number']}: unsupported target_type '{target_type}'")
         return None
+
+
+    def _round_to_tick(self, price: float) -> float:
+        """Snap a PREMIUM level to a tradeable tick. A PERCENT target of
+        482.30 x 1.95 = 940.485 is not a price anyone can be filled at;
+        AlgoTest uses 940.50. Only premium levels get this -- UNDERLYING_*
+        levels are index values and are left alone."""
+        return round(round(price / self.TICK_SIZE) * self.TICK_SIZE, 2)
 
 
     def _calc_stoploss_price(self, leg_meta: dict, entry_price: float, underlying_entry_price: float, position_type: str):
@@ -1014,15 +1100,16 @@ class BacktestEngine:
         stoploss_value = leg_meta.get("stoploss_value")
         # Stoploss direction is the mirror image of target direction.
         direction = -1 if position_type == "BUY" else 1
+        spot_direction = -1 if self._is_spot_bullish(leg_meta, position_type) else 1
 
         if stoploss_type == "POINTS":
-            return round(entry_price + direction * stoploss_value, 2)
+            return self._round_to_tick(entry_price + direction * stoploss_value)
         elif stoploss_type == "PERCENT":
-            return round(entry_price * (1 + direction * stoploss_value / 100), 2)
+            return self._round_to_tick(entry_price * (1 + direction * stoploss_value / 100))
         elif stoploss_type == "UNDERLYING_POINTS":
-            return round(underlying_entry_price + direction * stoploss_value, 2)
+            return round(underlying_entry_price + spot_direction * stoploss_value, 2)
         elif stoploss_type == "UNDERLYING_PERCENT":
-            return round(underlying_entry_price * (1 + direction * stoploss_value / 100), 2)
+            return round(underlying_entry_price * (1 + spot_direction * stoploss_value / 100), 2)
 
         logger.warning(f"Leg {leg_meta['leg_number']}: unsupported stoploss_type '{stoploss_type}'")
         return None
@@ -1030,6 +1117,18 @@ class BacktestEngine:
 
     def _calc_trailing_stoploss_series(self, leg_meta: dict, entry_price: float, stoploss_price, position_type: str, close: np.ndarray):
         if not leg_meta.get("is_trail_sl") or stoploss_price is None:
+            return stoploss_price
+
+        stoploss_type = leg_meta.get("stoploss_type")
+        if stoploss_type in ("UNDERLYING_POINTS", "UNDERLYING_PERCENT"):
+            leg_number = leg_meta["leg_number"]
+            if leg_number not in self._trail_skip_warned:
+                self._trail_skip_warned.add(leg_number)
+                logger.warning(
+                    f"Leg {leg_number}: is_trail_sl=True is ignored because "
+                    f"stoploss_type={stoploss_type} -- trailing steps are defined "
+                    f"on the instrument premium, not on the underlying."
+                )
             return stoploss_price
 
         trail_sl_type = leg_meta.get("trail_sl_type")
@@ -1072,21 +1171,19 @@ class BacktestEngine:
 
 
     @staticmethod
-    def _target_hit_mask(close: np.ndarray, underlying_close: np.ndarray, target_price: float, target_type: str, position_type: str) -> np.ndarray:
-        # BUY: target reached once price rises to/above target.
-        # SELL: target reached once price falls to/below target.
+    def _target_hit_mask(high: np.ndarray, low: np.ndarray, underlying_high: np.ndarray, underlying_low: np.ndarray, target_price: float, target_type: str, position_type: str, spot_bullish: bool) -> np.ndarray:
         if target_type in ("POINTS", "PERCENT"):
-            return close >= target_price if position_type == "BUY" else close <= target_price
+            return high >= target_price if position_type == "BUY" else low <= target_price
         elif target_type in ("UNDERLYING_POINTS", "UNDERLYING_PERCENT"):
-            return underlying_close >= target_price if position_type == "BUY" else underlying_close <= target_price
+            return underlying_high >= target_price if spot_bullish else underlying_low <= target_price
 
 
     @staticmethod
-    def _stoploss_hit_mask(close: np.ndarray, underlying_close: np.ndarray, stoploss_price: float, stoploss_type: str, position_type: str) -> np.ndarray:
+    def _stoploss_hit_mask(high: np.ndarray, low: np.ndarray, underlying_high: np.ndarray, underlying_low: np.ndarray, stoploss_price: float, stoploss_type: str, position_type: str, spot_bullish: bool) -> np.ndarray:
         if stoploss_type in ("POINTS", "PERCENT"):
-            return close <= stoploss_price if position_type == "BUY" else close >= stoploss_price
+            return low <= stoploss_price if position_type == "BUY" else high >= stoploss_price
         elif stoploss_type in ("UNDERLYING_POINTS", "UNDERLYING_PERCENT"):
-            return underlying_close <= stoploss_price if position_type == "BUY" else underlying_close >= stoploss_price
+            return underlying_low <= stoploss_price if spot_bullish else underlying_high >= stoploss_price
 
 
     def _check_sl_target_hit(self, leg_meta, leg_result, leg_series, start_idx=0):
@@ -1104,19 +1201,28 @@ class BacktestEngine:
             return None
 
         close = series["close"].to_numpy()
-        underlying_close = series["underlying_price"].to_numpy()
+        high = series["high"].to_numpy()
+        low = series["low"].to_numpy()
+        bar_open = series["open"].to_numpy()
+
+        if "underlying_high" in series.columns:
+            underlying_high = series["underlying_high"].to_numpy()
+            underlying_low = series["underlying_low"].to_numpy()
+        else:
+            underlying_high = underlying_low = series["underlying_price"].to_numpy()
 
         trailing_stoploss_price = self._calc_trailing_stoploss_series(
             leg_meta, entry_price, stoploss_price, position_type, close
         )
 
+        spot_bullish = self._is_spot_bullish(leg_meta, position_type)
         target_hit_mask = (
-            self._target_hit_mask(close, underlying_close, target_price, leg_meta.get("target_type"), position_type)
+            self._target_hit_mask(high, low, underlying_high, underlying_low, target_price, leg_meta.get("target_type"), position_type, spot_bullish)
             if target_price is not None
             else np.zeros(len(close), dtype=bool)
         )
         stoploss_hit_mask = (
-            self._stoploss_hit_mask(close, underlying_close, trailing_stoploss_price, leg_meta.get("stoploss_type"), position_type)
+            self._stoploss_hit_mask(high, low, underlying_high, underlying_low, trailing_stoploss_price, leg_meta.get("stoploss_type"), position_type, spot_bullish)
             if stoploss_price is not None
             else np.zeros(len(close), dtype=bool)
         )
@@ -1127,8 +1233,35 @@ class BacktestEngine:
 
         exit_idx = int(hit_mask.argmax())
         exit_row = series.iloc[exit_idx]
-        exit_reason = "STOPLOSS_HIT" if stoploss_hit_mask[exit_idx] else "TARGET_HIT"
-        return exit_row, exit_reason
+
+        candle_open = float(bar_open[exit_idx])
+        target_gapped_open = (
+            target_hit_mask[exit_idx]
+            and leg_meta.get("target_type") in ("POINTS", "PERCENT")
+            and (candle_open >= target_price if position_type == "BUY" else candle_open <= target_price)
+        )
+        underlying_fill = float(close[exit_idx])
+
+        if target_hit_mask[exit_idx] and (target_gapped_open or not stoploss_hit_mask[exit_idx]):
+            exit_reason = "TARGET_HIT"
+            if leg_meta.get("target_type") in ("POINTS", "PERCENT"):
+                exit_fill_price = candle_open if target_gapped_open else float(target_price)
+            else:
+                exit_fill_price = underlying_fill
+        else:
+            exit_reason = "STOPLOSS_HIT"
+            if leg_meta.get("stoploss_type") in ("POINTS", "PERCENT"):
+                level = float(
+                    trailing_stoploss_price[exit_idx]
+                    if isinstance(trailing_stoploss_price, np.ndarray)
+                    else trailing_stoploss_price
+                )
+                gapped = candle_open <= level if position_type == "BUY" else candle_open >= level
+                exit_fill_price = candle_open if gapped else level
+            else:
+                exit_fill_price = underlying_fill
+
+        return exit_row, exit_reason, round(exit_fill_price, 2)
 
    
     def select_strike(self, leg_meta: dict, leg_chain: pd.DataFrame):
@@ -1189,6 +1322,30 @@ class BacktestEngine:
         return subset.iloc[offset - 1]
 
 
+    def _recently_priced(self, leg_chain: pd.DataFrame, leg_meta: dict) -> pd.DataFrame:
+        """Narrows a chain to contracts that printed recently.
+
+        Only for the premium-based criteria. ATM/ITM/OTM selection keys off
+        the strike ladder, so it just needs a contract to exist; matching on
+        `close` instead means an option that last traded hours ago can win
+        on a premium nobody could have got. Falls back to the full chain
+        when nothing is recent -- a stale match still beats dropping the leg,
+        and the warning says which happened.
+        """
+        if "price_age_minutes" not in leg_chain.columns or leg_chain.empty:
+            return leg_chain
+        fresh = leg_chain.loc[leg_chain["price_age_minutes"] <= self.PREMIUM_MAX_PRICE_AGE_MINUTES]
+        if fresh.empty:
+            logger.warning(
+                f"Leg {leg_meta['leg_number']}: no contract on this expiry traded within "
+                f"{self.PREMIUM_MAX_PRICE_AGE_MINUTES}min of the entry -- matching premium "
+                f"against last traded prices up to "
+                f"{leg_chain['price_age_minutes'].min():.0f}min old"
+            )
+            return leg_chain
+        return fresh
+
+
     def _select_strike_closest_premium(self, leg_meta: dict, leg_chain: pd.DataFrame):
         premium_value = leg_meta.get("premium_value")
 
@@ -1199,6 +1356,7 @@ class BacktestEngine:
         if leg_chain.empty:
             return None
 
+        leg_chain = self._recently_priced(leg_chain, leg_meta)
         premium_distance = (leg_chain["close"] - premium_value).abs()
         closest_index = premium_distance.idxmin()
         return leg_chain.loc[closest_index]
@@ -1224,6 +1382,7 @@ class BacktestEngine:
         if leg_chain.empty:
             return None
 
+        leg_chain = self._recently_priced(leg_chain, leg_meta)
         in_range = leg_chain.loc[(leg_chain["close"] >= lower) & (leg_chain["close"] <= upper)]
 
         if in_range.empty:
@@ -1310,33 +1469,64 @@ class BacktestEngine:
             return None
 
         is_underlying = str(momentum_type).startswith("UNDERLYING")
+        # strike_row comes from _asof_chain_snapshot, so its `close` is the
+        # contract's last traded price (the only price knowable at this
+        # minute) while its datetime_utc is the snapshot minute itself. The
+        # scan below relies on that stamping to never look at a bar from
+        # before the strike was selected -- see _asof_chain_snapshot.
         base_price = strike_row["underlying_price"] if is_underlying else strike_row["close"]
         trigger_price = self._calc_momentum_trigger(leg_meta, momentum_type, momentum_value, base_price)
         if trigger_price is None:
             return strike_row  # unsupported momentum_type -- fall back to immediate entry
 
         ticker = strike_row["ticker"]
+        # Strictly AFTER the base bar: base_price IS that bar's close, and the
+        # intrabar test below would otherwise fire on the very bar the level
+        # was measured from.
         series = day_df.loc[
             (day_df["ticker"] == ticker)
-            & (day_df["datetime_utc"] >= strike_row["datetime_utc"])
-            & (day_df["trade_time"] <= self.exit_time)
+            & (day_df["datetime_utc"] > strike_row["datetime_utc"])
+            & (day_df["trade_time"] <= self.entry_day_cutoff)
         ].sort_values("datetime_utc")
 
         if series.empty:
             return None
 
-        reference = series["underlying_price"].to_numpy() if is_underlying else series["close"].to_numpy()
-
-        if str(momentum_type).endswith("_UP"):
-            hit_mask = reference >= trigger_price
+        # Momentum fires the moment price TOUCHES the level, so test the bar's
+        # extreme in the direction being watched -- not its close, which only
+        # sees the level minutes later (or never, on a bar that spikes and
+        # retraces). Verified against AlgoTest on Jan 2026: the high/low test
+        # reproduces its entry minute 11/11, the close test only 5/11.
+        up = str(momentum_type).endswith("_UP")
+        if is_underlying:
+            extreme_col = "underlying_high" if up else "underlying_low"
+            if extreme_col not in series.columns:      # pre-OHLC merged files
+                extreme_col = "underlying_price"
         else:
-            hit_mask = reference <= trigger_price
+            extreme_col = "high" if up else "low"
+        reference = series[extreme_col].to_numpy()
 
+        hit_mask = reference >= trigger_price if up else reference <= trigger_price
         if not hit_mask.any():
             return None
 
         idx = int(hit_mask.argmax())
-        return series.iloc[idx]
+        fill_row = series.iloc[idx]
+
+        if is_underlying:
+            # The level lives on the index, not on this option, so it says
+            # nothing about the premium payable -- fill at the bar's close,
+            # as underlying-triggered exits do.
+            return fill_row
+
+        # Instrument momentum: the level IS a premium, so that is the fill.
+        # A bar that OPENED beyond it gapped through, and the touch happened
+        # at the open -- the same rule the premium target/SL exits apply.
+        bar_open = float(fill_row["open"])
+        gapped = bar_open >= trigger_price if up else bar_open <= trigger_price
+        fill_row = fill_row.copy()
+        fill_row["close"] = round(bar_open if gapped else float(trigger_price), 2)
+        return fill_row
 
 
     def _calc_momentum_trigger(self, leg_meta, momentum_type: str, momentum_value: float, base_price: float):
@@ -1426,7 +1616,7 @@ class BacktestEngine:
         trade_time = ticker_series["trade_time"]
 
         lo = np.searchsorted(trade_time, range_end, side="right")
-        hi = np.searchsorted(trade_time, self.exit_time, side="right")
+        hi = np.searchsorted(trade_time, self.entry_day_cutoff, side="right")
         if lo >= hi:
             logger.warning(
                 f"Leg {leg_meta['leg_number']}: no candles available between "
@@ -1500,7 +1690,7 @@ class BacktestEngine:
         series = day_df.loc[
             (day_df["ticker"] == ticker)
             & (day_df["datetime_utc"] > prev_result["exit_datetime"])
-            & (day_df["trade_time"] <= self.exit_time)
+            & (day_df["trade_time"] <= self.entry_day_cutoff)
         ].sort_values("datetime_utc")
 
         if series.empty:
@@ -1587,8 +1777,80 @@ class BacktestEngine:
         candidates = day_df.loc[day_df["datetime_utc"] >= reference_datetime, "datetime_utc"]
         if candidates.empty:
             return None
-        snapshot_time = candidates.min()
-        return day_df.loc[day_df["datetime_utc"] == snapshot_time]
+        return self._asof_chain_snapshot(day_df, candidates.min())
+
+
+    def _asof_chain_snapshot(self, day_df: pd.DataFrame, snapshot_time) -> pd.DataFrame:
+        """The tradeable chain as of `snapshot_time`.
+
+        Bars exist only for minutes a contract actually printed, so an
+        exact-minute slice of day_df is NOT the chain -- it is only the
+        contracts that happened to trade in that one minute. Taken
+        literally it corrupts strike selection two ways: a contract that
+        was quiet that minute vanishes (the leg dies as NO_CHAIN_DATA),
+        and the `moneyness` column -- precomputed per minute over whatever
+        rows exist -- can crown a strike hundreds of points away as ATM
+        purely because it was the only one to print. Both were real: on
+        2024-01-19 the 71800 PE was quiet at 09:30 and the 72000 PE, 155
+        points from spot, was labeled ATM and traded.
+
+        So carry each contract's last trade forward: one row per ticker at
+        its most recent bar, restamped to `snapshot_time` and re-measured
+        against the spot at `snapshot_time`. Prices stay real -- only
+        their timestamp moves -- which is how an LTP-driven chain behaves.
+        Exits are unaffected: they scan this contract's actual bars, so a
+        stop/target still only fires on a price that genuinely printed.
+
+        Limits, all inherent to trade-only data. Only today's bars are
+        carried, so an entry in the first minutes of the session has little
+        history to draw on and degrades toward the old exact-minute
+        behaviour. A strike that has not traded at all today cannot be
+        conjured, so ATM falls back to the nearest strike that HAS traded.
+        And premium-based strike_criteria match on a last traded price that
+        may be old -- unlike ATM selection, which only needs the strike to
+        exist, they are sensitive to how stale that price is.
+        """
+        snapshot_time = pd.Timestamp(snapshot_time)
+        cached = self._snapshot_cache.get(snapshot_time)
+        if cached is not None:
+            return cached
+
+        rows = day_df.loc[day_df["datetime_utc"] <= snapshot_time]
+        if rows.empty:
+            return day_df.iloc[0:0]
+
+        snapshot = (
+            rows.sort_values("datetime_utc", kind="stable")
+                .drop_duplicates("ticker", keep="last")
+                .copy()
+        )
+        spot_rows = day_df.loc[day_df["datetime_utc"] == snapshot_time, "underlying_price"]
+        spot = float(spot_rows.iloc[0]) if not spot_rows.empty else float(
+            rows["underlying_price"].iloc[-1]
+        )
+
+        snapshot["price_age_minutes"] = (
+            (snapshot_time - snapshot["datetime_utc"]).dt.total_seconds() / 60.0
+        )
+
+        snapshot["datetime_utc"] = snapshot_time
+        snapshot["trade_time"] = snapshot_time.time()
+        snapshot["underlying_price"] = spot
+        snapshot["distance_from_underlying"] = (snapshot["strike"] - spot).abs()
+
+        is_itm = np.where(
+            snapshot["option_type"] == "CE",
+            snapshot["strike"] < spot,
+            snapshot["strike"] > spot,
+        )
+        snapshot["moneyness"] = np.where(is_itm, "ITM", "OTM")
+        atm_idx = snapshot.groupby(
+            ["expiration_date", "option_type"], sort=False
+        )["distance_from_underlying"].idxmin()
+        snapshot.loc[atm_idx, "moneyness"] = "ATM"
+
+        self._snapshot_cache[snapshot_time] = snapshot
+        return snapshot
        
 
     def _get_ticker_series(self, day_df: pd.DataFrame, ticker: str):
@@ -1665,23 +1927,6 @@ class BacktestEngine:
 
     def _run_overall_risk_cycles(self, day_df: pd.DataFrame, result: dict, active_legs: list,
                                   has_sl: bool, has_target: bool, cutoff) -> dict:
-        total_entry_premium = sum(leg["entry_price"] for leg in active_legs)
-
-        sl_threshold = self._calc_overall_threshold(
-            self.strategy.get("strategy_sl_type"),
-            self.strategy.get("strategy_sl_value"),
-            total_entry_premium,
-        ) if has_sl else None
-
-        target_threshold = self._calc_overall_threshold(
-            self.strategy.get("strategy_target_type"),
-            self.strategy.get("strategy_target_value"),
-            total_entry_premium,
-        ) if has_target else None
-
-        if sl_threshold is None and target_threshold is None:
-            return result
-
         remaining_sl_reentries = (
             int(self.strategy.get("overall_reentry_sl_value"))
             if self.strategy.get("is_overall_reentry_sl") else 0
@@ -1695,7 +1940,8 @@ class BacktestEngine:
         while True:
             cycle += 1
 
-            breach = self._find_overall_breach(day_df, active_legs, sl_threshold, target_threshold, cutoff)
+            breach = self._find_overall_breach(day_df, active_legs, has_sl, has_target, cutoff)
+
             if breach is None:
                 break  # combined MTM never breached this cycle
 
@@ -1710,11 +1956,18 @@ class BacktestEngine:
                             if held_leg is leg_result:
                                 del self.held_from_previous_day[held_key]
 
+            combined_pnl = round(sum(
+                leg.get("pnl") or 0.0
+                for leg in active_legs
+                if leg.get("status") == "EXIT_DONE"
+                and leg.get("exit_datetime") == breach_datetime
+            ), 2)
+
             result.setdefault("overall_exits", []).append({
                 "cycle": cycle,
                 "exit_datetime": breach_datetime,
                 "exit_reason": breach_reason,
-                "combined_pnl": breach_mtm,
+                "combined_pnl": combined_pnl,
             })
 
             if breach_reason == "OVERALL_STOPLOSS":
@@ -1732,7 +1985,9 @@ class BacktestEngine:
                 logger.warning(f"Unsupported overall reentry mode '{mode}'")
                 break
 
-            new_legs = self._reenter_all_legs(mode, breach_datetime, day_df)
+            # active_legs are the positions just closed by this breach -- a
+            # *_REVERSE mode re-enters on the opposite side of those.
+            new_legs = self._reenter_all_legs(mode, breach_datetime, day_df, active_legs)
             if not new_legs:
                 break
 
@@ -1750,16 +2005,48 @@ class BacktestEngine:
         return result
     
     
-    def _calc_overall_threshold(self, threshold_type, value, total_entry_premium: float):
-        """'POINTS'/'MTM'   -> absolute combined points/MTM threshold.
-        'PERCENT'/'TOTAL_PREMIUM_PERCENT' -> % of the combined ENTRY
-        premium across all legs (docs: 300 combined premium * 30% = 90)."""
+    def _overall_threshold_series(self, entry_value: np.ndarray, has_sl: bool, has_target: bool):
+        """(sl_threshold, target_threshold) as per-bar arrays.
+
+        POINTS/MTM are absolute, so they come out constant. PERCENT is a share
+        of the capital currently in the position, which is why it has to track
+        `entry_value` bar by bar rather than being fixed up front: Simple
+        Momentum staggers leg entries, so the position -- and therefore the
+        threshold -- grows as legs join. Fixing it from the full leg set let a
+        leg that had not entered yet raise the bar it was not part of, pushing
+        the exit later (AlgoTest closes on the legs open at that instant).
+
+        The value is money, matching combined_mtm (priced x QUANTITY x
+        lot_size); summing raw premium points made it ~20x too small.
+        """
+        def build(threshold_type, value):
+            if not has_sl and not has_target:
+                return None
+            if threshold_type in ("PERCENT", "TOTAL_PREMIUM_PERCENT") and value is not None:
+                return np.abs(entry_value) * abs(value) / 100.0
+            scalar = self._calc_overall_threshold(threshold_type, value, 0.0)
+            return None if scalar is None else np.full(len(entry_value), scalar, dtype=float)
+
+        sl_threshold = build(
+            self.strategy.get("strategy_sl_type"), self.strategy.get("strategy_sl_value")
+        ) if has_sl else None
+        target_threshold = build(
+            self.strategy.get("strategy_target_type"), self.strategy.get("strategy_target_value")
+        ) if has_target else None
+        return sl_threshold, target_threshold
+
+
+    def _calc_overall_threshold(self, threshold_type, value, total_entry_value: float):
+        """'POINTS'/'MTM'   -> absolute combined threshold, taken as given.
+        'PERCENT'/'TOTAL_PREMIUM_PERCENT' -> % of the combined ENTRY VALUE of
+        all legs (premium x QUANTITY x lot_size), so the result is money and
+        comparable with combined_mtm."""
         if threshold_type is None or value is None:
             return None
         if threshold_type in ("POINTS", "MTM"):
             return abs(value)
         elif threshold_type in ("PERCENT", "TOTAL_PREMIUM_PERCENT"):
-            return round(abs(total_entry_premium) * value / 100, 2)
+            return round(abs(total_entry_value) * value / 100, 2)
 
         logger.warning(f"Unsupported overall SL/target type '{threshold_type}'")
         return None
@@ -1781,7 +2068,11 @@ class BacktestEngine:
             )
             return sl_threshold
 
-        if trail_sl_type == "POINTS":
+        # MTM behaves like POINTS here: both give the step and the lock as
+        # absolute amounts ("every 1000 of profit, tighten the stop by 200"),
+        # and combined_mtm is already money. Without MTM in this branch the
+        # entire overall-trailing block was skipped as unsupported.
+        if trail_sl_type in ("POINTS", "MTM"):
             step_move = instrument_moves
             step_gain = stoploss_moves
         elif trail_sl_type == "PERCENT":
@@ -1801,7 +2092,7 @@ class BacktestEngine:
         return np.clip(sl_threshold - steps * step_gain, a_min=0, a_max=None)
 
 
-    def _find_overall_breach(self, day_df: pd.DataFrame, active_legs: list, sl_threshold, target_threshold, cutoff):
+    def _find_overall_breach(self, day_df: pd.DataFrame, active_legs: list, has_sl: bool, has_target: bool, cutoff):
         if not active_legs:
             return None
 
@@ -1820,12 +2111,15 @@ class BacktestEngine:
         pivot = pivot.sort_index().ffill()
 
         combined_mtm = pd.Series(0.0, index=pivot.index)
+        # Capital in the position bar by bar -- a leg only counts once it has
+        # entered, so a PERCENT threshold grows as staggered legs join.
+        entry_value = pd.Series(0.0, index=pivot.index)
         today_date = day_df["trade_date"].iloc[0] if not day_df.empty else None
-        
+
         for leg in active_legs:
             if leg["ticker"] not in pivot.columns:
                 continue
-            
+
             direction = 1 if leg["position"] == "BUY" else -1
             lot_size = self._lot_size_by_leg.get(leg["leg"], 1)
             price_series = pivot[leg["ticker"]]
@@ -1838,16 +2132,25 @@ class BacktestEngine:
                 pass
 
             leg_contribution = (direction * (price_series - leg["entry_price"]) * QUANTITY * lot_size)
-            leg_contribution = leg_contribution.where(pivot.index >= leg["entry_datetime"], 0.0)
+            leg_contribution = leg_contribution.where(pivot.index > leg["entry_datetime"], 0.0)
             combined_mtm = combined_mtm + leg_contribution
+            entry_value = entry_value + pd.Series(
+                leg["entry_price"] * QUANTITY * lot_size, index=pivot.index
+            ).where(pivot.index >= leg["entry_datetime"], 0.0)
 
-        combined_mtm = combined_mtm.dropna()
+        live = combined_mtm.notna()
+        combined_mtm = combined_mtm[live]
+        entry_value = entry_value[live]
         if combined_mtm.empty:
             return None
 
         values = combined_mtm.to_numpy()
         timestamps = combined_mtm.index.to_numpy()
-        
+
+        sl_threshold, target_threshold = self._overall_threshold_series(
+            entry_value.to_numpy(), has_sl, has_target
+        )
+
         trailing_sl_threshold = (
             self._calc_overall_trailing_sl_series(values, sl_threshold)
             if sl_threshold is not None else None
@@ -1855,7 +2158,11 @@ class BacktestEngine:
 
         sl_hit_mask = values <= -trailing_sl_threshold if trailing_sl_threshold is not None else np.zeros(len(values), dtype=bool)
         target_hit_mask = values >= target_threshold if target_threshold is not None else np.zeros(len(values), dtype=bool)
-        hit_mask = sl_hit_mask | target_hit_mask
+        # Nothing can breach while the position is empty -- before the first
+        # leg opens both the MTM and a PERCENT threshold are 0, and 0 >= 0
+        # would read as an instant target hit.
+        has_position = entry_value.to_numpy() > 0
+        hit_mask = (sl_hit_mask | target_hit_mask) & has_position
 
         if not hit_mask.any():
             return None
@@ -1931,12 +2238,18 @@ class BacktestEngine:
             leg_result["pnl"] = round((leg_result["exit_price"] - leg_result["entry_price"]) * QUANTITY * lot_size * direction, 2)
 
 
-    def _reenter_all_legs(self, mode: str, breach_datetime, day_df: pd.DataFrame) -> list:
+    def _reenter_all_legs(self, mode: str, breach_datetime, day_df: pd.DataFrame,
+                          exited_legs: list | None = None) -> list:
         chain_snapshot = self._get_chain_snapshot_at(day_df, breach_datetime)
         if chain_snapshot is None:
             return []
 
         reverse = mode.endswith("_REVERSE")
+        held_position = {
+            leg["leg"]: leg["position"]
+            for leg in (exited_legs or [])
+            if leg.get("leg") is not None and leg.get("position") is not None
+        }
         new_legs = []
 
         for leg_meta in self.legs_meta:
@@ -1950,7 +2263,8 @@ class BacktestEngine:
             if strike_row is None:
                 continue
 
-            position_type = self._flip_position(base_leg_meta["position_type"]) if reverse else base_leg_meta["position_type"]
+            previous = held_position.get(base_leg_meta["leg_number"], base_leg_meta["position_type"])
+            position_type = self._flip_position(previous) if reverse else previous
 
             if mode.startswith("RE_MOMENTUM") and base_leg_meta.get("is_simple_momentum"):
                 fill_row = self._resolve_momentum_fill(base_leg_meta, day_df, strike_row)
