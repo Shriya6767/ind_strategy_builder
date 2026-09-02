@@ -97,6 +97,8 @@ class BacktestEngine:
         self._underlying_series_cache = None
         self._snapshot_cache = {}  # snapshot minute -> as-of chain, per trading day
         self._trail_skip_warned = set()  # leg numbers already warned about ignored trailing
+        self._next_trade_date = {}       # trading date -> the next one
+        self._reentry_frame_cache = {}   # date -> day rows + next day up to exit_time
         self._day_expiry_map = {}  # expiry_type label -> expiry date, rebuilt per trading day
 
 
@@ -300,10 +302,15 @@ class BacktestEngine:
     def process_days(self):
         grouped = self.df.groupby("trade_date", sort=False)
         self._last_trade_date = self.df["trade_date"].max()
+        # date -> the trading day after it, so a pending BTST re-entry can be
+        # searched into the next session (see _reentry_search_frame).
+        ordered_dates = sorted(self.df["trade_date"].unique())
+        self._next_trade_date = dict(zip(ordered_dates, ordered_dates[1:]))
         logger.info(f"Total Trading Days: {len(grouped)}")
         for trade_date, day_df in grouped:
             self._day_expiry_map = self._build_day_expiry_map(trade_date, day_df)
             self._snapshot_cache = {}
+            self._reentry_frame_cache = {}
             if self.strategy_type == "btst":
                 self.process_day_btst(trade_date, day_df)
             else:
@@ -340,8 +347,13 @@ class BacktestEngine:
         for day_block in self.trade_results:
             for leg in day_block["legs"]:
                 leg.pop("_trade_date", None)
+                # A re-entry that filled on Day 2 carries the date of the trade
+                # it continues; everything else is bucketed by its own entry.
+                chain_date = leg.pop("_chain_date", None)
                 entry_dt = leg.get("entry_datetime")
-                bucket = entry_dt.date() if entry_dt is not None else day_block["trade_date"]
+                bucket = chain_date or (
+                    entry_dt.date() if entry_dt is not None else day_block["trade_date"]
+                )
                 legs_by_date.setdefault(bucket, []).append(leg)
             for overall_exit in day_block.get("overall_exits", []):
                 exit_dt = overall_exit.get("exit_datetime")
@@ -394,19 +406,14 @@ class BacktestEngine:
                         
                         del self.held_from_previous_day[leg_key]
 
-                        reentry_legs = self._run_reentry_loop(
-                            leg_meta, closed_leg, day_df, self._evaluate_leg_exit_btst_phase2
-                        )
-                        for rl in reentry_legs:
-                            rl["is_held_overnight"] = (rl.get("status") == "HELD_OVERNIGHT")
-                            if rl.get("status") == "HELD_OVERNIGHT":
-                                rl["_trade_date"] = rl["entry_datetime"].date()
-                                rl_key = f"leg_{rl['leg']}_{rl['entry_datetime'].isoformat()}"
-                                self.held_from_previous_day[rl_key] = rl
-                                logger.debug(f"Overnight leg {rl['leg']}: re-held overnight after close")
-                        
-                        closed_today.extend([closed_leg] + reentry_legs)
-                        tickers_held_today.update(rl["ticker"] for rl in reentry_legs if rl.get("status") == "HELD_OVERNIGHT")
+                        # Closing the carryover ENDS that trade -- no leg-level
+                        # re-entry chain follows it. The Day-2 close is the
+                        # strategy's own square-off, and Phase 2 opens a fresh
+                        # position minutes later; re-entering in between would
+                        # re-open the very position just squared off and then
+                        # double up on it. AlgoTest reports only the carryover
+                        # and then the day's new entry.
+                        closed_today.append(closed_leg)
                     else:
                         del self.held_from_previous_day[leg_key]
 
@@ -890,10 +897,19 @@ class BacktestEngine:
         return leg_result
 
 
-    def _evaluate_leg_exit_btst_phase2(self, leg_meta, leg_result, day_df): 
+    def _evaluate_leg_exit_btst_phase2(self, leg_meta, leg_result, day_df):
         ticker = leg_result["ticker"]
 
+        # A true carryover entered YESTERDAY, so it is live from the Day-2
+        # open. A leg that RE-ENTERED today is only live from its own entry --
+        # scanning it from the Day-2 open let it "exit" on a bar before it
+        # existed, producing exit_datetime earlier than entry_datetime.
         start_mask = day_df["trade_time"] >= self.day2_market_open
+        entry_dt = leg_result.get("entry_datetime")
+        if entry_dt is not None:
+            today = day_df["trade_date"].iloc[0] if not day_df.empty else None
+            if today is not None and entry_dt.date() == today:
+                start_mask &= day_df["datetime_utc"] >= entry_dt
 
         full_day_series = day_df.loc[
             (day_df["ticker"] == ticker) & start_mask
@@ -987,6 +1003,35 @@ class BacktestEngine:
         ]
    
 
+    def _reentry_search_frame(self, day_df: pd.DataFrame) -> pd.DataFrame:
+        """Entry-day rows plus the NEXT trading day's rows up to the strategy
+        exit_time.
+
+        A pending re-entry order (return-to-cost, momentum level) that never
+        fills before the close is still live overnight -- AlgoTest fills it
+        the next morning. Bounded by exit_time rather than the market close,
+        because a BTST position must be square by the Day-2 cutoff.
+
+        INTRADAY is unaffected: there is no Day 2 to spill into."""
+        if self.strategy_type != "btst" or day_df.empty:
+            return day_df
+        today = day_df["trade_date"].iloc[0]
+        cached = self._reentry_frame_cache.get(today)
+        if cached is not None:
+            return cached
+        next_date = self._next_trade_date.get(today)
+        frame = day_df
+        if next_date is not None:
+            tail = self.df.loc[
+                (self.df["trade_date"] == next_date)
+                & (self.df["trade_time"] <= self.exit_time)
+            ]
+            if not tail.empty:
+                frame = pd.concat([day_df, tail])
+        self._reentry_frame_cache[today] = frame
+        return frame
+
+
     def _run_reentry_loop(self, leg_meta, first_result, day_df, evaluator):
         lot_size = leg_meta.get("lot_size", 1)
         remaining_sl_reentries = int(leg_meta.get("reentry_sl_value")) if leg_meta.get("is_reentry_sl") else 0
@@ -1014,7 +1059,9 @@ class BacktestEngine:
                 logger.warning(f"Leg {leg_meta['leg_number']}: unsupported reentry mode '{mode}'")
                 break
 
-            reentry_result = self._resolve_reentry(current_leg_meta, mode, prev_result, day_df)
+            reentry_result = self._resolve_reentry(
+                current_leg_meta, mode, prev_result, self._reentry_search_frame(day_df)
+            )
             if reentry_result is None:
                 break
 
@@ -1026,6 +1073,27 @@ class BacktestEngine:
                 effective_leg_meta["position_type"] = reentry_result["position"]
             else:
                 effective_leg_meta = current_leg_meta
+
+            # A re-entry that only filled on Day 2 belongs to Day 2: the
+            # evaluator here holds Day-1 data and knows nothing about it. Hand
+            # it to the carryover machinery, which closes it at the Day-2
+            # exit_time, and end the chain -- there is no room for another
+            # re-entry before the square-off.
+            if (self.strategy_type == "btst"
+                    and reentry_result["entry_datetime"].date() > day_df["trade_date"].iloc[0]):
+                reentry_result.update({
+                    "status": "HELD_OVERNIGHT",
+                    "exit_datetime": None, "exit_price": None,
+                    "underlying_exit_price": None, "exit_reason": None, "pnl": None,
+                    "quantity_multiplier": QUANTITY * lot_size,
+                    "_trade_date": reentry_result["entry_datetime"].date(),
+                    # It fills on Day 2 but belongs to the trade that opened on
+                    # Day 1 -- report it under that day, as AlgoTest does.
+                    "_chain_date": day_df["trade_date"].iloc[0],
+                    "is_reentry": True, "reentry_mode": mode,
+                })
+                new_legs.append(reentry_result)
+                break
 
             reentry_result = evaluator(effective_leg_meta, reentry_result, day_df)
             if reentry_result.get("status") == "EXIT_DONE":
@@ -1683,9 +1751,7 @@ class BacktestEngine:
         for its price to come back to the entry price of the attempt that
         just exited, then re-enter there."""
         ticker = prev_result["ticker"]
-        return_price = prev_result["entry_price"]
-        lower_bound = return_price * (1 - COST_BUFFER_PCT)
-        upper_bound = return_price * (1 + COST_BUFFER_PCT)
+        return_price = float(prev_result["entry_price"])
 
         series = day_df.loc[
             (day_df["ticker"] == ticker)
@@ -1696,14 +1762,36 @@ class BacktestEngine:
         if series.empty:
             return None
 
+        # The price has "come back to cost" the moment a bar TOUCHES it, so
+        # test the bar's range rather than its close, and fill AT the cost --
+        # that is the whole point of the mode, and it is what AlgoTest books
+        # (its RE_COST entry equals the original entry price to the paisa).
+        # Testing the close inside a tolerance band instead filled wherever
+        # the bar happened to settle, several points away from the cost.
+        low = series["low"].to_numpy()
+        high = series["high"].to_numpy()
+        bar_open = series["open"].to_numpy()
         close = series["close"].to_numpy()
-        hit_mask = (close >= lower_bound) & (close <= upper_bound)
+        touched = (low <= return_price) & (high >= return_price)
 
+        # ...or it GAPPED over the level: on one side at the previous close,
+        # the other at this open, never trading it. A resting order fills at
+        # the first available price, the open -- the same gap-through rule the
+        # premium SL/target exits use. Overnight gaps make this the norm for
+        # BTST: on 2026-01-29 the cost sat at 112.60, Day 1 closed above it
+        # and Day 2 opened at 95.05, which is where AlgoTest fills.
+        prev_close = np.concatenate(([float(prev_result["exit_price"])], close[:-1]))
+        gapped = (prev_close - return_price) * (bar_open - return_price) < 0
+
+        hit_mask = touched | gapped
         if not hit_mask.any():
             return None
 
         idx = int(hit_mask.argmax())
-        fill_row = series.iloc[idx]
+        fill_row = series.iloc[idx].copy()
+        fill_row["close"] = round(
+            return_price if touched[idx] else float(bar_open[idx]), 2
+        )
         return self._build_entry_result(leg_meta, position_type, prev_result, fill_row, is_reentry=True, reentry_mode=mode)
 
 
