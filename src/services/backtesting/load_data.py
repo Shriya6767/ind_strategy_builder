@@ -1,5 +1,5 @@
 from src.core.modules import os, pd, ds, timedelta
-from src.core.config import SENSEX_PROCESSED_OHLC_PATH
+from src.core.config import SENSEX_PROCESSED_FULL_PATH
 from src.core.data_store import DataStore
 from src.core.logger import get_logger
 
@@ -21,6 +21,7 @@ REQUIRED_COLUMNS = [
     "strike",
     "dte",
     "underlying_price",
+    "underlying_open",
     "underlying_high",
     "underlying_low",
     "underlying",
@@ -40,8 +41,8 @@ class DataLoader:
     def __init__(self, symbol: str = "sensex"):
         if str(symbol).lower() != "sensex":
             raise ValueError("Only symbol 'sensex' is supported.")
-        if not SENSEX_PROCESSED_OHLC_PATH:
-            raise ValueError("SENSEX_PROCESSED_OHLC_PATH must be set in .env")
+        if not SENSEX_PROCESSED_FULL_PATH:
+            raise ValueError("SENSEX_PROCESSED_FULL_PATH must be set in .env")
         self.symbol = "sensex"
 
 
@@ -75,8 +76,8 @@ class DataLoader:
         while current <= end_dt:
             month_dir = f"{MONTH_ABBR[current.month]}_{current.year}"
             path = os.path.join(
-                SENSEX_PROCESSED_OHLC_PATH, str(current.year), month_dir,
-                f"SENSEX_MERGED_OHLC_{current.strftime('%d%m%Y')}.parquet"
+                SENSEX_PROCESSED_FULL_PATH, str(current.year), month_dir,
+                f"SENSEX_MERGED_FULL_{current.strftime('%d%m%Y')}.parquet"
             )
             if os.path.exists(path):
                 files.append(path)

@@ -2,10 +2,11 @@ from src.core.modules import os, load_dotenv, psycopg2
     
 load_dotenv()
 
-SENSEX_SPOT_PATH: str = os.getenv("SENSEX_SPOT_PATH")
-SENSEX_FNO_PATH: str = os.getenv("SENSEX_FNO_PATH")
-SENSEX_PROCESSED_PATH: str = os.getenv("SENSEX_PROCESSED_PATH")
-SENSEX_PROCESSED_OHLC_PATH: str = os.getenv("SENSEX_PROCESSED_OHLC_PATH")
+# SENSEX_SPOT_PATH: str = os.getenv("SENSEX_SPOT_PATH")
+# SENSEX_FNO_PATH: str = os.getenv("SENSEX_FNO_PATH")
+# SENSEX_PROCESSED_PATH: str = os.getenv("SENSEX_PROCESSED_PATH")
+# SENSEX_PROCESSED_OHLC_PATH: str = os.getenv("SENSEX_PROCESSED_OHLC_PATH")
+SENSEX_PROCESSED_FULL_PATH: str = os.getenv("SENSEX_PROCESSED_FULL_PATH")
 
 DATABASE_HOST = os.getenv("DATABASE_HOST")
 DATABASE_PORT = os.getenv("DATABASE_PORT")

@@ -1258,6 +1258,43 @@ class BacktestEngine:
             return underlying_low <= stoploss_price if spot_bullish else underlying_high >= stoploss_price
 
 
+    @staticmethod
+    def _underlying_exit_fill(level, underlying_open, underlying_high, underlying_low,
+                              exit_idx, candle_open, close_fill, breach_above):
+        """Fill price for an exit triggered by the UNDERLYING (the
+        UNDERLYING_POINTS / UNDERLYING_PERCENT stop and target types).
+
+        Two cases, and they fill at different prices:
+
+          * the spot crossed the level DURING the bar. The option price at the
+            crossing instant is unknowable inside a 1-minute bar, so use the
+            bar close.
+          * the spot had ALREADY passed the level when the bar opened. Nothing
+            could have filled at the level; the first tradeable price is the
+            bar's open. The common case is a BTST position gapping through its
+            stop overnight and exiting on the next session's first bar.
+
+        Which case applies is decided by the spot's OPEN, not by whether the
+        whole bar sits beyond the level. The whole-bar test is only an
+        approximation of this and a single tick defeats it: on 2026-01-27 the
+        spot opened at 81,252.20, already past an 81,248.59 target, then
+        wicked to 81,248.51 -- 0.08 below -- so the bar was no longer wholly
+        beyond and the exit mis-filled at the close.
+
+        Measured against AlgoTest over 2024-2026: of the underlying stops the
+        whole-bar test still got wrong, 36 of 39 are fixed by reading the
+        open, and the underlying_open fallback below keeps the old behaviour
+        on data built before that column existed.
+        """
+        if underlying_open is None:
+            gapped = (underlying_low[exit_idx] >= level if breach_above
+                      else underlying_high[exit_idx] <= level)
+        else:
+            gapped = (underlying_open[exit_idx] >= level if breach_above
+                      else underlying_open[exit_idx] <= level)
+        return candle_open if gapped else close_fill
+
+
     def _check_sl_target_hit(self, leg_meta, leg_result, leg_series, start_idx=0):
         entry_price = leg_result["entry_price"]
         underlying_entry_price = leg_result.get("underlying_entry_price")
@@ -1282,6 +1319,13 @@ class BacktestEngine:
             underlying_low = series["underlying_low"].to_numpy()
         else:
             underlying_high = underlying_low = series["underlying_price"].to_numpy()
+
+        # Present only on data built with the spot's open (see
+        # _underlying_exit_fill); None falls back to the whole-bar test.
+        underlying_open = (
+            series["underlying_open"].to_numpy()
+            if "underlying_open" in series.columns else None
+        )
 
         trailing_stoploss_price = self._calc_trailing_stoploss_series(
             leg_meta, entry_price, stoploss_price, position_type, close
@@ -1319,19 +1363,25 @@ class BacktestEngine:
             if leg_meta.get("target_type") in ("POINTS", "PERCENT"):
                 exit_fill_price = candle_open if target_gapped_open else float(target_price)
             else:
-                exit_fill_price = underlying_fill
+                exit_fill_price = self._underlying_exit_fill(
+                    target_price, underlying_open, underlying_high, underlying_low,
+                    exit_idx, candle_open, underlying_fill, breach_above=spot_bullish
+                )
         else:
             exit_reason = "STOPLOSS_HIT"
+            level = float(
+                trailing_stoploss_price[exit_idx]
+                if isinstance(trailing_stoploss_price, np.ndarray)
+                else trailing_stoploss_price
+            )
             if leg_meta.get("stoploss_type") in ("POINTS", "PERCENT"):
-                level = float(
-                    trailing_stoploss_price[exit_idx]
-                    if isinstance(trailing_stoploss_price, np.ndarray)
-                    else trailing_stoploss_price
-                )
                 gapped = candle_open <= level if position_type == "BUY" else candle_open >= level
                 exit_fill_price = candle_open if gapped else level
             else:
-                exit_fill_price = underlying_fill
+                exit_fill_price = self._underlying_exit_fill(
+                    level, underlying_open, underlying_high, underlying_low,
+                    exit_idx, candle_open, underlying_fill, breach_above=not spot_bullish
+                )
 
         return exit_row, exit_reason, round(exit_fill_price, 2)
 
