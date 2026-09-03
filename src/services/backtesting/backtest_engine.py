@@ -52,6 +52,9 @@ class BacktestEngine:
     # Sensex options quote in 5-paisa ticks.
     TICK_SIZE = 0.05
 
+    # Strike ladder interval used when the chain is too thin to infer one.
+    _FALLBACK_STRIKE_STEP = 100
+
     def __init__(self, df: pd.DataFrame, request: dict):
         self.df = df.copy()
         self.strategy = request["strategy"]
@@ -100,6 +103,7 @@ class BacktestEngine:
         self._next_trade_date = {}       # trading date -> the next one
         self._reentry_frame_cache = {}   # date -> day rows + next day up to exit_time
         self._day_expiry_map = {}  # expiry_type label -> expiry date, rebuilt per trading day
+        self._snapshot_day_df = None     # frame the current chain snapshot was built from
 
 
     def _parse_entry_time(self) -> dt_time:
@@ -1350,44 +1354,134 @@ class BacktestEngine:
         return None
 
 
+    @staticmethod
+    def _strike_ladder_step(strikes: np.ndarray) -> int:
+        """The listed strike interval implied by `strikes`: the GCD of the
+        gaps between them.
+
+        GCD rather than the smallest or the most common gap, because strikes
+        that have not traded leave holes in the observed ladder -- a run of
+        gaps like 100/200/500 still implies a 100-point ladder. Measured
+        across the whole data tree this returns 100 for the near expiries and
+        500 for the far-dated ones (which genuinely list only 500s), and
+        never a spurious sub-100 value.
+        """
+        if strikes.size < 2:
+            return BacktestEngine._FALLBACK_STRIKE_STEP
+        gaps = np.diff(strikes)
+        gaps = gaps[gaps > 0]
+        if gaps.size == 0:
+            return BacktestEngine._FALLBACK_STRIKE_STEP
+        return int(np.gcd.reduce(gaps)) or BacktestEngine._FALLBACK_STRIKE_STEP
+
+
     def _select_strike_based_on_points(self, leg_meta: dict, leg_chain: pd.DataFrame):
         """
         atm_strike values:
-          0 / "0" / "ATM"      -> the ATM row (moneyness == 'ATM')
-          "ITM-1", "ITM-2", ...-> nth-nearest ITM strike to the underlying
-          "OTM-1", "OTM-2", ...-> nth-nearest OTM strike to the underlying
-        Nearest = smallest distance_from_underlying within that moneyness group.
+          0 / "0" / "ATM"      -> the strike nearest the underlying on the
+                                  listed ladder: round(spot / step) * step
+          "ITM-1", "ITM-2", ...-> n ladder steps in the money  (ATM -+ n*step)
+          "OTM-1", "OTM-2", ...-> n ladder steps out of the money
+
+        Steps run along the LISTED ladder, not along the strikes that happen
+        to have printed. Counting printed rows instead made both ATM and the
+        ITM-n/OTM-n offsets drift whenever a strike was quiet: on 2025-04-07
+        spot was 72,678 (true ATM 72700, which first printed at 09:17), so
+        the 09:16 entry took 72500 as ATM and, walking the printed ITM rows
+        72400/72200/72100/72000/71500, landed on 71500 for ITM-5 -- 1,200
+        points in instead of 500.
+
+        In the money is DOWN the ladder for a call and UP for a put, since a
+        call gains intrinsic value as the strike falls and a put as it rises.
         """
         atm_strike = leg_meta.get("atm_strike", 0)
 
+        if leg_chain.empty:
+            logger.warning(f"Leg {leg_meta['leg_number']}: empty chain snapshot")
+            return None
+
+        strikes = np.unique(leg_chain["strike"].to_numpy().astype(np.int64))
+        step = self._strike_ladder_step(strikes)
+        spot = float(leg_chain["underlying_price"].iloc[0])
+        atm = int(round(spot / step) * step)
+
         if atm_strike in (0, "0", "ATM"):
-            atm_rows = leg_chain.loc[leg_chain["moneyness"] == "ATM"]
-            if atm_rows.empty:
-                logger.warning(f"Leg {leg_meta['leg_number']}: no ATM strike in chain snapshot")
+            target_strike, moneyness_type = atm, "ATM"
+        else:
+            moneyness_type, _, offset_str = str(atm_strike).partition("-")
+            moneyness_type = moneyness_type.strip().upper()
+            offset = int(offset_str) if offset_str.strip().isdigit() else 1
+
+            if moneyness_type not in ("ITM", "OTM"):
+                logger.warning(f"Leg {leg_meta['leg_number']}: unrecognized atm_strike '{atm_strike}'")
                 return None
-            return atm_rows.iloc[0]
 
-        moneyness_type, _, offset_str = str(atm_strike).partition("-")
-        moneyness_type = moneyness_type.strip().upper()
-        offset = int(offset_str) if offset_str.strip().isdigit() else 1
+            inward = -1 if leg_meta["option_type"] == "CE" else 1
+            direction = inward if moneyness_type == "ITM" else -inward
+            target_strike = atm + direction * offset * step
 
-        if moneyness_type not in ("ITM", "OTM"):
-            logger.warning(f"Leg {leg_meta['leg_number']}: unrecognized atm_strike '{atm_strike}'")
+        row = leg_chain.loc[leg_chain["strike"] == target_strike]
+        if not row.empty:
+            selected = row.iloc[0].copy()
+        else:
+            selected = self._first_print_row(leg_chain, target_strike)
+            if selected is None:
+                logger.warning(
+                    f"Leg {leg_meta['leg_number']}: {atm_strike} resolves to strike "
+                    f"{target_strike} (ATM {atm}, ladder step {step}) which never "
+                    f"trades today -- no bar to enter on"
+                )
+                return None
+
+        # The snapshot labels moneyness by strike-vs-spot, so the ladder ATM
+        # reads as ITM/OTM whenever spot sits off the strike. Report what was
+        # asked for instead, and leave the row's own price/distance columns
+        # untouched.
+        selected["moneyness"] = moneyness_type
+        return selected
+
+
+    def _first_print_row(self, leg_chain: pd.DataFrame, target_strike: int):
+        """A chain row for a ladder strike that is listed but has not printed
+        yet at the entry minute.
+
+        The as-of snapshot can only carry a contract forward once it has
+        traded, so a strike that is silent at the entry minute has no row at
+        all, and the leg used to be dropped as STRIKE_NOT_FOUND. AlgoTest,
+        working from a quote feed, still enters it -- and on 41 of the 52 such
+        cases in 2024 its entry price is exactly this contract's FIRST print
+        of the day. So fall back to that first bar, filled at its OPEN (the
+        first traded price) and stamped at the entry minute.
+
+        This reads a price from later in the session: it stands in for the
+        quote a live feed would have shown at the entry minute. Only the
+        ATM/ITM/OTM ladder uses it. The premium-based criteria must not --
+        they match ON the price, so a not-yet-happened number would let them
+        pick the strike itself with hindsight.
+        """
+        day_df = self._snapshot_day_df
+        if day_df is None or leg_chain.empty:
             return None
 
-        subset = (
-            leg_chain.loc[leg_chain["moneyness"] == moneyness_type]
-            .sort_values("distance_from_underlying")
-        )
-
-        if len(subset) < offset:
-            logger.warning(
-                f"Leg {leg_meta['leg_number']}: requested {moneyness_type}-{offset} "
-                f"but only {len(subset)} {moneyness_type} strikes available"
-            )
+        reference = leg_chain.iloc[0]
+        snapshot_time = reference["datetime_utc"]
+        bars = day_df.loc[
+            (day_df["strike"] == target_strike)
+            & (day_df["option_type"] == reference["option_type"])
+            & (day_df["expiration_date"] == reference["expiration_date"])
+            & (day_df["datetime_utc"] > snapshot_time)
+        ]
+        if bars.empty:
             return None
 
-        return subset.iloc[offset - 1]
+        spot = float(reference["underlying_price"])
+        row = bars.loc[bars["datetime_utc"].idxmin()].copy()
+        row["close"] = float(row["open"])
+        row["datetime_utc"] = snapshot_time
+        row["trade_time"] = reference["trade_time"]
+        row["underlying_price"] = spot
+        row["distance_from_underlying"] = abs(float(target_strike) - spot)
+        return row
 
 
     def _recently_priced(self, leg_chain: pd.DataFrame, leg_meta: dict) -> pd.DataFrame:
@@ -1899,6 +1993,9 @@ class BacktestEngine:
         exist, they are sensitive to how stale that price is.
         """
         snapshot_time = pd.Timestamp(snapshot_time)
+        # Kept so the ladder selector can reach a listed strike that has not
+        # printed yet -- see _first_print_row.
+        self._snapshot_day_df = day_df
         cached = self._snapshot_cache.get(snapshot_time)
         if cached is not None:
             return cached
