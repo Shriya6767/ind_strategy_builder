@@ -15,12 +15,40 @@ logger = get_logger(__name__)
 
 _FORK_CTX = mp.get_context("fork") if platform.system() != "Windows" else None
 
+_SHARED_DF = None
+
 _WEEKDAY_CODE_TO_INDEX = {"M": 0, "T": 1, "W": 2, "Th": 3, "F": 4, "Sa": 5, "Su": 6}
 
-def _run_single_strategy(df, strategy_request: dict) -> dict:
+
+def _available_memory_bytes():
+    """Free RAM, or None when it can't be determined.
+
+    /proc/meminfo's MemAvailable is the kernel's own estimate of what a new
+    workload can claim without swapping, which is exactly the question here,
+    and it needs no third-party package on the Ubuntu host. psutil is used
+    if it happens to be installed (e.g. on a dev machine); everything else
+    falls through to None and the worker count stays CPU-bound.
+    """
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    try:
+        import psutil
+        return psutil.virtual_memory().available
+    except Exception:
+        return None
+
+
+def _run_single_strategy(strategy_request: dict, df=None) -> dict:
+    """Runs one strategy in a worker process. `df` is None on the fork path,
+    where the frame is inherited as _SHARED_DF rather than pickled in."""
     strategy_id = strategy_request["strategy"]["strategy_id"]
     try:
-        engine = BacktestEngine(df, strategy_request)
+        engine = BacktestEngine(_SHARED_DF if df is None else df, strategy_request)
         output = engine.run()
         return {"strategy_id": strategy_id, "ok": True, "output": output}
     except Exception as exc:
@@ -130,17 +158,69 @@ class PortfolioBacktestService:
 
 
     def _run_strategies_in_parallel(self, strategies: list[dict], df) -> dict:
-        max_workers = min(len(strategies), mp.cpu_count())
+        """Runs each strategy in its own process against the same market data.
+
+        The data is NOT passed to submit() on Linux. Arguments to submit are
+        pickled and piped to the worker, so handing over the DataFrame would
+        cost one serialized copy in the parent plus one private copy per
+        worker -- for a 3-year load that is ~4 GB each, and it is what made a
+        2-strategy portfolio peak around 33 GB. Publishing it as a module
+        global before the pool forks lets every worker read the parent's
+        pages copy-on-write instead: the engine only ever adds columns to a
+        shallow copy, so almost nothing is actually duplicated.
+
+        Windows has no fork and must still pickle the frame, so it keeps the
+        argument path.
+        """
+        global _SHARED_DF
+
+        forking = _FORK_CTX is not None
+        max_workers = self._worker_budget(len(strategies), df, shared=forking)
         results_by_id = {}
-        with ProcessPoolExecutor(max_workers=max_workers, mp_context=_FORK_CTX) as pool:
-            futures = {}
-            for s in strategies:
-                sid = s["strategy"]["strategy_id"]
-                futures[pool.submit(_run_single_strategy, df, s)] = sid
-            for future in as_completed(futures):
-                result = future.result()
-                results_by_id[result["strategy_id"]] = result
+        if forking:
+            _SHARED_DF = df                  
+        try:
+            with ProcessPoolExecutor(max_workers=max_workers, mp_context=_FORK_CTX) as pool:
+                futures = {}
+                for s in strategies:
+                    sid = s["strategy"]["strategy_id"]
+                    futures[pool.submit(_run_single_strategy, s,
+                                        None if forking else df)] = sid
+                for future in as_completed(futures):
+                    result = future.result()
+                    results_by_id[result["strategy_id"]] = result
+        finally:
+            _SHARED_DF = None
         return results_by_id
+
+
+    @staticmethod
+    def _worker_budget(strategy_count: int, df, shared: bool) -> int:
+        """How many strategies to run at once.
+
+        Bounded by memory as well as CPU: each worker needs room for the
+        columns the engine derives (and, without fork, its own copy of the
+        frame), so a wide portfolio on a small box should run slower rather
+        than exhaust RAM and freeze. Falls back to the CPU count when the
+        available memory can't be read.
+        """
+        workers = max(1, min(strategy_count, mp.cpu_count()))
+        available = _available_memory_bytes()
+        if available is None:
+            return workers
+
+        frame = int(df.memory_usage(deep=False).sum())
+        # ~90 bytes/row of python date/time objects in prepare_dataframe, plus
+        # the frame itself when it could not be inherited.
+        per_worker = 90 * len(df) + (0 if shared else frame)
+        affordable = max(1, int(available * 0.7 // max(per_worker, 1)))
+        if affordable < workers:
+            logger.warning(
+                f"Portfolio: limiting to {affordable} parallel worker(s) instead of "
+                f"{workers} -- {available / 1024**3:.1f} GB available, each worker "
+                f"needs about {per_worker / 1024**3:.1f} GB."
+            )
+        return min(workers, affordable)
 
 
     @staticmethod
@@ -203,9 +283,6 @@ class PortfolioBacktestService:
                 mode = period_selection.get("mode")
                 if mode == "weekdays":
                     output = self._apply_weekday_filter(output, period_selection)
-                # mode == "dte" is deliberately a pass-through: the engine's
-                # per-leg expiry_type already decides which contract trades,
-                # so the strategy result is returned unfiltered.
 
             slippage_percent = override.get("slippage_percent", 0)
             if slippage_percent:
