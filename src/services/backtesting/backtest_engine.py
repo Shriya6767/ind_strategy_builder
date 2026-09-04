@@ -56,7 +56,13 @@ class BacktestEngine:
     _FALLBACK_STRIKE_STEP = 100
 
     def __init__(self, df: pd.DataFrame, request: dict):
-        self.df = df.copy()
+        # Shallow: the engine only replaces datetime_utc and appends
+        # trade_date / trade_time (see prepare_dataframe), and pandas'
+        # copy-on-write gives those writes their own storage without
+        # duplicating any column the caller still holds. A deep copy here
+        # cost a second full frame per run -- ~4 GB on a 3-year load, paid
+        # again in every portfolio worker.
+        self.df = df.copy(deep=False)
         self.strategy = request["strategy"]
         self.legs = request["legs"]
         self.trade_results = []
