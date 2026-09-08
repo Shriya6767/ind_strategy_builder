@@ -108,6 +108,7 @@ class BacktestEngine:
         self._trail_skip_warned = set()  # leg numbers already warned about ignored trailing
         self._next_trade_date = {}       # trading date -> the next one
         self._reentry_frame_cache = {}   # date -> day rows + next day up to exit_time
+        self._next_day = None            # (date, frame) of the day after the one being processed
         self._day_expiry_map = {}  # expiry_type label -> expiry date, rebuilt per trading day
         self._snapshot_day_df = None     # frame the current chain snapshot was built from
 
@@ -316,15 +317,34 @@ class BacktestEngine:
         # searched into the next session (see _reentry_search_frame).
         ordered_dates = sorted(self.df["trade_date"].unique())
         self._next_trade_date = dict(zip(ordered_dates, ordered_dates[1:]))
-        logger.info(f"Total Trading Days: {len(grouped)}")
-        for trade_date, day_df in grouped:
-            self._day_expiry_map = self._build_day_expiry_map(trade_date, day_df)
-            self._snapshot_cache = {}
-            self._reentry_frame_cache = {}
-            if self.strategy_type == "btst":
-                self.process_day_btst(trade_date, day_df)
-            else:
-                self.process_day_intraday(trade_date, day_df)
+        total_days = len(grouped)
+        logger.info(f"Total Trading Days: {total_days}")
+        # Iterate one day AHEAD: the frame the groupby hands out for day N+1
+        # is parked in _next_day so a BTST re-entry pending at the close of
+        # day N can search into it (see _reentry_search_frame) without
+        # touching self.df again. Costs one extra day-sized frame, ~1 ms per
+        # day, and nothing that grows with the years loaded.
+        days = iter(grouped)
+        current = next(days, None)
+        day_no = 0
+        try:
+            while current is not None:
+                upcoming = next(days, None)
+                self._next_day = upcoming
+                trade_date, day_df = current
+                day_no += 1
+                self._day_expiry_map = self._build_day_expiry_map(trade_date, day_df)
+                self._snapshot_cache = {}
+                self._reentry_frame_cache = {}
+                if self.strategy_type == "btst":
+                    self.process_day_btst(trade_date, day_df)
+                else:
+                    self.process_day_intraday(trade_date, day_df)
+                if day_no % 50 == 0 or day_no == total_days:
+                    logger.info(f"Processed {day_no}/{total_days} trading days (up to {trade_date})")
+                current = upcoming
+        finally:
+            self._next_day = None
 
 
     def _dedupe_carryover_legs(self):
@@ -1032,10 +1052,11 @@ class BacktestEngine:
         next_date = self._next_trade_date.get(today)
         frame = day_df
         if next_date is not None:
-            tail = self.df.loc[
-                (self.df["trade_date"] == next_date)
-                & (self.df["trade_time"] <= self.exit_time)
-            ]
+            if self._next_day is not None and self._next_day[0] == next_date:
+                next_day = self._next_day[1]
+            else:                                   # not iterating, or order surprise
+                next_day = self.df.loc[self.df["trade_date"] == next_date]
+            tail = next_day.loc[next_day["trade_time"] <= self.exit_time]
             if not tail.empty:
                 frame = pd.concat([day_df, tail])
         self._reentry_frame_cache[today] = frame
@@ -1432,24 +1453,6 @@ class BacktestEngine:
 
 
     def _select_strike_based_on_points(self, leg_meta: dict, leg_chain: pd.DataFrame):
-        """
-        atm_strike values:
-          0 / "0" / "ATM"      -> the strike nearest the underlying on the
-                                  listed ladder: round(spot / step) * step
-          "ITM-1", "ITM-2", ...-> n ladder steps in the money  (ATM -+ n*step)
-          "OTM-1", "OTM-2", ...-> n ladder steps out of the money
-
-        Steps run along the LISTED ladder, not along the strikes that happen
-        to have printed. Counting printed rows instead made both ATM and the
-        ITM-n/OTM-n offsets drift whenever a strike was quiet: on 2025-04-07
-        spot was 72,678 (true ATM 72700, which first printed at 09:17), so
-        the 09:16 entry took 72500 as ATM and, walking the printed ITM rows
-        72400/72200/72100/72000/71500, landed on 71500 for ITM-5 -- 1,200
-        points in instead of 500.
-
-        In the money is DOWN the ladder for a call and UP for a put, since a
-        call gains intrinsic value as the strike falls and a put as it rises.
-        """
         atm_strike = leg_meta.get("atm_strike", 0)
 
         if leg_chain.empty:
