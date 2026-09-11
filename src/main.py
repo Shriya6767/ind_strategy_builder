@@ -18,7 +18,7 @@ app.add_middleware(
 )
 
 # Compresses any response body over 1 KB
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=6)
 
 # if __name__ == "__main__":
 #     uvicorn.run("src.main:app", host="127.0.0.1", port=8000, reload=True)
