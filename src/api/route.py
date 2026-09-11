@@ -1,5 +1,5 @@
 from urllib import request
-from src.core.modules import APIRouter, HTTPException
+from src.core.modules import APIRouter, HTTPException, ORJSONResponse
 from src.core.schemas import LoadDataRequest
 from src.services.backtesting.load_data import DataLoader
 from src.services.backtesting.backtest_service import BacktestService
@@ -22,11 +22,11 @@ async def run_backtest(request: dict):
     try:
         service = BacktestService()
         result = service.run_engine(request)
-        return {
+        return ORJSONResponse({
             "success": True,
             "message": "Backtest completed successfully.",
             "data": result
-        }
+        })
     except Exception as e:
         logger.error(f"Unexpected error in run_backtest: {e}")
         raise HTTPException(status_code=500, detail={"status_code": 500, "message": "Failed to start backtest."})
@@ -43,11 +43,11 @@ async def apply_slippage(request: dict):
     try:
         service = BacktestService()
         result = service.apply_slippage(strategy_id, slippage_percent)
-        return {
+        return ORJSONResponse({
             "success": True,
             "message": "Slippage applied successfully.",
             "data": result
-        }
+        })
     except KeyError:
         return {
             "success": False,
@@ -65,11 +65,11 @@ async def compare_backtest(request: dict):
     try:
         service = CompareBacktestService()
         result = service.compare_backtests(request)
-        return {
+        return ORJSONResponse({
             "success": True,
             "message": "Backtests compared successfully.",
             "data": result
-        }
+        })
     except Exception as e:
         logger.error(f"Unexpected error in compare_backtest: {e}")
         raise HTTPException(status_code=500, detail={"status_code": 500, "message": "Failed to compare backtests."})
@@ -233,7 +233,7 @@ def delete_portfolio(request: dict):
 def run_portfolio_backtest(request: dict):
     try:
         portfolio_service = PortfolioBacktestService()
-        return portfolio_service.run_portfolio(request)
+        return ORJSONResponse(portfolio_service.run_portfolio(request))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
