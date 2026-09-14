@@ -57,6 +57,11 @@ class SaveStrategyService:
                     entry_delay,
                     exit_time,
                     exit_delay,
+                    is_delay_restart,
+                    delay_restart_time,
+                    positional_expire_on,
+                    positional_entry_day,
+                    positional_exit_day,
                     is_strategy_sl,
                     strategy_sl_type,
                     strategy_sl_value,
@@ -80,7 +85,7 @@ class SaveStrategyService:
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 RETURNING id;
             """
@@ -103,6 +108,11 @@ class SaveStrategyService:
                     strategy["entry_delay"],
                     strategy["exit_time"],
                     strategy["exit_delay"],
+                    strategy.get("is_delay_restart", False),
+                    strategy.get("delay_restart_time"),
+                    strategy.get("positional_expire_on"),
+                    strategy.get("positional_entry_day"),
+                    strategy.get("positional_exit_day"),
                     strategy["is_strategy_sl"],
                     strategy["strategy_sl_type"],
                     strategy["strategy_sl_value"],
@@ -162,6 +172,7 @@ class SaveStrategyService:
                     momentum_value,
                     is_range_breakout,
                     range_breakout_type,
+                    range_end_day,
                     range_end_time,
                     range_on,
                     version,
@@ -174,7 +185,8 @@ class SaveStrategyService:
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s
                 )
                 RETURNING leg_id;
             """
@@ -231,6 +243,7 @@ class SaveStrategyService:
 
                         leg.get("is_range_breakout"),
                         leg.get("range_breakout_type"),
+                        str(leg.get("range_end_day")) if leg.get("range_end_day") is not None else None,
                         leg.get("range_end_time"),
                         leg.get("range_on"),
                         version,
