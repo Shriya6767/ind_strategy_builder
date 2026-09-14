@@ -68,6 +68,8 @@ class BacktestEngine:
         self.trade_results = []
 
         self.strategy_type = self.strategy.get("strategy_type", "intraday").lower()
+        self.is_positional = self.strategy_type == "positional"
+        self._is_multiday = self.strategy_type == "btst" or self.is_positional
 
         if self.strategy_type == "btst":
             self.held_from_previous_day = {}  # Positions held overnight
@@ -75,31 +77,33 @@ class BacktestEngine:
         self.entry_time = self._parse_entry_time()
         self.exit_time = self._parse_exit_time()
 
-        # BTST exits on Day 2, so its exit_time may be earlier in the clock
-        # than entry_time. For INTRADAY that's a contradiction -- fail loudly
-        # instead of silently producing zero trades.
-        if self.strategy_type != "btst" and self.exit_time <= self.entry_time:
+        # BTST/positional exit on a LATER day, so their exit_time may be
+        # earlier in the clock than entry_time. For INTRADAY that's a
+        # contradiction -- fail loudly instead of silently producing zero
+        # trades.
+        if not self._is_multiday and self.exit_time <= self.entry_time:
             raise ValueError(
                 f"INTRADAY strategy: exit_time ({self.exit_time}) must be after "
                 f"entry_time ({self.entry_time})."
             )
 
-        if self.strategy_type == "btst":
+        self.is_delay_restart = bool(self.strategy.get("is_delay_restart"))
+        if self._is_multiday:
             self.day1_market_close = self._parse_day1_market_close()
             self.day2_market_open = self._parse_day2_market_open()
-            # Delay-restart: when enabled, Day-2 monitoring of overnight
-            # positions starts at delay_restart_time instead of the market
-            self.is_delay_restart = bool(self.strategy.get("is_delay_restart"))
+            # Delay-restart: when enabled, carry-day monitoring of overnight
+            # positions starts at delay_restart_time instead of the market open.
             if self.is_delay_restart and self.strategy.get("delay_restart_time"):
                 self.day2_market_open = datetime.strptime(
                     str(self.strategy["delay_restart_time"]), "%H:%M:%S"
                 ).time()
 
         # Entry-day scans (momentum / range-breakout fills, cost re-entries)
-        # must run to the Day-1 session close for BTST: there exit_time is
-        # the DAY-2 cutoff and can be earlier in the clock than entry_time,
-        # which would make a `trade_time <= exit_time` scan permanently empty.
-        self.entry_day_cutoff = self.day1_market_close if self.strategy_type == "btst" else self.exit_time
+        # must run to the Day-1 session close for BTST/positional: there
+        # exit_time is a later day's cutoff and can be earlier in the clock
+        # than entry_time, which would make a `trade_time <= exit_time` scan
+        # permanently empty.
+        self.entry_day_cutoff = self.day1_market_close if self._is_multiday else self.exit_time
 
         # Precompute leg metadata
         self.legs_meta = self._prepare_legs_meta()
@@ -118,6 +122,7 @@ class BacktestEngine:
         self._next_day = None            # (date, frame) of the day after the one being processed
         self._day_expiry_map = {}  # expiry_type label -> expiry date, rebuilt per trading day
         self._snapshot_day_df = None     # frame the current chain snapshot was built from
+        self._current_cycle = None       # active positional expiry cycle
 
 
     def _parse_entry_time(self) -> dt_time:
@@ -210,12 +215,7 @@ class BacktestEngine:
 
     def _build_expiry_calendar(self):
         """Month -> last known expiry of that month, built ONCE from every
-        expiry observed across the whole loaded date range. A single day's
-        chain can't identify the monthly contract (early in a month the
-        monthly isn't listed yet, and far-out quarterlies would be mistaken
-        for it), but across the range the true last expiry of each month
-        shows up. Near the end of the range later months may be incomplete
-        -- load a range extending past the expiries you trade."""
+        expiry observed across the whole loaded date range."""
         self._monthly_expiry_by_month = {}
         for expiry in sorted(pd.to_datetime(pd.unique(self.df["expiration_date"]))):
             self._monthly_expiry_by_month[(expiry.year, expiry.month)] = expiry
@@ -278,9 +278,14 @@ class BacktestEngine:
         expiry = self._resolve_leg_expiry(leg_meta)
         if expiry is None:
             return chain_snapshot.iloc[0:0]
+        if isinstance(expiry, tuple):
+            # positional cycle: the real expiry plus stale labels a
+            # rescheduled series traded under earlier in its life
+            expiry_match = chain_snapshot["expiration_date"].isin(expiry)
+        else:
+            expiry_match = chain_snapshot["expiration_date"] == expiry
         return chain_snapshot[
-            (chain_snapshot["option_type"] == leg_meta["option_type"])
-            & (chain_snapshot["expiration_date"] == expiry)
+            (chain_snapshot["option_type"] == leg_meta["option_type"]) & expiry_match
         ]
 
 
@@ -295,7 +300,10 @@ class BacktestEngine:
     def run(self):
         self.prepare_dataframe()
         self._build_expiry_calendar()
-        self.process_days()
+        if self.is_positional:
+            self.process_positional()
+        else:
+            self.process_days()
         self._dedupe_carryover_legs()
         if self.strategy_type == "btst":
             self._flush_unclosed_final_holds()
@@ -366,9 +374,17 @@ class BacktestEngine:
                 if exit_dt is not None:
                     exit_date = exit_dt.date() if hasattr(exit_dt, "date") else exit_dt
                     if exit_date != block_date:
-                        # This leg's true close is recorded in a LATER
-                        # block -- drop this earlier, now-stale appearance.
-                        continue
+                        entry_dt = leg.get("entry_datetime")
+                        same_day_trade = (
+                            entry_dt is not None and hasattr(entry_dt, "date")
+                            and entry_dt.date() == exit_date
+                        )
+                        if not same_day_trade:
+                            # This leg's true close is recorded in a LATER
+                            # block -- drop this earlier, now-stale appearance.
+                            # (A same-day Day-2 trade -- tomorrow-range entry --
+                            # is recorded ONLY here, so it must be kept.)
+                            continue
                 kept_legs.append(leg)
             day_block["legs"] = kept_legs
 
@@ -410,6 +426,351 @@ class BacktestEngine:
         self.trade_results = rebuilt
 
 
+    # POSITIONAL: one position per expiry cycle, entered N trading days
+    # before the expiry and exited M trading days before it (0 = expiry day).
+    def process_positional(self):
+        expire_on = str(self.strategy.get("positional_expire_on") or "weekly").strip().lower()
+        if expire_on not in ("weekly", "monthly"):
+            raise ValueError(f"positional_expire_on must be 'weekly' or 'monthly', got {expire_on!r}.")
+        entry_day = int(self.strategy.get("positional_entry_day", 0) or 0)
+        exit_day = int(self.strategy.get("positional_exit_day", 0) or 0)
+        if entry_day < exit_day:
+            raise ValueError(
+                f"positional_entry_day ({entry_day}) must be >= positional_exit_day "
+                f"({exit_day}) -- both count trading days BEFORE expiry (0 = expiry day)."
+            )
+        if entry_day == exit_day and self.exit_time <= self.entry_time:
+            raise ValueError(
+                "positional entry and exit fall on the same day: exit_time must be after entry_time."
+            )
+
+        ordered_dates = sorted(self.df["trade_date"].unique())
+        date_pos = {d: i for i, d in enumerate(ordered_dates)}
+
+        # An exchange reschedule relabels a series mid-life (Jan 2026: the
+        # 15JAN contracts traded until Jan 12, then became 14JAN for a
+        # holiday). The abandoned label is STALE: it must not form a cycle of
+        # its own, and the real expiry's cycle must accept it as an alias --
+        # both when picking the entry chain (still under the old label on
+        # early days) and when following the position across the rename.
+        presence = self.df.groupby("expiration_date")["trade_date"].agg(["min", "max"])
+        first_seen = {pd.Timestamp(k): v for k, v in presence["min"].items()}
+        last_seen = {pd.Timestamp(k): v for k, v in presence["max"].items()}
+        all_labels = sorted(first_seen)
+        last_loaded = ordered_dates[-1]
+        aliases = {}   # real expiry label -> tuple of labels (real first)
+        stale = set()
+        for lbl in all_labels:
+            if lbl.date() > last_loaded or last_seen[lbl] >= lbl.date():
+                continue  # still alive at its own date, or beyond the range
+            for other in all_labels:
+                if other is lbl or other in stale:
+                    continue
+                if (abs((other - lbl).days) <= 7
+                        and first_seen[other] > last_seen[lbl]):
+                    stale.add(lbl)
+                    aliases.setdefault(other, []).append(lbl)
+                    logger.info(
+                        f"POSITIONAL: expiry label {lbl.date()} was relabeled to "
+                        f"{other.date()} mid-life (rescheduled expiry) -- treating as one series."
+                    )
+                    break
+
+        if expire_on == "monthly":
+            candidates = sorted(self._monthly_expiry_by_month.values())
+        else:
+            candidates = sorted(pd.to_datetime(pd.unique(self.df["expiration_date"])))
+        cycles = []
+        for expiry in candidates:
+            if expiry in stale:
+                continue
+            pos = date_pos.get(expiry.date())
+            if pos is None:          # expiry beyond the loaded range
+                continue
+            entry_idx = pos - entry_day
+            if entry_idx < 0:        # not enough history before this expiry
+                continue
+            labels = (expiry, *aliases.get(expiry, ()))
+            cycles.append((labels, ordered_dates[entry_idx], ordered_dates[pos - exit_day], pos))
+
+        logger.info(
+            f"POSITIONAL ({expire_on}): {len(cycles)} expiry cycle(s), "
+            f"entry T-{entry_day}, exit T-{exit_day}"
+        )
+        for labels, entry_date, exit_date, expiry_pos in cycles:
+            self._process_positional_cycle(labels, entry_date, exit_date, ordered_dates, expiry_pos)
+
+
+    def _cycle_frame(self, start_date, end_date) -> pd.DataFrame:
+        lo = self.df["datetime_utc"].searchsorted(pd.Timestamp(start_date, tz="UTC"), side="left")
+        hi = self.df["datetime_utc"].searchsorted(
+            pd.Timestamp(end_date, tz="UTC") + pd.Timedelta(days=1), side="left"
+        )
+        return self.df.iloc[lo:hi]
+
+
+    def _cycle_contract_frame(self, option_type, strike, cycle) -> pd.DataFrame:
+        """One CONTRACT's bars across the whole cycle, matched by strike +
+        option type + the cycle's expiry labels rather than by ticker: a
+        rescheduled series trades under a NEW ticker after the relabel
+        (15JAN26 -> 14JAN26), and the position must follow it across the
+        rename. Session-bounded (drops stray post-15:30 prints) and cached
+        per cycle. option_type=None gives the per-minute underlying series
+        (strike is ignored -- one spot series serves the whole cycle)."""
+        key = (None, None) if option_type is None else (option_type, strike)
+        cached = self._cycle_ticker_cache.get(key)
+        if cached is not None:
+            return cached
+        frame = self._cycle_frame(cycle["entry_date"], cycle["exit_date"])
+        if option_type is None:
+            rows = frame.drop_duplicates(subset="datetime_utc", keep="first")
+        else:
+            rows = frame.loc[
+                (frame["option_type"] == option_type)
+                & (frame["strike"] == strike)
+                & frame["expiration_date"].isin(cycle["expiry_labels"])
+            ]
+        rows = rows.loc[rows["trade_time"] <= self.day1_market_close].sort_values("datetime_utc")
+        self._cycle_ticker_cache[key] = rows
+        return rows
+
+
+    def _process_positional_cycle(self, expiry_labels, entry_date, exit_date, ordered_dates, expiry_pos):
+        expiry = expiry_labels[0]  # the real settlement; the rest are stale aliases
+        self._range_cache = {}
+        self._ticker_series_cache = {}
+        self._underlying_series_cache = None
+        self._snapshot_cache = {}
+        self._cycle_ticker_cache = {}
+
+        entry_frame = self._cycle_frame(entry_date, entry_date)
+        if entry_frame.empty:
+            return
+
+        # Every leg trades THIS cycle's contract regardless of its own
+        # expiry_type label -- positional_expire_on picked the series.
+        self._day_expiry_map = {label: expiry_labels for label in self.VALID_EXPIRY_TYPES}
+        entry_snapshot = self.find_entry_snapshot(entry_frame)
+        if entry_snapshot is None or entry_snapshot.empty:
+            logger.warning(f"[positional {expiry.date()}] no entry snapshot on {entry_date}")
+            return
+
+        cycle = {
+            "expiry": expiry,
+            "expiry_labels": expiry_labels,
+            "entry_date": entry_date,
+            "exit_date": exit_date,
+            "ordered_dates": ordered_dates,
+            "expiry_pos": expiry_pos,
+        }
+        self._current_cycle = cycle
+        # The session-masked monitoring frame: handing THIS to the shared
+        # intraday machinery (re-entries, momentum scans, chain snapshots,
+        # overall SL/target) makes their datetime-based logic work across
+        # the whole holding period unchanged.
+        monitor_frame = self._positional_monitor_frame(cycle)
+        cycle["monitor_frame"] = monitor_frame
+
+        result = {"trade_date": entry_date, "legs": []}
+        for leg_meta in self.legs_meta:
+            leg_result = self.execute_leg(leg_meta, entry_snapshot, monitor_frame)
+            if leg_result.get("status") == "ENTRY_DONE":
+                effective_leg_meta = leg_result.pop("_effective_leg_meta", None) or leg_meta
+                lot_size = effective_leg_meta.get("lot_size", 1)
+                leg_result = self._evaluate_leg_exit_positional(effective_leg_meta, leg_result)
+                leg_result["quantity_multiplier"] = QUANTITY * lot_size
+                if leg_result.get("status") == "EXIT_DONE":
+                    direction = 1 if effective_leg_meta["position_type"] == "BUY" else -1
+                    leg_result["pnl"] = round(
+                        (leg_result["exit_price"] - leg_result["entry_price"]) * QUANTITY * lot_size * direction, 2
+                    )
+                else:
+                    leg_result["pnl"] = None
+                leg_result["is_reentry"] = False
+                leg_result["reentry_mode"] = None
+                result["legs"].append(leg_result)
+
+                # Per-leg re-entries after SL/target, exactly as intraday --
+                # the masked frame lets fills land on any later cycle day.
+                result["legs"].extend(
+                    self._run_reentry_loop(effective_leg_meta, leg_result, monitor_frame, self.evaluate_leg_exit)
+                )
+            else:
+                result["legs"].append(leg_result)
+
+        # Overall SL/Target/Re-entry across all legs, as in intraday.
+        result = self._apply_overall_risk_management(monitor_frame, result)
+
+        self._current_cycle = None
+        if result["legs"]:
+            self.trade_results.append(result)
+
+
+    def _positional_monitor_frame(self, cycle) -> pd.DataFrame:
+        """Every bar of the cycle that falls inside the strategy's live
+        window: entry day from entry_time to the close, carry days from the
+        (delay-restart aware) monitor start to the close, the exit day from
+        the monitor start to exit_time. One boolean pass per cycle."""
+        frame = self._cycle_frame(cycle["entry_date"], cycle["exit_date"])
+        dates = frame["trade_date"].to_numpy()
+        times = frame["trade_time"].to_numpy()
+        entry_date, exit_date = cycle["entry_date"], cycle["exit_date"]
+        in_session = times <= self.day1_market_close
+        if entry_date == exit_date:
+            mask = (dates == entry_date) & (times >= self.entry_time) & (times <= self.exit_time)
+        else:
+            on_entry = (dates == entry_date) & (times >= self.entry_time) & in_session
+            carry = (dates > entry_date) & (dates < exit_date) & (times >= self.day2_market_open) & in_session
+            on_exit = (dates == exit_date) & (times >= self.day2_market_open) & (times <= self.exit_time)
+            mask = on_entry | carry | on_exit
+        return frame.loc[mask]
+
+
+    def _resolve_range_breakout_fill_positional(self, leg_meta, strike_row, cycle, range_end_t):
+        """Range window: entry snapshot minute -> range_end_day (trading days
+        before expiry, 0 = expiry day) at range_end_time. Breach scan: after
+        the window, until the cycle's exit-day cutoff. Prices follow the
+        single-day implementation: per-minute closes of the instrument, or
+        the spot for range_breakout_type='underlying' (fills are always
+        option bars)."""
+        raw_end_day = leg_meta.get("range_end_day")
+        try:
+            end_dte = int(raw_end_day)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Leg {leg_meta['leg_number']}: positional range_end_day must be a number of "
+                f"trading days before expiry (got {raw_end_day!r}) -- skipping leg"
+            )
+            return None
+
+        end_idx = cycle["expiry_pos"] - end_dte
+        if end_idx < 0 or end_idx >= len(cycle["ordered_dates"]):
+            logger.warning(f"Leg {leg_meta['leg_number']}: range_end_day {end_dte} outside loaded range -- skipping leg")
+            return None
+        end_date = cycle["ordered_dates"][end_idx]
+        if not (cycle["entry_date"] <= end_date <= cycle["exit_date"]):
+            logger.warning(
+                f"Leg {leg_meta['leg_number']}: range end {end_date} not within the cycle "
+                f"[{cycle['entry_date']} .. {cycle['exit_date']}] -- skipping leg"
+            )
+            return None
+
+        range_on = str(leg_meta.get("range_on")).strip().lower()
+        if range_on not in ("high", "low"):
+            logger.warning(f"Leg {leg_meta['leg_number']}: invalid range_on {leg_meta.get('range_on')!r} -- skipping leg")
+            return None
+        watch_high = range_on == "high"
+        is_underlying = str(leg_meta.get("range_breakout_type")).strip().lower() == "underlying"
+
+        range_start_dt = strike_row["datetime_utc"]
+        range_end_dt = pd.Timestamp(f"{end_date} {range_end_t}", tz="UTC")
+        exit_cutoff_dt = pd.Timestamp(f"{cycle['exit_date']} {self.exit_time}", tz="UTC")
+        if range_end_dt <= range_start_dt:
+            logger.warning(
+                f"Leg {leg_meta['leg_number']}: range end {range_end_dt} is not after the "
+                f"entry snapshot {range_start_dt} -- skipping leg"
+            )
+            return None
+
+        # The fill must be an option bar, so the contract's own series
+        # drives the breach scan; the window reference is that same series
+        # for 'instrument', or the cycle's per-minute spot for 'underlying'.
+        # Both frames are time-sorted and cycle-cached, so the window and
+        # the scan are plain searchsorted slices -- no boolean masks.
+        rows = self._cycle_contract_frame(leg_meta["option_type"], strike_row["strike"], cycle)
+        if rows.empty:
+            return None
+        win = self._cycle_contract_frame(None, None, cycle) if is_underlying else rows
+
+        win_dts = win["datetime_utc"]
+        w0 = win_dts.searchsorted(range_start_dt, side="left")
+        w1 = win_dts.searchsorted(range_end_dt, side="right")
+        if w0 >= w1:
+            logger.warning(f"Leg {leg_meta['leg_number']}: no candles in the positional range window -- skipping leg")
+            return None
+        window_ref = (win["underlying_price"] if is_underlying else win["close"]).to_numpy()[w0:w1]
+        trigger_price = float(window_ref.max() if watch_high else window_ref.min())
+
+        scan_dts = rows["datetime_utc"]
+        lo = scan_dts.searchsorted(range_end_dt, side="right")
+        hi = scan_dts.searchsorted(exit_cutoff_dt, side="right")
+        if lo >= hi:
+            return None
+        scan_ref = (rows["underlying_price"] if is_underlying else rows["close"]).to_numpy()[lo:hi]
+        hit = scan_ref >= trigger_price if watch_high else scan_ref <= trigger_price
+        if not hit.any():
+            return None
+        return rows.iloc[int(lo) + int(hit.argmax())]
+
+
+    def _evaluate_leg_exit_positional(self, leg_meta, leg_result, day_df=None):
+        """Multi-day monitoring: entry day from the entry bar, every carry
+        day from the (delay-restart aware) monitor start to the close, the
+        exit day up to exit_time. One vectorized SL/target pass over the
+        whole holding period; if nothing hits, square off on the exit day.
+        (day_df is ignored -- the active cycle provides the window; the
+        parameter keeps the shared evaluator interface for re-entry loops.)"""
+        cycle = self._current_cycle
+        rows = self._cycle_contract_frame(leg_result["option"], leg_result["strike"], cycle)
+        entry_dt = leg_result["entry_datetime"]
+        entry_date = entry_dt.date()
+        exit_date = cycle["exit_date"]
+        monitor_start = self.day2_market_open
+
+        dates = rows["trade_date"].to_numpy()
+        times = rows["trade_time"].to_numpy()
+        dts = rows["datetime_utc"].to_numpy()
+
+        on_entry_day = (dates == entry_date) & (dts >= entry_dt)
+        carry = (dates > entry_date) & (dates < exit_date) & (times >= monitor_start)
+        if exit_date == entry_date:
+            on_exit_day = on_entry_day & (times <= self.exit_time)
+            mask = on_exit_day
+        else:
+            on_exit_day = (dates == exit_date) & (times >= monitor_start) & (times <= self.exit_time)
+            mask = on_entry_day | carry | on_exit_day
+
+        series = rows.loc[mask]
+        if series.empty:
+            leg_result.update({
+                "exit_datetime": None, "exit_price": None, "underlying_exit_price": None,
+                "exit_reason": "NO_MONITORING_DATA", "status": "OPEN_NO_EXIT_SIGNAL",
+            })
+            return leg_result
+
+        # first monitored bar of every LATER day: the overnight gap candle
+        series_dates = series["trade_date"].to_numpy()
+        day_first = np.empty(len(series), dtype=bool)
+        day_first[0] = False
+        day_first[1:] = series_dates[1:] != series_dates[:-1]
+
+        hit = self._check_sl_target_hit(leg_meta, leg_result, series, day_first_mask=day_first)
+        if hit is not None:
+            exit_row, exit_reason, exit_fill_price = hit
+            leg_result["exit_datetime"] = exit_row["datetime_utc"]
+            leg_result["exit_price"] = exit_fill_price
+            leg_result["underlying_exit_price"] = self._underlying_at(exit_row)
+            leg_result["exit_reason"] = exit_reason
+            leg_result["status"] = "EXIT_DONE"
+            return leg_result
+
+        # time exit on the cycle's exit day
+        exit_day_series = series.loc[series["trade_date"].to_numpy() == exit_date]
+        if not exit_day_series.empty:
+            exit_row = exit_day_series.iloc[-1]
+            exit_datetime = pd.Timestamp(f"{exit_date} {self.exit_time}", tz="UTC")
+        else:
+            exit_row = series.iloc[-1]
+            exit_datetime = exit_row["datetime_utc"]
+
+        leg_result["exit_datetime"] = exit_datetime
+        leg_result["exit_price"] = round(float(exit_row["close"]), 2)
+        leg_result["underlying_exit_price"] = self._underlying_at(exit_row)
+        leg_result["exit_reason"] = "POSITIONAL_EXIT"
+        leg_result["status"] = "EXIT_DONE"
+        return leg_result
+
+
     def process_day_intraday(self, trade_date, day_df):
         entry_snapshot = self.find_entry_snapshot(day_df)
         if entry_snapshot is None or entry_snapshot.empty:
@@ -423,7 +784,7 @@ class BacktestEngine:
         tickers_held_today = set()
 
         # ========== PHASE 1: Close any positions held overnight from yesterday ==========
-        if self.held_from_previous_day:            
+        if self.held_from_previous_day:
             for leg_key, leg_result in list(self.held_from_previous_day.items()):
                 leg_meta = self._get_leg_meta_by_number(leg_result["leg"])
                 if leg_meta:
@@ -494,7 +855,7 @@ class BacktestEngine:
         same day (<= exit_time); BTST exits on Day 2, so its exit_time can
         be earlier in the clock than entry_time -- Day-1 entries are
         bounded by the session close instead."""
-        upper_bound = self.day1_market_close if self.strategy_type == "btst" else self.exit_time
+        upper_bound = self.day1_market_close if self._is_multiday else self.exit_time
         candidates = day_df.loc[
             (day_df["trade_time"] >= self.entry_time) & (day_df["trade_time"] <= upper_bound),
             "datetime_utc",
@@ -572,6 +933,30 @@ class BacktestEngine:
                 effective_leg_meta = leg_result.pop("_effective_leg_meta", None) or leg_meta
                 lot_size = effective_leg_meta.get("lot_size", 1)
 
+                if leg_result["entry_datetime"].date() > trade_date:
+                    # Range window ended TOMORROW: the breach entry happens on
+                    # Day 2, and BTST has no Day 3 -- the position enters AND
+                    # exits on Day 2 (SL/TGT until exit_time, else squared off
+                    # there). No re-entry chain follows that square-off.
+                    next_day_frame = self._next_day_frame(trade_date)
+                    if next_day_frame is not None:
+                        leg_result = self._evaluate_leg_exit_btst_phase2(
+                            effective_leg_meta, leg_result, next_day_frame
+                        )
+                    leg_result["quantity_multiplier"] = QUANTITY * lot_size
+                    if leg_result.get("status") == "EXIT_DONE":
+                        direction = 1 if effective_leg_meta["position_type"] == "BUY" else -1
+                        leg_result["pnl"] = round(
+                            (leg_result["exit_price"] - leg_result["entry_price"]) * QUANTITY * lot_size * direction, 2
+                        )
+                    else:
+                        leg_result["pnl"] = None
+                    leg_result["is_reentry"] = False
+                    leg_result["reentry_mode"] = None
+                    leg_result["is_held_overnight"] = False
+                    result["legs"].append(leg_result)
+                    continue
+
                 # Day-1 monitoring (entry-day SL/TGT, or held overnight)
                 leg_result = self._evaluate_leg_exit_btst_phase1(effective_leg_meta, leg_result, day_df)
 
@@ -637,10 +1022,11 @@ class BacktestEngine:
                 "status": "NO_EXPIRY_AVAILABLE",
             }
 
+        expiry_primary = expiry[0] if isinstance(expiry, tuple) else expiry
         leg_chain = self._filter_leg_chain(entry_snapshot, leg_meta)
         if leg_chain.empty:
             logger.warning(
-                f"Leg {leg_meta['leg_number']}: expiry {expiry.date()} resolved but no chain "
+                f"Leg {leg_meta['leg_number']}: expiry {expiry_primary.date()} resolved but no chain "
                 f"rows at the entry snapshot (option_type={leg_meta['option_type']}, "
                 f"expiry_type={leg_meta['expiry_type']})"
             )
@@ -649,7 +1035,7 @@ class BacktestEngine:
                 "position": leg_meta["position_type"],
                 "option": leg_meta["option_type"],
                 "expiry_type": leg_meta["expiry_type"],
-                "expiration_date": expiry,
+                "expiration_date": expiry_primary,
                 "status": "NO_CHAIN_DATA",
             }
 
@@ -842,11 +1228,12 @@ class BacktestEngine:
 
 
     def evaluate_leg_exit(self, leg_meta, leg_result, day_df):
-        """Route to INTRADAY or BTST phase1 evaluator based on strategy type."""
+        """Route to the INTRADAY, BTST phase-1 or POSITIONAL evaluator."""
         if self.strategy_type == "btst":
             return self._evaluate_leg_exit_btst_phase1(leg_meta, leg_result, day_df)
-        else:
-            return self._evaluate_leg_exit_intraday(leg_meta, leg_result, day_df)
+        if self.is_positional:
+            return self._evaluate_leg_exit_positional(leg_meta, leg_result)
+        return self._evaluate_leg_exit_intraday(leg_meta, leg_result, day_df)
 
 
     def _evaluate_leg_exit_intraday(self, leg_meta, leg_result, day_df):
@@ -951,6 +1338,29 @@ class BacktestEngine:
         full_day_series = day_df.loc[
             (day_df["ticker"] == ticker) & start_mask
         ].sort_values("datetime_utc")
+
+        if full_day_series.empty and leg_result.get("expiration_date") is not None:
+            # A rescheduled expiry renames the series overnight (15JAN26 ->
+            # 14JAN26) and the old ticker stops printing. If the LABEL itself
+            # vanished from today's chain, follow the same contract (strike +
+            # option type) under the nearest replacement label. A merely
+            # quiet contract keeps its label in the chain and is untouched.
+            expiry = pd.Timestamp(leg_result["expiration_date"])
+            day_labels = pd.to_datetime(pd.unique(day_df["expiration_date"]))
+            if not (day_labels == expiry).any():
+                near = [lbl for lbl in day_labels if abs((lbl - expiry).days) <= 7]
+                if near:
+                    new_label = min(near, key=lambda lbl: abs((lbl - expiry).days))
+                    logger.info(
+                        f"BTST carryover {ticker}: expiry label {expiry.date()} was "
+                        f"relabeled to {new_label.date()} -- following the contract."
+                    )
+                    full_day_series = day_df.loc[
+                        (day_df["option_type"] == leg_result["option"])
+                        & (day_df["strike"] == leg_result["strike"])
+                        & (day_df["expiration_date"] == new_label)
+                        & start_mask
+                    ].sort_values("datetime_utc")
 
         if full_day_series.empty:
             logger.warning(
@@ -1330,7 +1740,7 @@ class BacktestEngine:
         return gap_fill if gapped else close_fill
 
 
-    def _check_sl_target_hit(self, leg_meta, leg_result, leg_series, start_idx=0):
+    def _check_sl_target_hit(self, leg_meta, leg_result, leg_series, start_idx=0, day_first_mask=None):
         entry_price = leg_result["entry_price"]
         underlying_entry_price = leg_result.get("underlying_entry_price")
         position_type = leg_result.get("position") or leg_meta["position_type"]
@@ -1403,12 +1813,23 @@ class BacktestEngine:
         #         a BUY sells at the low, a SELL buys back at the high.
         #       - delay-restart OFF: fill at that candle's CLOSE.
         gap_fill = candle_open
-        if self.strategy_type == "btst" and exit_idx == 0:
-            if pd.Timestamp(leg_result["entry_datetime"]).date() < exit_row["datetime_utc"].date():
-                if self.is_delay_restart:
-                    gap_fill = float(low[exit_idx]) if position_type == "BUY" else float(high[exit_idx])
-                else:
-                    gap_fill = float(close[exit_idx])
+        # A carry-day's FIRST monitored candle: BTST identifies it as the
+        # first bar of its single Day-2 series; positional monitors many days
+        # in one series, so the caller marks every later-day first bar via
+        # day_first_mask (aligned to leg_series before start_idx slicing).
+        if day_first_mask is not None:
+            overnight_gap_candle = bool(day_first_mask[start_idx + exit_idx])
+        else:
+            overnight_gap_candle = (
+                self.strategy_type == "btst"
+                and exit_idx == 0
+                and pd.Timestamp(leg_result["entry_datetime"]).date() < exit_row["datetime_utc"].date()
+            )
+        if overnight_gap_candle:
+            if self.is_delay_restart:
+                gap_fill = float(low[exit_idx]) if position_type == "BUY" else float(high[exit_idx])
+            else:
+                gap_fill = float(close[exit_idx])
 
         if target_hit_mask[exit_idx] and (target_gapped_open or not stoploss_hit_mask[exit_idx]):
             exit_reason = "TARGET_HIT"
@@ -1820,6 +2241,16 @@ class BacktestEngine:
                 f"be parsed (raw value: '{leg_meta.get('range_end_time')}') -- skipping leg"
             )
             return None
+        # POSITIONAL range windows are measured in trading days before
+        # expiry and can span several days -- resolved against the active
+        # expiry cycle instead of day_df.
+        if self.is_positional:
+            return self._resolve_range_breakout_fill_positional(leg_meta, strike_row, self._current_cycle, range_end)
+        # BTST range window may extend into the NEXT session
+        # (range_end_day: "tomorrow"); "today"/absent keeps the same-day window.
+        if (self.strategy_type == "btst"
+                and str(leg_meta.get("range_end_day", "today")).strip().lower() == "tomorrow"):
+            return self._resolve_range_breakout_fill_btst_tomorrow(leg_meta, day_df, strike_row, range_end)
         if range_end <= self.entry_time:
             logger.warning(
                 f"Leg {leg_meta['leg_number']}: range_end_time ({leg_meta.get('range_end_time')}) "
@@ -1878,6 +2309,77 @@ class BacktestEngine:
 
         rel_idx = int(hit_mask.argmax())
         return ticker_series["frame"].iloc[lo + rel_idx]
+
+
+    def _next_day_frame(self, today):
+        """The next trading day's full frame -- from the one-day-ahead
+        iterator when aligned, else sliced from the master frame."""
+        next_date = self._next_trade_date.get(today)
+        if next_date is None:
+            return None
+        if self._next_day is not None and self._next_day[0] == next_date:
+            return self._next_day[1]
+        return self.df.loc[self.df["trade_date"] == next_date]
+
+
+    def _resolve_range_breakout_fill_btst_tomorrow(self, leg_meta, day_df, strike_row, range_end):
+        """BTST range window ending TOMORROW: Day-1 bars from entry_time to
+        the close plus Day-2 bars up to range_end_time form the range; the
+        breach is scanned on Day 2 between range_end_time and exit_time.
+        BTST has no Day 3 -- a Day-2 fill enters AND exits on Day 2 (see
+        execute_strategy_btst)."""
+        range_on = str(leg_meta.get("range_on")).strip().lower()
+        if range_on not in ("high", "low"):
+            logger.warning(f"Leg {leg_meta['leg_number']}: invalid range_on {leg_meta.get('range_on')!r} -- skipping leg")
+            return None
+        if range_end >= self.exit_time:
+            logger.warning(
+                f"Leg {leg_meta['leg_number']}: range_end_day='tomorrow' needs range_end_time "
+                f"({range_end}) before exit_time ({self.exit_time}) -- no room to enter and exit. Skipping leg."
+            )
+            return None
+        watch_high = range_on == "high"
+        is_underlying = str(leg_meta.get("range_breakout_type")).strip().lower() == "underlying"
+        ticker = strike_row["ticker"]
+
+        today = day_df["trade_date"].iloc[0]
+        next_day_df = self._next_day_frame(today)
+        if next_day_df is None:
+            logger.warning(f"Leg {leg_meta['leg_number']}: range ends tomorrow but no next trading day loaded -- skipping leg")
+            return None
+
+        col = "underlying_price" if is_underlying else "close"
+        if is_underlying:
+            ref1 = day_df.drop_duplicates(subset="datetime_utc", keep="first")
+            ref2 = next_day_df.drop_duplicates(subset="datetime_utc", keep="first")
+        else:
+            ref1 = day_df.loc[day_df["ticker"] == ticker]
+            ref2 = next_day_df.loc[next_day_df["ticker"] == ticker]
+
+        window_values = np.concatenate([
+            ref1.loc[
+                (ref1["trade_time"] >= self.entry_time)
+                & (ref1["trade_time"] <= self.day1_market_close), col
+            ].to_numpy(),
+            ref2.loc[ref2["trade_time"] <= range_end, col].to_numpy(),
+        ])
+        if len(window_values) == 0:
+            logger.warning(f"Leg {leg_meta['leg_number']}: no candles in the two-day range window -- skipping leg")
+            return None
+        trigger_price = float(np.max(window_values)) if watch_high else float(np.min(window_values))
+
+        scan = next_day_df.loc[
+            (next_day_df["ticker"] == ticker)
+            & (next_day_df["trade_time"] > range_end)
+            & (next_day_df["trade_time"] <= self.exit_time)
+        ].sort_values("datetime_utc")
+        if scan.empty:
+            return None
+        reference = (scan["underlying_price"] if is_underlying else scan["close"]).to_numpy()
+        hit_mask = reference >= trigger_price if watch_high else reference <= trigger_price
+        if not hit_mask.any():
+            return None
+        return scan.iloc[int(hit_mask.argmax())]
 
 
     def _resolve_reentry(self, leg_meta: dict, mode: str, prev_result: dict, day_df: pd.DataFrame):
@@ -2169,8 +2671,13 @@ class BacktestEngine:
             return result
 
         if self.strategy_type != "btst":
+            # Positional hands in an already session-masked multi-day frame
+            # (entry day from entry_time, carry days from the delay-restart
+            # start, exit day up to exit_time), so its time cutoff must be a
+            # no-op -- the frame IS the window. Intraday keeps exit_time.
+            cutoff = self.day1_market_close if self.is_positional else self.exit_time
             return self._run_overall_risk_cycles(
-                day_df, result, active_legs, has_sl, has_target, cutoff=self.exit_time
+                day_df, result, active_legs, has_sl, has_target, cutoff=cutoff
             )
             
         today_date = day_df["trade_date"].iloc[0] if not day_df.empty else None
