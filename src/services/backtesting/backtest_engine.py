@@ -489,30 +489,18 @@ class BacktestEngine:
             pos = date_pos.get(expiry.date())
             if pos is None:          # expiry beyond the loaded range
                 continue
-            entry_idx = pos - entry_day
-            if entry_idx < 0:        # not enough history before this expiry
-                continue
-            entry_date = ordered_dates[entry_idx]
-            # AlgoTest trades only CLEAN cycles (verified against its trade
-            # exports): skip when the entry->expiry window is disturbed --
-            # a weekend special session inside it, or a holiday (the window's
-            # trading days then don't cover every weekday of the calendar
-            # span; the shifted entry would also collide with the previous
-            # cycle, which exits at 09:20 on expiry day while the new entry
-            # would fire at entry_time that same morning).
-            window = ordered_dates[entry_idx:pos + 1]
-            weekday_span = sum(
-                1 for k in range((expiry.date() - entry_date).days + 1)
-                if (entry_date + timedelta(days=k)).weekday() < 5
-            )
-            if any(d.weekday() >= 5 for d in window) or weekday_span != len(window):
-                logger.info(
-                    f"POSITIONAL: skipping {expiry.date()} cycle -- window "
-                    f"{entry_date}..{expiry.date()} has a holiday/weekend session (AlgoTest convention)."
+            entry_date = self._weekdays_before_expiry(expiry.date(), entry_day, date_pos, ordered_dates)
+            exit_date = self._weekdays_before_expiry(expiry.date(), exit_day, date_pos, ordered_dates)
+            if entry_date is None or exit_date is None:
+                continue             # not enough history before this expiry
+            if entry_date > exit_date:
+                logger.warning(
+                    f"POSITIONAL: skipping {expiry.date()} cycle -- entry day "
+                    f"({entry_date}) resolved after the exit day ({exit_date})."
                 )
                 continue
             labels = (expiry, *aliases.get(expiry, ()))
-            cycles.append((labels, entry_date, ordered_dates[pos - exit_day], pos))
+            cycles.append((labels, entry_date, exit_date, pos))
 
         logger.info(
             f"POSITIONAL ({expire_on}): {len(cycles)} expiry cycle(s), "
@@ -520,6 +508,33 @@ class BacktestEngine:
         )
         for labels, entry_date, exit_date, expiry_pos in cycles:
             self._process_positional_cycle(labels, entry_date, exit_date, ordered_dates, expiry_pos)
+
+
+    @staticmethod
+    def _weekdays_before_expiry(expiry_date, k, date_pos, ordered_dates):
+        """The trading day 'k days before expiry', counted in CALENDAR
+        weekdays (Mon-Fri). A holiday inside the window is sat through, not
+        counted around: expiry Thu the 17th with k=4 enters the previous
+        Friday even when Monday the 14th is closed -- the position simply
+        holds across the holiday. A holiday needs no calendar source: it is
+        a weekday with NO data (one parquet file exists per trading day),
+        so 'not in date_pos' identifies it. Special weekend sessions never
+        shift the count (Sat/Sun are skipped in the countdown). If the
+        computed day itself is a holiday, the first trading day AFTER it is
+        used. Returns None when the day falls before the loaded range."""
+        d = expiry_date
+        steps = k
+        while steps > 0:
+            d -= timedelta(days=1)
+            if d.weekday() < 5:
+                steps -= 1
+        if d < ordered_dates[0]:
+            return None
+        while d <= expiry_date:
+            if d in date_pos:
+                return d
+            d += timedelta(days=1)
+        return None
 
 
     def _cycle_frame(self, start_date, end_date) -> pd.DataFrame:
