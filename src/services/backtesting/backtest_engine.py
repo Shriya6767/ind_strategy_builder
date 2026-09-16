@@ -1,4 +1,4 @@
-from src.core.modules import pd, np, datetime, date, timedelta, dt_time
+from src.core.modules import pd, np, datetime, date, timedelta
 from src.core.constant import REENTRY_MODES, OVERALL_REENTRY_MODES, QUANTITY, COST_BUFFER_PCT
 from src.core.logger import get_logger
 from src.services.backtesting.report_builder import BacktestReportBuilder
@@ -36,6 +36,20 @@ def _sanitize(obj):
         return obj.isoformat()
     return obj
     
+
+def _secs(t) -> int:
+    return t.hour * 3600 + t.minute * 60 + t.second
+
+
+def _parse_hms(raw) -> int:
+    return _secs(datetime.strptime(str(raw), "%H:%M:%S"))
+
+
+def _hms(secs) -> str:
+    """'HH:MM:SS' for log messages."""
+    secs = int(secs)
+    return f"{secs // 3600:02d}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"
+
 
 class BacktestEngine:
     # Sensex session is 09:15-15:30 IST. Bars are labeled by their
@@ -83,8 +97,8 @@ class BacktestEngine:
         # trades.
         if not self._is_multiday and self.exit_time <= self.entry_time:
             raise ValueError(
-                f"INTRADAY strategy: exit_time ({self.exit_time}) must be after "
-                f"entry_time ({self.entry_time})."
+                f"INTRADAY strategy: exit_time ({_hms(self.exit_time)}) must be after "
+                f"entry_time ({_hms(self.entry_time)})."
             )
 
         self.is_delay_restart = bool(self.strategy.get("is_delay_restart"))
@@ -94,9 +108,7 @@ class BacktestEngine:
             # Delay-restart: when enabled, carry-day monitoring of overnight
             # positions starts at delay_restart_time instead of the market open.
             if self.is_delay_restart and self.strategy.get("delay_restart_time"):
-                self.day2_market_open = datetime.strptime(
-                    str(self.strategy["delay_restart_time"]), "%H:%M:%S"
-                ).time()
+                self.day2_market_open = _parse_hms(self.strategy["delay_restart_time"])
 
         # Entry-day scans (momentum / range-breakout fills, cost re-entries)
         # must run to the Day-1 session close for BTST/positional: there
@@ -125,32 +137,29 @@ class BacktestEngine:
         self._current_cycle = None       # active positional expiry cycle
 
 
-    def _parse_entry_time(self) -> dt_time:
-        """Strategy-level entry time + entry_delay, computed once.
-        All legs enter simultaneously at this time."""
+    def _parse_entry_time(self) -> int:
+        """Strategy-level entry time + entry_delay, computed once, as
+        seconds since midnight. All legs enter simultaneously at this time."""
         entry_dt = datetime.strptime(self.strategy["entry_time"], "%H:%M:%S")
         entry_dt += timedelta(minutes=self.strategy.get("entry_delay", 0) or 0)
-        return entry_dt.time()
+        return _secs(entry_dt)
 
 
-    def _parse_exit_time(self) -> dt_time:
-        """Strategy-level squareoff/exit time + exit_delay, computed once.
-        For BTST, this is the Day-2 cutoff. For INTRADAY, same-day exit cutoff."""
+    def _parse_exit_time(self) -> int:
+        """Strategy-level squareoff/exit time + exit_delay, computed once,
+        as seconds since midnight. For BTST, this is the Day-2 cutoff. For
+        INTRADAY, same-day exit cutoff."""
         exit_dt = datetime.strptime(self.strategy["exit_time"], "%H:%M:%S")
         exit_dt += timedelta(minutes=self.strategy.get("exit_delay", 0) or 0)
-        return exit_dt.time()
+        return _secs(exit_dt)
 
 
-    def _parse_day1_market_close(self) -> dt_time:
-        raw = self._DEFAULT_DAY1_MARKET_CLOSE
-        parsed = datetime.strptime(raw, "%H:%M:%S").time()
-        return parsed
-    
-    
-    def _parse_day2_market_open(self) -> dt_time:
-        raw = self._DEFAULT_DAY2_MARKET_OPEN
-        parsed = datetime.strptime(raw, "%H:%M:%S").time()
-        return parsed
+    def _parse_day1_market_close(self) -> int:
+        return _parse_hms(self._DEFAULT_DAY1_MARKET_CLOSE)
+
+
+    def _parse_day2_market_open(self) -> int:
+        return _parse_hms(self._DEFAULT_DAY2_MARKET_OPEN)
 
 
     def _prepare_legs_meta(self) -> list[dict]:
@@ -165,7 +174,7 @@ class BacktestEngine:
             meta["expiry_type"] = self._normalize_expiry_type(leg)
             meta["option_type"] = self._map_option_type(leg)
             if leg.get("is_range_breakout"):
-                meta["_range_end_parsed"] = (datetime.strptime(leg.get("range_end_time"), "%H:%M:%S")).time()
+                meta["_range_end_parsed"] = _parse_hms(leg.get("range_end_time"))
 
             sequential_leg_config = leg.get("sequential_leg")
             if sequential_leg_config:
@@ -181,7 +190,7 @@ class BacktestEngine:
         meta["expiry_type"] = self._normalize_expiry_type(leg_config)
         meta["option_type"] = self._map_option_type(leg_config)
         if leg_config.get("is_range_breakout"):
-            meta["_range_end_parsed"] = datetime.strptime(leg_config.get("range_end_time"), "%H:%M:%S").time()
+            meta["_range_end_parsed"] = _parse_hms(leg_config.get("range_end_time"))
         return meta
 
 
@@ -318,21 +327,42 @@ class BacktestEngine:
         })
  
 
+    @staticmethod
+    def derive_day_columns(df: pd.DataFrame) -> pd.DataFrame:
+        if "trade_date" not in df.columns or "trade_time" not in df.columns:
+            stamps = pd.to_datetime(df["datetime_utc"], utc=True)
+            df["datetime_utc"] = stamps
+            wall = stamps.dt.tz_localize(None)
+            df["trade_date"] = wall.dt.normalize()
+            df["trade_time"] = (wall.dt.hour * 3600 + wall.dt.minute * 60 + wall.dt.second).astype("int32")
+        for col in ("ticker", "option_type", "moneyness", "underlying"):
+            if col in df.columns and df[col].dtype == object:
+                df[col] = df[col].astype("category")
+        return df
+
+
     def prepare_dataframe(self):
-        if "trade_date" in self.df.columns and "trade_time" in self.df.columns:
-            return
-        self.df["datetime_utc"] = pd.to_datetime(self.df["datetime_utc"], utc=True)
-        # self.df.sort_values("datetime_utc", inplace=True)
-        self.df["trade_date"] = self.df["datetime_utc"].dt.date
-        self.df["trade_time"] = self.df["datetime_utc"].dt.time
+        self.derive_day_columns(self.df)
+
+
+    def _trading_dates(self) -> list:
+        """Sorted python dates of every trading day in the frame."""
+        return sorted(pd.DatetimeIndex(self.df["trade_date"].unique()).date)
+
+
+    @staticmethod
+    def _as_day(group):
+        """groupby('trade_date') hands out (Timestamp, frame); the engine
+        keys its days, results and lookups by python date."""
+        return None if group is None else (group[0].date(), group[1])
 
 
     def process_days(self):
         grouped = self.df.groupby("trade_date", sort=False)
-        self._last_trade_date = self.df["trade_date"].max()
+        self._last_trade_date = self.df["trade_date"].max().date()
         # date -> the trading day after it, so a pending BTST re-entry can be
         # searched into the next session (see _reentry_search_frame).
-        ordered_dates = sorted(self.df["trade_date"].unique())
+        ordered_dates = self._trading_dates()
         self._next_trade_date = dict(zip(ordered_dates, ordered_dates[1:]))
         total_days = len(grouped)
         logger.info(f"Total Trading Days: {total_days}")
@@ -342,11 +372,11 @@ class BacktestEngine:
         # touching self.df again. Costs one extra day-sized frame, ~1 ms per
         # day, and nothing that grows with the years loaded.
         days = iter(grouped)
-        current = next(days, None)
+        current = self._as_day(next(days, None))
         day_no = 0
         try:
             while current is not None:
-                upcoming = next(days, None)
+                upcoming = self._as_day(next(days, None))
                 self._next_day = upcoming
                 trade_date, day_df = current
                 day_no += 1
@@ -446,7 +476,7 @@ class BacktestEngine:
                 "positional entry and exit fall on the same day: exit_time must be after entry_time."
             )
 
-        ordered_dates = sorted(self.df["trade_date"].unique())
+        ordered_dates = self._trading_dates()
         date_pos = {d: i for i, d in enumerate(ordered_dates)}
 
         # An exchange reschedule relabels a series mid-life (Jan 2026: the
@@ -456,8 +486,8 @@ class BacktestEngine:
         # both when picking the entry chain (still under the old label on
         # early days) and when following the position across the rename.
         presence = self.df.groupby("expiration_date")["trade_date"].agg(["min", "max"])
-        first_seen = {pd.Timestamp(k): v for k, v in presence["min"].items()}
-        last_seen = {pd.Timestamp(k): v for k, v in presence["max"].items()}
+        first_seen = {pd.Timestamp(k): v.date() for k, v in presence["min"].items()}
+        last_seen = {pd.Timestamp(k): v.date() for k, v in presence["max"].items()}
         all_labels = sorted(first_seen)
         last_loaded = ordered_dates[-1]
         aliases = {}   # real expiry label -> tuple of labels (real first)
@@ -650,9 +680,9 @@ class BacktestEngine:
         frame = self._cycle_frame(cycle["entry_date"], cycle["exit_date"])
         dates = frame["trade_date"].to_numpy()
         times = frame["trade_time"].to_numpy()
-        entry_date, exit_date = cycle["entry_date"], cycle["exit_date"]
+        entry_date, exit_date = np.datetime64(cycle["entry_date"]), np.datetime64(cycle["exit_date"])
         in_session = times <= self.day1_market_close
-        if entry_date == exit_date:
+        if cycle["entry_date"] == cycle["exit_date"]:
             mask = (dates == entry_date) & (times >= self.entry_time) & (times <= self.exit_time)
         else:
             on_entry = (dates == entry_date) & (times >= self.entry_time) & in_session
@@ -699,8 +729,8 @@ class BacktestEngine:
         is_underlying = str(leg_meta.get("range_breakout_type")).strip().lower() == "underlying"
 
         range_start_dt = strike_row["datetime_utc"]
-        range_end_dt = pd.Timestamp(f"{end_date} {range_end_t}", tz="UTC")
-        exit_cutoff_dt = pd.Timestamp(f"{cycle['exit_date']} {self.exit_time}", tz="UTC")
+        range_end_dt = pd.Timestamp(end_date, tz="UTC") + pd.Timedelta(seconds=range_end_t)
+        exit_cutoff_dt = pd.Timestamp(cycle["exit_date"], tz="UTC") + pd.Timedelta(seconds=self.exit_time)
         if range_end_dt <= range_start_dt:
             logger.warning(
                 f"Leg {leg_meta['leg_number']}: range end {range_end_dt} is not after the "
@@ -749,21 +779,21 @@ class BacktestEngine:
         cycle = self._current_cycle
         rows = self._cycle_contract_frame(leg_result["option"], leg_result["strike"], cycle)
         entry_dt = leg_result["entry_datetime"]
-        entry_date = entry_dt.date()
         exit_date = cycle["exit_date"]
+        entry_d64, exit_d64 = np.datetime64(entry_dt.date()), np.datetime64(exit_date)
         monitor_start = self.day2_market_open
 
         dates = rows["trade_date"].to_numpy()
         times = rows["trade_time"].to_numpy()
         dts = rows["datetime_utc"].to_numpy()
 
-        on_entry_day = (dates == entry_date) & (dts > entry_dt)
-        carry = (dates > entry_date) & (dates < exit_date) & (times >= monitor_start)
-        if exit_date == entry_date:
+        on_entry_day = (dates == entry_d64) & (dts > entry_dt)
+        carry = (dates > entry_d64) & (dates < exit_d64) & (times >= monitor_start)
+        if exit_d64 == entry_d64:
             on_exit_day = on_entry_day & (times <= self.exit_time)
             mask = on_exit_day
         else:
-            on_exit_day = (dates == exit_date) & (times >= monitor_start) & (times <= self.exit_time)
+            on_exit_day = (dates == exit_d64) & (times >= monitor_start) & (times <= self.exit_time)
             mask = on_entry_day | carry | on_exit_day
 
         series = rows.loc[mask]
@@ -778,7 +808,7 @@ class BacktestEngine:
 
         series_dates = series["trade_date"].to_numpy()
         day_first = np.empty(len(series), dtype=bool)
-        day_first[0] = series_dates[0] != entry_date
+        day_first[0] = series_dates[0] != entry_d64
         day_first[1:] = series_dates[1:] != series_dates[:-1]
 
         hit = self._check_sl_target_hit(leg_meta, leg_result, series, day_first_mask=day_first)
@@ -792,10 +822,10 @@ class BacktestEngine:
             return leg_result
 
         # time exit on the cycle's exit day
-        exit_day_series = series.loc[series["trade_date"].to_numpy() == exit_date]
+        exit_day_series = series.loc[series["trade_date"].to_numpy() == exit_d64]
         if not exit_day_series.empty:
             exit_row = exit_day_series.iloc[-1]
-            exit_datetime = pd.Timestamp(f"{exit_date} {self.exit_time}", tz="UTC")
+            exit_datetime = pd.Timestamp(exit_date, tz="UTC") + pd.Timedelta(seconds=self.exit_time)
         else:
             exit_row = series.iloc[-1]
             exit_datetime = exit_row["datetime_utc"]
@@ -1368,7 +1398,7 @@ class BacktestEngine:
         start_mask = day_df["trade_time"] >= self.day2_market_open
         entry_dt = leg_result.get("entry_datetime")
         if entry_dt is not None:
-            today = day_df["trade_date"].iloc[0] if not day_df.empty else None
+            today = day_df["trade_date"].iloc[0].date() if not day_df.empty else None
             if today is not None and entry_dt.date() == today:
                 start_mask &= day_df["datetime_utc"] > entry_dt
 
@@ -1431,7 +1461,7 @@ class BacktestEngine:
 
         # Use exit_row's price, but timestamp = exactly exit_time
         if not leg_series.empty:
-           exit_datetime = pd.Timestamp(f"{exit_row['trade_date']} {self.exit_time}", tz='UTC')
+           exit_datetime = exit_row["trade_date"].tz_localize("UTC") + pd.Timedelta(seconds=self.exit_time)
         else:
            exit_datetime = exit_row["datetime_utc"]
 
@@ -1443,8 +1473,8 @@ class BacktestEngine:
         return leg_result
 
 
-    def _is_day1_market_closed(self, current_time: dt_time) -> bool:
-        """Helper: check if current_time is past day1_market_close."""
+    def _is_day1_market_closed(self, current_time: int) -> bool:
+        """Helper: check if current_time (seconds since midnight) is past day1_market_close."""
         return current_time > self.day1_market_close
 
 
@@ -1499,7 +1529,7 @@ class BacktestEngine:
         INTRADAY is unaffected: there is no Day 2 to spill into."""
         if self.strategy_type != "btst" or day_df.empty:
             return day_df
-        today = day_df["trade_date"].iloc[0]
+        today = day_df["trade_date"].iloc[0].date()
         cached = self._reentry_frame_cache.get(today)
         if cached is not None:
             return cached
@@ -1509,7 +1539,7 @@ class BacktestEngine:
             if self._next_day is not None and self._next_day[0] == next_date:
                 next_day = self._next_day[1]
             else:                                   # not iterating, or order surprise
-                next_day = self.df.loc[self.df["trade_date"] == next_date]
+                next_day = self.df.loc[self.df["trade_date"] == pd.Timestamp(next_date)]
             tail = next_day.loc[next_day["trade_time"] <= self.exit_time]
             if not tail.empty:
                 frame = pd.concat([day_df, tail])
@@ -1565,7 +1595,7 @@ class BacktestEngine:
             # exit_time, and end the chain -- there is no room for another
             # re-entry before the square-off.
             if (self.strategy_type == "btst"
-                    and reentry_result["entry_datetime"].date() > day_df["trade_date"].iloc[0]):
+                    and reentry_result["entry_datetime"].date() > day_df["trade_date"].iloc[0].date()):
                 reentry_result.update({
                     "status": "HELD_OVERNIGHT",
                     "exit_datetime": None, "exit_price": None,
@@ -1574,7 +1604,7 @@ class BacktestEngine:
                     "_trade_date": reentry_result["entry_datetime"].date(),
                     # It fills on Day 2 but belongs to the trade that opened on
                     # Day 1 -- report it under that day, as AlgoTest does.
-                    "_chain_date": day_df["trade_date"].iloc[0],
+                    "_chain_date": day_df["trade_date"].iloc[0].date(),
                     "is_reentry": True, "reentry_mode": mode,
                 })
                 new_legs.append(reentry_result)
@@ -2291,7 +2321,7 @@ class BacktestEngine:
         if range_end <= self.entry_time:
             logger.warning(
                 f"Leg {leg_meta['leg_number']}: range_end_time ({leg_meta.get('range_end_time')}) "
-                f"is not after entry_time ({self.entry_time}) -- skipping leg"
+                f"is not after entry_time ({_hms(self.entry_time)}) -- skipping leg"
             )
             return None
 
@@ -2320,7 +2350,7 @@ class BacktestEngine:
         if range_high is None:
             logger.warning(
                 f"Leg {leg_meta['leg_number']}: no candles found in range window "
-                f"[{self.entry_time} - {leg_meta.get('range_end_time')}] -- skipping leg"
+                f"[{_hms(self.entry_time)} - {leg_meta.get('range_end_time')}] -- skipping leg"
             )
             return None
 
@@ -2356,7 +2386,7 @@ class BacktestEngine:
             return None
         if self._next_day is not None and self._next_day[0] == next_date:
             return self._next_day[1]
-        return self.df.loc[self.df["trade_date"] == next_date]
+        return self.df.loc[self.df["trade_date"] == pd.Timestamp(next_date)]
 
 
     def _resolve_range_breakout_fill_btst_tomorrow(self, leg_meta, day_df, strike_row, range_end):
@@ -2372,14 +2402,14 @@ class BacktestEngine:
         if range_end >= self.exit_time:
             logger.warning(
                 f"Leg {leg_meta['leg_number']}: range_end_day='tomorrow' needs range_end_time "
-                f"({range_end}) before exit_time ({self.exit_time}) -- no room to enter and exit. Skipping leg."
+                f"({_hms(range_end)}) before exit_time ({_hms(self.exit_time)}) -- no room to enter and exit. Skipping leg."
             )
             return None
         watch_high = range_on == "high"
         is_underlying = str(leg_meta.get("range_breakout_type")).strip().lower() == "underlying"
         ticker = strike_row["ticker"]
 
-        today = day_df["trade_date"].iloc[0]
+        today = day_df["trade_date"].iloc[0].date()
         next_day_df = self._next_day_frame(today)
         if next_day_df is None:
             logger.warning(f"Leg {leg_meta['leg_number']}: range ends tomorrow but no next trading day loaded -- skipping leg")
@@ -2642,7 +2672,7 @@ class BacktestEngine:
         )
 
         snapshot["datetime_utc"] = snapshot_time
-        snapshot["trade_time"] = snapshot_time.time()
+        snapshot["trade_time"] = _secs(snapshot_time)
         snapshot["underlying_price"] = spot
         snapshot["distance_from_underlying"] = (snapshot["strike"] - spot).abs()
 
@@ -2652,8 +2682,10 @@ class BacktestEngine:
             snapshot["strike"] > spot,
         )
         snapshot["moneyness"] = np.where(is_itm, "ITM", "OTM")
+        # observed=True: option_type is categorical, and the default would
+        # emit a row for every unobserved category combination.
         atm_idx = snapshot.groupby(
-            ["expiration_date", "option_type"], sort=False
+            ["expiration_date", "option_type"], sort=False, observed=True
         )["distance_from_underlying"].idxmin()
         snapshot.loc[atm_idx, "moneyness"] = "ATM"
 
@@ -2717,7 +2749,7 @@ class BacktestEngine:
                 day_df, result, active_legs, has_sl, has_target, cutoff=cutoff
             )
             
-        today_date = day_df["trade_date"].iloc[0] if not day_df.empty else None
+        today_date = day_df["trade_date"].iloc[0].date() if not day_df.empty else None
 
         carryover_legs = [
             leg for leg in active_legs
@@ -2920,14 +2952,17 @@ class BacktestEngine:
         if subset.empty:
             return None
 
-        pivot = subset.pivot_table(index="datetime_utc", columns="ticker", values="close", aggfunc="last")
+        # observed=True: ticker is categorical -- without it the pivot would
+        # grow a column for EVERY ticker in the whole loaded range.
+        pivot = subset.pivot_table(index="datetime_utc", columns="ticker", values="close",
+                                   aggfunc="last", observed=True)
         pivot = pivot.sort_index().ffill()
 
         combined_mtm = pd.Series(0.0, index=pivot.index)
         # Capital in the position bar by bar -- a leg only counts once it has
         # entered, so a PERCENT threshold grows as staggered legs join.
         entry_value = pd.Series(0.0, index=pivot.index)
-        today_date = day_df["trade_date"].iloc[0] if not day_df.empty else None
+        today_date = day_df["trade_date"].iloc[0].date() if not day_df.empty else None
 
         for leg in active_legs:
             if leg["ticker"] not in pivot.columns:

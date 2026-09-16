@@ -57,7 +57,9 @@ class DataLoader:
         logger.info(f"Trading days found: {len(files)}")
 
         dataset = ds.dataset(files, format="parquet")
-        df = dataset.to_table(columns=REQUIRED_COLUMNS).to_pandas()
+        df = dataset.to_table(columns=REQUIRED_COLUMNS).to_pandas(
+            categories=["ticker", "option_type", "moneyness", "underlying"]
+        )
         DataStore.set_df(df)
         rows = len(df)
         logger.info(
