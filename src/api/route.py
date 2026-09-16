@@ -6,6 +6,7 @@ from src.services.backtesting.backtest_service import BacktestService
 from src.services.backtesting.compare_backtest import CompareBacktestService
 from src.services.backtesting.portfolio_backtest import PortfolioBacktestService
 from src.services.save_strategy import SaveStrategyService
+from src.services.update_strategy import UpdateStrategyService
 from src.services.save_portfolio import SavePortfolioService
 from src.services.delete_portfolio import DeletePortfolioService
 from src.core.logger import get_logger
@@ -118,8 +119,37 @@ def save_strategy(request: dict):
         )
 
 
+@router.put("/update-strategy")
+def update_strategy(request: dict):
+    try:
+        result = UpdateStrategyService.update_strategy(request)
+        if not result["status"]:
+            raise HTTPException(
+                status_code=404 if result.get("not_found") else 400,
+                detail={"status": False, "message": result["message"]}
+            )
+        return {
+            "status": True,
+            "message": "Strategy updated successfully.",
+            "strategy_id": result["strategy_id"],
+            "version": result["version"],
+            "legs_saved": result["legs_saved"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in update_strategy: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": False,
+                "message": f"Internal server error: {str(e)}"
+            }
+        )
+
+
 @router.get("/get-strategy")
-def get_strategy(strategy_id: int, strategy_name: str, version: int):  
+def get_strategy(strategy_id: int, strategy_name: str, version: int):
     if not strategy_id or not strategy_name or not version:
         raise HTTPException(
             status_code=400,

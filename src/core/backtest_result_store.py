@@ -71,7 +71,15 @@ class VersionedResultStore:
                     %s,%s,%s,%s,%s,%s,%s,%s,%s,%s
                 )
                 ON CONFLICT (strategy_id, version)
-                DO NOTHING
+                DO UPDATE SET
+                    strategy_name       = EXCLUDED.strategy_name,
+                    backtest_start_date = EXCLUDED.backtest_start_date,
+                    backtest_end_date   = EXCLUDED.backtest_end_date,
+                    overall_mtm         = EXCLUDED.overall_mtm,
+                    avg_mtm             = EXCLUDED.avg_mtm,
+                    max_drawdown        = EXCLUDED.max_drawdown,
+                    risk_reward_ratio   = EXCLUDED.risk_reward_ratio,
+                    win_percentage      = EXCLUDED.win_percentage
                 """,
                 (
                     strategy_id,
