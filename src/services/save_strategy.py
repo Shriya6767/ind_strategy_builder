@@ -4,6 +4,159 @@ from src.core.logger import get_logger
 logger = get_logger(__name__)
 
 
+LEG_INSERT_QUERY = """
+    INSERT INTO leg_details (
+        strategy_id,
+        parent_leg_id,
+        lot_size,
+        position_type,
+        option_type,
+        expiry_type,
+        strike_criteria,
+        atm_strike,
+        strike_sign,
+        premium_value,
+        lower_range,
+        upper_range,
+        multiplier_percentage,
+        is_target,
+        target_type,
+        target_value,
+        is_stoploss,
+        stoploss_type,
+        stoploss_value,
+        is_trail_sl,
+        trail_sl_type,
+        instrument_moves,
+        stoploss_moves,
+        is_reentry_sl,
+        reentry_sl_type,
+        reentry_sl_value,
+        is_reentry_target,
+        reentry_target_type,
+        reentry_target_value,
+        is_simple_momentum,
+        momentum_type,
+        momentum_value,
+        is_range_breakout,
+        range_breakout_type,
+        range_end_day,
+        range_end_time,
+        range_on,
+        version,
+        is_lazy_leg,
+        is_sequential,
+        leg_name,
+        is_selected
+    )
+    VALUES (
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+        %s, %s
+    )
+    RETURNING leg_id;
+"""
+
+
+def insert_legs(cursor, strategy_id, version, request) -> int:
+    inserted = 0
+
+    def insert_leg(leg, parent_leg_id=None, is_lazy_leg=False, is_sequential=False,
+                   leg_name=None, is_selected=True):
+        nonlocal inserted
+        cursor.execute(
+            LEG_INSERT_QUERY,
+            (
+                strategy_id,
+                parent_leg_id,
+                leg.get("lot_size"),
+                leg.get("position_type"),
+                leg.get("option_type"),
+                leg.get("expiry_type"),
+                leg.get("strike_criteria"),
+                leg.get("atm_strike"),
+                leg.get("strike_sign"),
+                leg.get("premium_value"),
+                leg.get("lower_range"),
+                leg.get("upper_range"),
+                leg.get("multiplier_percentage"),
+
+                leg.get("is_target"),
+                leg.get("target_type"),
+                leg.get("target_value"),
+
+                leg.get("is_stoploss"),
+                leg.get("stoploss_type"),
+                leg.get("stoploss_value"),
+
+                leg.get("is_trail_sl"),
+                leg.get("trail_sl_type"),
+                leg.get("instrument_moves"),
+                leg.get("stoploss_moves"),
+
+                leg.get("is_reentry_sl"),
+                leg.get("reentry_sl_type"),
+                leg.get("reentry_sl_value"),
+
+                leg.get("is_reentry_target"),
+                leg.get("reentry_target_type"),
+                leg.get("reentry_target_value"),
+
+                leg.get("is_simple_momentum"),
+                leg.get("momentum_type"),
+                leg.get("momentum_value"),
+
+                leg.get("is_range_breakout"),
+                leg.get("range_breakout_type"),
+                str(leg.get("range_end_day")) if leg.get("range_end_day") is not None else None,
+                leg.get("range_end_time"),
+                leg.get("range_on"),
+                version,
+                is_lazy_leg,
+                is_sequential,
+                leg_name,
+                is_selected
+            )
+        )
+        inserted += 1
+        inserted_leg_id = cursor.fetchone()[0]
+
+        nested_lazy_leg = leg.get("lazy_leg")
+        sequential_leg = leg.get("sequential_leg")
+
+        if nested_lazy_leg is not None:
+            insert_leg(
+                leg=nested_lazy_leg,
+                parent_leg_id=inserted_leg_id,
+                is_lazy_leg=True,
+                is_sequential=False,
+                leg_name=nested_lazy_leg.get("leg_name"),
+                is_selected=True
+            )
+        if sequential_leg is not None:
+            insert_leg(
+                leg=sequential_leg,
+                parent_leg_id=inserted_leg_id,
+                is_lazy_leg=False,
+                is_sequential=True,
+                leg_name=sequential_leg.get("leg_name"),
+                is_selected=True
+            )
+
+    for leg in request["legs"]:
+        insert_leg(leg=leg, parent_leg_id=None, is_lazy_leg=False,
+                   is_sequential=False, leg_name=None, is_selected=True)
+
+    for unselected_leg in request.get("unselected_legs") or []:
+        insert_leg(leg=unselected_leg, parent_leg_id=None, is_lazy_leg=False,
+                   is_sequential=False, leg_name=unselected_leg.get("leg_name"),
+                   is_selected=False)
+
+    return inserted
+
+
 class SaveStrategyService:
     @staticmethod
     def save_strategy(request):
@@ -136,171 +289,7 @@ class SaveStrategyService:
 
             cursor.fetchone()
 
-            leg_query = """
-                INSERT INTO leg_details (
-                    strategy_id,
-                    parent_leg_id,
-                    lot_size,
-                    position_type,
-                    option_type,
-                    expiry_type,
-                    strike_criteria,
-                    atm_strike,
-                    strike_sign,
-                    premium_value,
-                    lower_range,
-                    upper_range,
-                    multiplier_percentage,
-                    is_target,
-                    target_type,
-                    target_value,
-                    is_stoploss,
-                    stoploss_type,
-                    stoploss_value,
-                    is_trail_sl,
-                    trail_sl_type,
-                    instrument_moves,
-                    stoploss_moves,
-                    is_reentry_sl,
-                    reentry_sl_type,
-                    reentry_sl_value,
-                    is_reentry_target,
-                    reentry_target_type,
-                    reentry_target_value,
-                    is_simple_momentum,
-                    momentum_type,
-                    momentum_value,
-                    is_range_breakout,
-                    range_breakout_type,
-                    range_end_day,
-                    range_end_time,
-                    range_on,
-                    version,
-                    is_lazy_leg,
-                    is_sequential,
-                    leg_name,
-                    is_selected
-                )
-                VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s
-                )
-                RETURNING leg_id;
-            """
-
-            def insert_leg(
-                leg,
-                parent_leg_id=None,
-                is_lazy_leg=False,
-                is_sequential=False,
-                leg_name=None,
-                is_selected=True
-            ):
-                cursor.execute(
-                    leg_query,
-                    (
-                        strategy_id,
-                        parent_leg_id,
-                        leg.get("lot_size"),
-                        leg.get("position_type"),
-                        leg.get("option_type"),
-                        leg.get("expiry_type"),
-                        leg.get("strike_criteria"),
-                        leg.get("atm_strike"),
-                        leg.get("strike_sign"),
-                        leg.get("premium_value"),
-                        leg.get("lower_range"),
-                        leg.get("upper_range"),
-                        leg.get("multiplier_percentage"),
-
-                        leg.get("is_target"),
-                        leg.get("target_type"),
-                        leg.get("target_value"),
-
-                        leg.get("is_stoploss"),
-                        leg.get("stoploss_type"),
-                        leg.get("stoploss_value"),
-
-                        leg.get("is_trail_sl"),
-                        leg.get("trail_sl_type"),
-                        leg.get("instrument_moves"),
-                        leg.get("stoploss_moves"),
-
-                        leg.get("is_reentry_sl"),
-                        leg.get("reentry_sl_type"),
-                        leg.get("reentry_sl_value"),
-
-                        leg.get("is_reentry_target"),
-                        leg.get("reentry_target_type"),
-                        leg.get("reentry_target_value"),
-
-                        leg.get("is_simple_momentum"),
-                        leg.get("momentum_type"),
-                        leg.get("momentum_value"),
-
-                        leg.get("is_range_breakout"),
-                        leg.get("range_breakout_type"),
-                        str(leg.get("range_end_day")) if leg.get("range_end_day") is not None else None,
-                        leg.get("range_end_time"),
-                        leg.get("range_on"),
-                        version,
-                        is_lazy_leg,
-                        is_sequential,
-                        leg_name,
-                        is_selected
-                    )
-                )
-                
-                inserted_leg_id = cursor.fetchone()[0]
-
-                nested_lazy_leg = leg.get("lazy_leg")
-                sequential_leg = leg.get("sequential_leg")
-
-                if nested_lazy_leg is not None:
-                    nested_leg_name = nested_lazy_leg.get("leg_name")
-                    insert_leg(
-                        leg=nested_lazy_leg,
-                        parent_leg_id=inserted_leg_id,
-                        is_lazy_leg=True,
-                        is_sequential=False,
-                        leg_name=nested_leg_name,
-                        is_selected=True
-                    )
-                if sequential_leg is not None:
-                    sequential_leg_name = sequential_leg.get("leg_name")
-                    insert_leg(
-                        leg=sequential_leg,
-                        parent_leg_id=inserted_leg_id,
-                        is_lazy_leg=False,
-                        is_sequential=True,
-                        leg_name=sequential_leg_name,
-                        is_selected=True
-                    )
-
-            for leg in legs:
-                insert_leg(
-                    leg=leg,
-                    parent_leg_id=None,
-                    is_lazy_leg=False,
-                    is_sequential=False,
-                    leg_name=None,
-                    is_selected=True
-                )
-
-            unselected_legs = request.get("unselected_legs") or []
-
-            for unselected_leg in unselected_legs:
-                insert_leg(
-                    leg=unselected_leg,
-                    parent_leg_id=None,
-                    is_lazy_leg=False,
-                    is_sequential=False,
-                    leg_name=unselected_leg.get("leg_name"),
-                    is_selected=False
-                )
+            insert_legs(cursor, strategy_id, version, request)
 
             conn.commit()
 
