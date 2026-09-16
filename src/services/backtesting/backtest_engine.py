@@ -492,8 +492,27 @@ class BacktestEngine:
             entry_idx = pos - entry_day
             if entry_idx < 0:        # not enough history before this expiry
                 continue
+            entry_date = ordered_dates[entry_idx]
+            # AlgoTest trades only CLEAN cycles (verified against its trade
+            # exports): skip when the entry->expiry window is disturbed --
+            # a weekend special session inside it, or a holiday (the window's
+            # trading days then don't cover every weekday of the calendar
+            # span; the shifted entry would also collide with the previous
+            # cycle, which exits at 09:20 on expiry day while the new entry
+            # would fire at entry_time that same morning).
+            window = ordered_dates[entry_idx:pos + 1]
+            weekday_span = sum(
+                1 for k in range((expiry.date() - entry_date).days + 1)
+                if (entry_date + timedelta(days=k)).weekday() < 5
+            )
+            if any(d.weekday() >= 5 for d in window) or weekday_span != len(window):
+                logger.info(
+                    f"POSITIONAL: skipping {expiry.date()} cycle -- window "
+                    f"{entry_date}..{expiry.date()} has a holiday/weekend session (AlgoTest convention)."
+                )
+                continue
             labels = (expiry, *aliases.get(expiry, ()))
-            cycles.append((labels, ordered_dates[entry_idx], ordered_dates[pos - exit_day], pos))
+            cycles.append((labels, entry_date, ordered_dates[pos - exit_day], pos))
 
         logger.info(
             f"POSITIONAL ({expire_on}): {len(cycles)} expiry cycle(s), "
@@ -723,7 +742,7 @@ class BacktestEngine:
         times = rows["trade_time"].to_numpy()
         dts = rows["datetime_utc"].to_numpy()
 
-        on_entry_day = (dates == entry_date) & (dts >= entry_dt)
+        on_entry_day = (dates == entry_date) & (dts > entry_dt)
         carry = (dates > entry_date) & (dates < exit_date) & (times >= monitor_start)
         if exit_date == entry_date:
             on_exit_day = on_entry_day & (times <= self.exit_time)
@@ -740,10 +759,11 @@ class BacktestEngine:
             })
             return leg_result
 
-        # first monitored bar of every LATER day: the overnight gap candle
+        # first monitored bar of every LATER day: the overnight gap candle.
+
         series_dates = series["trade_date"].to_numpy()
         day_first = np.empty(len(series), dtype=bool)
-        day_first[0] = False
+        day_first[0] = series_dates[0] != entry_date
         day_first[1:] = series_dates[1:] != series_dates[:-1]
 
         hit = self._check_sl_target_hit(leg_meta, leg_result, series, day_first_mask=day_first)
@@ -1292,7 +1312,7 @@ class BacktestEngine:
 
         subset = day_df.loc[
             (day_df["ticker"] == leg_result["ticker"])
-            & (day_df["datetime_utc"] >= entry_datetime)
+            & (day_df["datetime_utc"] > entry_datetime)
             & (day_df["trade_time"] <= self.day1_market_close)
         ].sort_values("datetime_utc")
 
@@ -1335,7 +1355,7 @@ class BacktestEngine:
         if entry_dt is not None:
             today = day_df["trade_date"].iloc[0] if not day_df.empty else None
             if today is not None and entry_dt.date() == today:
-                start_mask &= day_df["datetime_utc"] >= entry_dt
+                start_mask &= day_df["datetime_utc"] > entry_dt
 
         full_day_series = day_df.loc[
             (day_df["ticker"] == ticker) & start_mask
