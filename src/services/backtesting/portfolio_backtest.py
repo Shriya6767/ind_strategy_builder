@@ -2,6 +2,7 @@ import copy
 import multiprocessing as mp
 import platform
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from src.core.modules import pd
 from src.core.data_store import DataStore
 from src.core.logger import get_logger
 from src.services.backtesting.backtest_engine import BacktestEngine
@@ -73,19 +74,21 @@ class PortfolioBacktestService:
 
         strategies = self._expand_strategies(overrides, start_date, end_date)
 
-        df = self._load_dataframe(start_date, end_date)
+        df = self._prepare_shared_frame(self._load_dataframe(start_date, end_date))
 
-        results_by_id = self._run_strategies_in_parallel(strategies, df)
-        failures = {sid: r["error"] for sid, r in results_by_id.items() if not r["ok"]}
+        overrides_by_id = {s["strategy_id"]: s for s in overrides}
+        payloads_by_id, reduced_by_id, failures = self._run_and_reduce(strategies, overrides_by_id, df)
         if failures:
             raise RuntimeError(f"Portfolio backtest failed for strategies: {failures}")
 
-        strategy_payloads, trade_results_by_id = self._persist_and_collect(strategies, overrides, results_by_id)
-        merged_trade_results = PortfolioReportBuilder.merge_trade_results(trade_results_by_id)
+        merged_trade_results = PortfolioReportBuilder.merge_trade_results(reduced_by_id)
         aggregate_report = BacktestReportBuilder(merged_trade_results).build()
+        # Response order follows the request's strategy_overrides order.
+        strategy_payloads = [payloads_by_id[s["strategy"]["strategy_id"]] for s in strategies]
         return {
             "portfolio_id": portfolio_id,
             "aggregate": aggregate_report,
+            "trade_results": merged_trade_results,
             "strategies": strategy_payloads,
         }
 
@@ -127,6 +130,20 @@ class PortfolioBacktestService:
 
 
     @staticmethod
+    def _prepare_shared_frame(df):
+        """Derives the engine's trade_date / trade_time columns ONCE in the
+        parent, before the pool forks. Each worker's prepare_dataframe sees
+        them and skips, so the ~90-bytes/row python date/time objects
+        (~5.5 GB on a 3-year load) exist once and are inherited
+        copy-on-write instead of being rebuilt inside every worker."""
+        if "trade_date" not in df.columns or "trade_time" not in df.columns:
+            df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
+            df["trade_date"] = df["datetime_utc"].dt.date
+            df["trade_time"] = df["datetime_utc"].dt.time
+        return df
+
+
+    @staticmethod
     def _expand_strategies(overrides: list, start_date: str, end_date: str) -> list:
         expanded = []
         for s in overrides:
@@ -157,8 +174,15 @@ class PortfolioBacktestService:
         return expanded
 
 
-    def _run_strategies_in_parallel(self, strategies: list[dict], df) -> dict:
-        """Runs each strategy in its own process against the same market data.
+    def _run_and_reduce(self, strategies: list[dict], overrides_by_id: dict, df) -> tuple[dict, dict, dict]:
+        """Runs each strategy in its own process against the same market data
+        and post-processes every result AS IT COMPLETES: weekday filter +
+        slippage, then keep only (a) the summary blocks for the response and
+        (b) a pnl-only skeleton of its trade_results for the aggregate merge.
+        The full leg-level output -- hundreds of MB per strategy on a
+        multi-year window -- is dropped inside the loop, so parent memory
+        stays flat at roughly ONE strategy's output no matter how many
+        strategies the portfolio holds.
 
         The data is NOT passed to submit() on Linux. Arguments to submit are
         pickled and piped to the worker, so handing over the DataFrame would
@@ -176,9 +200,11 @@ class PortfolioBacktestService:
 
         forking = _FORK_CTX is not None
         max_workers = self._worker_budget(len(strategies), df, shared=forking)
-        results_by_id = {}
+        names_by_id = {s["strategy"]["strategy_id"]: s["strategy"]["strategy_name"] for s in strategies}
+
+        payloads_by_id, reduced_by_id, failures = {}, {}, {}
         if forking:
-            _SHARED_DF = df                  
+            _SHARED_DF = df
         try:
             with ProcessPoolExecutor(max_workers=max_workers, mp_context=_FORK_CTX) as pool:
                 futures = {}
@@ -186,12 +212,58 @@ class PortfolioBacktestService:
                     sid = s["strategy"]["strategy_id"]
                     futures[pool.submit(_run_single_strategy, s,
                                         None if forking else df)] = sid
-                for future in as_completed(futures):
+                for future in as_completed(list(futures)):
+                    # pop so the future (and the full output it holds) can be
+                    # garbage-collected as soon as this iteration ends
+                    sid = futures.pop(future)
                     result = future.result()
-                    results_by_id[result["strategy_id"]] = result
+                    if not result["ok"]:
+                        failures[sid] = result["error"]
+                        continue
+                    output = result["output"]
+                    override = overrides_by_id[sid]
+
+                    period_selection = override.get("period_selection")
+                    if period_selection and period_selection.get("mode") == "weekdays":
+                        output = self._apply_weekday_filter(output, period_selection)
+
+                    slippage_percent = override.get("slippage_percent", 0)
+                    if slippage_percent:
+                        slipped = SlippageService.apply(output["trade_results"], slippage_percent)
+                        output = {**output, **slipped}
+
+                    reduced_by_id[sid] = self._reduce_for_merge(output["trade_results"])
+                    payloads_by_id[sid] = {
+                        "strategy_id": sid,
+                        "strategy_name": names_by_id[sid],
+                        "summary_report_result": output["summary_report_result"],
+                        "monthly_state_result": output.get("monthly_state_result"),
+                    }
         finally:
             _SHARED_DF = None
-        return results_by_id
+        return payloads_by_id, reduced_by_id, failures
+
+
+    @staticmethod
+    def _reduce_for_merge(trade_results: list) -> list:
+        """Keeps only EXECUTED legs (pnl is not None) and the day's
+        overall-exit marker. The executed leg dicts are kept by REFERENCE
+        (no copy) with all their fields: the merge tags them strategy_id
+        and they become the response's combined trade report, and the
+        aggregate report is rebuilt from the same rows. What's dropped is
+        the bulk a combined report never shows -- non-executed leg blocks
+        (RANGE_BREAKOUT_NOT_TRIGGERED, NO_CHAIN_DATA, ...), empty days, and
+        the per-strategy duplicate copy of the full output."""
+        reduced = []
+        for day in trade_results:
+            legs = [leg for leg in day["legs"] if leg.get("pnl") is not None]
+            if not legs:
+                continue
+            slim = {"trade_date": day["trade_date"], "legs": legs}
+            if day.get("overall_exits"):
+                slim["overall_exits"] = True
+            reduced.append(slim)
+        return reduced
 
 
     @staticmethod
@@ -210,9 +282,11 @@ class PortfolioBacktestService:
             return workers
 
         frame = int(df.memory_usage(deep=False).sum())
-        # ~90 bytes/row of python date/time objects in prepare_dataframe, plus
-        # the frame itself when it could not be inherited.
-        per_worker = 90 * len(df) + (0 if shared else frame)
+        # trade_date / trade_time are pre-derived in the parent
+        # (_prepare_shared_frame) and inherited, so a worker's own footprint
+        # is just its day-frame slices, caches and results (~15 bytes/row of
+        # cushion), plus the whole frame when it could not be inherited.
+        per_worker = 15 * len(df) + (0 if shared else frame)
         affordable = max(1, int(available * 0.7 // max(per_worker, 1)))
         if affordable < workers:
             logger.warning(
@@ -266,34 +340,3 @@ class PortfolioBacktestService:
         return {**output, "trade_results": filtered_trade_results, **report}
 
 
-    def _persist_and_collect(self, strategies: list[dict], overrides: list[dict], results_by_id: dict) -> tuple[list[dict], dict]:
-        overrides_by_id = {s["strategy_id"]: s for s in overrides}
-
-        strategy_payloads = []
-        trade_results_by_id = {}
-
-        for s in strategies:
-            meta = s["strategy"]
-            sid = meta["strategy_id"]
-            override = overrides_by_id[sid]
-            output = results_by_id[sid]["output"]
-
-            period_selection = override.get("period_selection")
-            if period_selection:
-                mode = period_selection.get("mode")
-                if mode == "weekdays":
-                    output = self._apply_weekday_filter(output, period_selection)
-
-            slippage_percent = override.get("slippage_percent", 0)
-            if slippage_percent:
-                slipped = SlippageService.apply(output["trade_results"], slippage_percent)
-                output = {**output, **slipped} 
-
-            trade_results_by_id[sid] = output["trade_results"]
-            strategy_payloads.append({
-                "strategy_id": sid,
-                "strategy_name": meta["strategy_name"],
-                **output,
-            })
-
-        return strategy_payloads, trade_results_by_id
