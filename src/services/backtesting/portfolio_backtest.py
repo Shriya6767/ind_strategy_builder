@@ -1,8 +1,8 @@
 import copy
+import gc
 import multiprocessing as mp
 import platform
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from src.core.modules import pd
 from src.core.data_store import DataStore
 from src.core.logger import get_logger
 from src.services.backtesting.backtest_engine import BacktestEngine
@@ -124,23 +124,26 @@ class PortfolioBacktestService:
     def _load_dataframe(start_date: str, end_date: str):
         """One load serves every strategy: each Sensex daily file carries
         every live expiry, and legs pick their contract per expiry_type
-        (weekly / next weekly / monthly / next monthly) inside the engine."""
+        (weekly / next weekly / monthly / next monthly) inside the engine.
+
+        The PREVIOUS frame is released before loading: DataStore would
+        otherwise keep holding it (a 3-year frame with the derived columns
+        is ~19 GB) while the loader builds the new one -- on a rerun that
+        transient double-hold alone exceeds a 32 GB host."""
+        DataStore.clear_df()
+        gc.collect()
         DataLoader().load(start_date, end_date)  # side effect: DataStore.set_df(df)
         return DataStore.get_df()
 
 
     @staticmethod
     def _prepare_shared_frame(df):
-        """Derives the engine's trade_date / trade_time columns ONCE in the
-        parent, before the pool forks. Each worker's prepare_dataframe sees
-        them and skips, so the ~90-bytes/row python date/time objects
-        (~5.5 GB on a 3-year load) exist once and are inherited
-        copy-on-write instead of being rebuilt inside every worker."""
-        if "trade_date" not in df.columns or "trade_time" not in df.columns:
-            df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
-            df["trade_date"] = df["datetime_utc"].dt.date
-            df["trade_time"] = df["datetime_utc"].dt.time
-        return df
+        """Derives the engine's day columns ONCE in the parent, before the
+        pool forks (see BacktestEngine.derive_day_columns): each worker's
+        prepare_dataframe finds them and skips, and because every column is
+        a refcount-free numeric/categorical dtype the workers read the
+        inherited pages without ever privatizing them."""
+        return BacktestEngine.derive_day_columns(df)
 
 
     @staticmethod
@@ -282,11 +285,13 @@ class PortfolioBacktestService:
             return workers
 
         frame = int(df.memory_usage(deep=False).sum())
-        # trade_date / trade_time are pre-derived in the parent
-        # (_prepare_shared_frame) and inherited, so a worker's own footprint
-        # is just its day-frame slices, caches and results (~15 bytes/row of
-        # cushion), plus the whole frame when it could not be inherited.
-        per_worker = 15 * len(df) + (0 if shared else frame)
+        # The frame holds only numeric/categorical columns (see
+        # BacktestEngine.derive_day_columns), so forked workers read the
+        # inherited pages without dirtying them -- no refcounts to write. A
+        # worker's own footprint is its day-frame slices, caches and results
+        # (~20 bytes/row of cushion); without fork add the whole pickled
+        # frame as before.
+        per_worker = 20 * len(df) + (0 if shared else frame)
         affordable = max(1, int(available * 0.7 // max(per_worker, 1)))
         if affordable < workers:
             logger.warning(
