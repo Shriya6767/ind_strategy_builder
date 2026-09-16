@@ -319,6 +319,8 @@ class BacktestEngine:
  
 
     def prepare_dataframe(self):
+        if "trade_date" in self.df.columns and "trade_time" in self.df.columns:
+            return
         self.df["datetime_utc"] = pd.to_datetime(self.df["datetime_utc"], utc=True)
         # self.df.sort_values("datetime_utc", inplace=True)
         self.df["trade_date"] = self.df["datetime_utc"].dt.date
