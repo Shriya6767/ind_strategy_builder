@@ -1,6 +1,7 @@
 import copy
 import gc
 import multiprocessing as mp
+import os
 import platform
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from src.core.modules import pd
@@ -283,7 +284,12 @@ class PortfolioBacktestService:
         than exhaust RAM and freeze. Falls back to the CPU count when the
         available memory can't be read.
         """
-        workers = max(1, min(strategy_count, mp.cpu_count()))
+        # PORTFOLIO_MAX_WORKERS (.env) caps the parallel workers below the
+        # machine's core count so the OS, this API process and PostgreSQL
+        # keep cores of their own while a portfolio runs (e.g. 16 on the
+        # 20-core host). Unset/0 = every core.
+        core_cap = int(os.environ.get("PORTFOLIO_MAX_WORKERS", 0) or 0) or mp.cpu_count()
+        workers = max(1, min(strategy_count, core_cap))
         available = _available_memory_bytes()
         if available is None:
             return workers
