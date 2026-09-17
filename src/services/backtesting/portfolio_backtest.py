@@ -3,6 +3,7 @@ import gc
 import multiprocessing as mp
 import platform
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from src.core.modules import pd
 from src.core.data_store import DataStore
 from src.core.logger import get_logger
 from src.services.backtesting.backtest_engine import BacktestEngine
@@ -125,14 +126,17 @@ class PortfolioBacktestService:
         """One load serves every strategy: each Sensex daily file carries
         every live expiry, and legs pick their contract per expiry_type
         (weekly / next weekly / monthly / next monthly) inside the engine.
-
-        The PREVIOUS frame is released before loading: DataStore would
-        otherwise keep holding it (a 3-year frame with the derived columns
-        is ~19 GB) while the loader builds the new one -- on a rerun that
-        transient double-hold alone exceeds a 32 GB host."""
+        A frame already loaded for EXACTLY this range (by a previous
+        portfolio run or /load-data) is reused as-is."""
+        
+        start = pd.Timestamp(start_date).strftime("%Y-%m-%d")
+        end = pd.Timestamp(end_date).strftime("%Y-%m-%d")
+        if DataStore.covers(start, end):
+            logger.info(f"Portfolio: reusing the loaded {start}..{end} frame (no reload).")
+            return DataStore.get_df()
         DataStore.clear_df()
         gc.collect()
-        DataLoader().load(start_date, end_date)  # side effect: DataStore.set_df(df)
+        DataLoader().load(start_date, end_date)  # side effect: DataStore.set_df(df, start, end)
         return DataStore.get_df()
 
 
