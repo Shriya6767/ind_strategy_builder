@@ -200,7 +200,6 @@ class SaveStrategyService:
                     symbol,
                     start_date,
                     end_date,
-                    dte_filter,
                     underlying_type,
                     is_squareoff,
                     is_trail_sl_break_even,
@@ -238,7 +237,7 @@ class SaveStrategyService:
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s
                 )
                 RETURNING id;
             """
@@ -251,7 +250,6 @@ class SaveStrategyService:
                     strategy["symbol"],
                     strategy["start_date"],
                     strategy["end_date"],
-                    strategy["dte_filter"],
                     strategy["underlying_type"],
                     strategy["is_squareoff"],
                     strategy["is_trail_sl_break_even"],

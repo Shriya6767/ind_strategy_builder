@@ -60,7 +60,7 @@ class DataLoader:
         df = dataset.to_table(columns=REQUIRED_COLUMNS).to_pandas(
             categories=["ticker", "option_type", "moneyness", "underlying"]
         )
-        DataStore.set_df(df)
+        DataStore.set_df(df, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
         rows = len(df)
         logger.info(
             f"Loaded {rows:,} option rows with {len(df.columns)} columns "
