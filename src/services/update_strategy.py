@@ -7,7 +7,7 @@ logger = get_logger(__name__)
 
 class UpdateStrategyService:
     @staticmethod
-    def update_strategy(request):
+    def update_strategy(request, user_id: int):
         conn = None
         cursor = None
 
@@ -23,8 +23,8 @@ class UpdateStrategyService:
             version = strategy.get("version") or None
             if not version:
                 cursor.execute(
-                    "SELECT MAX(version) FROM strategy WHERE strategy_id = %s;",
-                    (strategy_id,)
+                    "SELECT MAX(version) FROM strategy WHERE strategy_id = %s AND user_id = %s;",
+                    (strategy_id, user_id)
                 )
                 version = cursor.fetchone()[0]
                 if version is None:
@@ -36,9 +36,11 @@ class UpdateStrategyService:
 
             # Lock the row for the duration of the transaction so two
             # concurrent updates of the same version cannot interleave.
+            # The user_id filter is the ownership check: someone else's
+            # strategy simply "does not exist" for this caller.
             cursor.execute(
-                "SELECT id FROM strategy WHERE strategy_id = %s AND version = %s FOR UPDATE;",
-                (strategy_id, version)
+                "SELECT id FROM strategy WHERE strategy_id = %s AND version = %s AND user_id = %s FOR UPDATE;",
+                (strategy_id, version, user_id)
             )
             if cursor.fetchone() is None:
                 return {

@@ -7,7 +7,7 @@ logger = get_logger(__name__)
 
 class SavePortfolioService:
     @staticmethod
-    def save_portfolio(request: dict) -> dict:
+    def save_portfolio(request: dict, user_id: int) -> dict:
         conn = None
         try:
             portfolio_id = request.get("portfolio_id")
@@ -22,6 +22,17 @@ class SavePortfolioService:
             conn = Database.get_connection()
             cursor = conn.cursor()
 
+            # Every strategy in the portfolio must be the caller's own.
+            wanted = sorted({int(s["strategy_id"]) for s in normalized_strategies})
+            cursor.execute(
+                "SELECT DISTINCT strategy_id FROM strategy WHERE user_id = %s AND strategy_id = ANY(%s);",
+                (user_id, wanted),
+            )
+            owned = {row[0] for row in cursor.fetchall()}
+            foreign = [sid for sid in wanted if sid not in owned]
+            if foreign:
+                return {"status": False, "message": f"Strategy id(s) not found: {foreign}."}
+
             if portfolio_id is None:
                 cursor.execute(
                     """
@@ -33,11 +44,11 @@ class SavePortfolioService:
 
                 cursor.execute(
                     """
-                    INSERT INTO portfolio (portfolio_id, portfolio_name, strategies)
-                    VALUES (%s, %s, %s)
+                    INSERT INTO portfolio (portfolio_id, portfolio_name, strategies, user_id)
+                    VALUES (%s, %s, %s, %s)
                     RETURNING id;
                     """,
-                    (portfolio_id, portfolio_name, Json(normalized_strategies)),
+                    (portfolio_id, portfolio_name, Json(normalized_strategies), user_id),
                 )
                 message = f"Portfolio created successfully."
             else:
@@ -47,10 +58,10 @@ class SavePortfolioService:
                     SET portfolio_name = %s,
                         strategies = %s,
                         updated_at = NOW()
-                    WHERE portfolio_id = %s
+                    WHERE portfolio_id = %s AND user_id = %s
                     RETURNING id;
                     """,
-                    (portfolio_name, Json(normalized_strategies), portfolio_id),
+                    (portfolio_name, Json(normalized_strategies), portfolio_id, user_id),
                 )
                 message = f"Portfolio updated."
 

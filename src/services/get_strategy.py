@@ -9,13 +9,14 @@ class GetStrategyService:
     _INTERNAL_LEG_FIELDS = ("leg_id", "parent_leg_id", "is_lazy_leg", "is_sequential", "is_selected")
 
     @staticmethod
-    def get_strategy(strategy_id, strategy_name, version):
+    def get_strategy(strategy_id, strategy_name, version, user_id=None):
         """
         Fetch complete strategy data from database by ID and name.
         Args:
             strategy_id: Unique identifier for the strategy
             strategy_name: Strategy name (used for verification)
             version: Strategy version
+            user_id: owner; when given, another user's strategy is "not found"
         Returns:
             {"success": True, "data": {...}} or {"success": False, "error": "..."}
         """
@@ -69,8 +70,12 @@ class GetStrategyService:
             FROM strategy
             WHERE strategy_id = %s AND strategy_name = %s AND version = %s
             """
+            params = [strategy_id, strategy_name, version]
+            if user_id is not None:
+                strategy_query += " AND user_id = %s"
+                params.append(user_id)
 
-            cursor.execute(strategy_query, (strategy_id, strategy_name, version))
+            cursor.execute(strategy_query, params)
             row = cursor.fetchone()
 
             if not row:

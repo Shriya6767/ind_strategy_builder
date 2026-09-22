@@ -1,5 +1,5 @@
-from src.core.modules import os, pd, ds, timedelta
-from src.core.config import SENSEX_PROCESSED_FULL_PATH
+from src.core.modules import os, re, pd, ds, timedelta
+from src.core.config import SENSEX_PROCESSED_FULL_PATH, DATA_PRELOAD, DATA_PRELOAD_RANGE
 from src.core.data_store import DataStore
 from src.core.logger import get_logger
 
@@ -67,6 +67,44 @@ class DataLoader:
             f"from {len(files)} trading day(s)."
         )
         return rows
+
+
+    @staticmethod
+    def disk_date_range() -> tuple[str, str]:
+        """Earliest and latest trading day that has a merged file on disk."""
+        dates = []
+        pattern = re.compile(r"SENSEX_MERGED_FULL_(\d{2})(\d{2})(\d{4})\.parquet$")
+        for _root, _dirs, files in os.walk(SENSEX_PROCESSED_FULL_PATH):
+            for fn in files:
+                m = pattern.match(fn)
+                if m:
+                    dates.append(f"{m.group(3)}-{m.group(2)}-{m.group(1)}")
+        if not dates:
+            raise FileNotFoundError(f"No merged sensex files under {SENSEX_PROCESSED_FULL_PATH}.")
+        return min(dates), max(dates)
+
+
+    @classmethod
+    def preload_from_env(cls) -> None:
+        """Startup: load the resident frame ONCE for every process, then
+        every backtest slices its own dates from it (see DataStore).
+          DATA_PRELOAD=false         skip (old per-request /load-data behaviour)
+          DATA_PRELOAD_RANGE=a:b     load only a..b (e.g. a small range on a
+                                     laptop); default = everything on disk
+        The engine's derived day columns are added here so no request ever
+        writes to the shared frame (forked workers stay copy-on-write)."""
+        if not DATA_PRELOAD:
+            logger.warning("DATA_PRELOAD=false: market data will not be preloaded; call /load-data.")
+            return
+        if DATA_PRELOAD_RANGE:
+            start, end = [p.strip() for p in DATA_PRELOAD_RANGE.split(":", 1)]
+        else:
+            start, end = cls.disk_date_range()
+        logger.info(f"Preloading market data {start}..{end} ...")
+        cls().load(start, end)
+        from src.services.backtesting.backtest_engine import BacktestEngine
+        BacktestEngine.derive_day_columns(DataStore.get_df())
+        logger.info(f"Market data resident: {len(DataStore.get_df()):,} rows, {start}..{end}.")
 
 
     def _get_required_files(self, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> list[str]:
