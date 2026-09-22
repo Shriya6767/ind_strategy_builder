@@ -6,7 +6,7 @@ logger = get_logger(__name__)
 class DeleteStrategyService:
 
     @staticmethod
-    def delete_strategy(strategy_id, strategy_name):
+    def delete_strategy(strategy_id, strategy_name, user_id):
         conn = None
         cursor = None
 
@@ -14,19 +14,31 @@ class DeleteStrategyService:
             conn = Database.get_connection()
             cursor = conn.cursor()
 
+            # Ownership first: legs have no user_id of their own, so confirm
+            # the strategy belongs to the caller before touching them.
+            cursor.execute(
+                "SELECT 1 FROM strategy WHERE strategy_id = %s AND strategy_name = %s AND user_id = %s LIMIT 1;",
+                (strategy_id, strategy_name, user_id)
+            )
+            if cursor.fetchone() is None:
+                return {
+                    "success": False,
+                    "error": f"Strategy not found for strategy_id={strategy_id}, strategy_name='{strategy_name}'"
+                }
+
             delete_legs_query = """
             DELETE FROM leg_details WHERE strategy_id = %s;
             """
-            
+
             cursor.execute(delete_legs_query, (strategy_id,))
             deleted_leg_count = cursor.rowcount
 
             delete_strategy_query = """
             DELETE FROM strategy
-            WHERE strategy_id = %s AND strategy_name = %s
+            WHERE strategy_id = %s AND strategy_name = %s AND user_id = %s
             RETURNING strategy_id;
             """
-            cursor.execute(delete_strategy_query, (strategy_id, strategy_name))
+            cursor.execute(delete_strategy_query, (strategy_id, strategy_name, user_id))
             deleted = cursor.fetchone()
 
             if not deleted:

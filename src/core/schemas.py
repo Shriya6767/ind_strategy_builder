@@ -4,3 +4,4 @@ class LoadDataRequest(BaseModel):
     start_date: str
     end_date: str
     symbol: str = "sensex"
+    reload: bool = False

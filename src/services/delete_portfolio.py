@@ -7,7 +7,7 @@ logger = get_logger(__name__)
 
 class DeletePortfolioService:
     @staticmethod
-    def delete_portfolio(request: dict) -> dict:
+    def delete_portfolio(request: dict, user_id: int) -> dict:
         conn = None
         try:
             portfolio_id = request.get("portfolio_id")
@@ -21,10 +21,10 @@ class DeletePortfolioService:
             cursor.execute(
                 """
                 DELETE FROM portfolio
-                WHERE portfolio_id = %s
+                WHERE portfolio_id = %s AND user_id = %s
                 RETURNING id;
                 """,
-                (portfolio_id,)
+                (portfolio_id, user_id)
             )
 
             row = cursor.fetchone()

@@ -4,7 +4,7 @@ from src.core.logger import get_logger
 logger = get_logger(__name__)
 
 class CompareBacktestService:
-    def compare_backtests(self, request: dict) -> list[dict]:
+    def compare_backtests(self, request: dict, user_id: int) -> list[dict]:
         conn = None
 
         try:
@@ -14,26 +14,32 @@ class CompareBacktestService:
             conn = Database.get_connection()
             cursor = conn.cursor()
 
+            # version_result has no owner column; ownership comes from the
+            # strategy it belongs to.
             cursor.execute(
                 """
                 SELECT
-                    strategy_id,
-                    strategy_name,
-                    version,
-                    backtest_start_date,
-                    backtest_end_date,
-                    overall_mtm,
-                    avg_mtm,
-                    max_drawdown,
-                    risk_reward_ratio,
-                    win_percentage,
-                    created_at
-                FROM version_result
-                WHERE strategy_id = %s
-                  AND strategy_name = %s
-                ORDER BY version DESC;
+                    vr.strategy_id,
+                    vr.strategy_name,
+                    vr.version,
+                    vr.backtest_start_date,
+                    vr.backtest_end_date,
+                    vr.overall_mtm,
+                    vr.avg_mtm,
+                    vr.max_drawdown,
+                    vr.risk_reward_ratio,
+                    vr.win_percentage,
+                    vr.created_at
+                FROM version_result vr
+                WHERE vr.strategy_id = %s
+                  AND vr.strategy_name = %s
+                  AND EXISTS (
+                        SELECT 1 FROM strategy s
+                        WHERE s.strategy_id = vr.strategy_id AND s.user_id = %s
+                  )
+                ORDER BY vr.version DESC;
                 """,
-                (strategy_id, strategy_name),
+                (strategy_id, strategy_name, user_id),
             )
 
             rows = cursor.fetchall()

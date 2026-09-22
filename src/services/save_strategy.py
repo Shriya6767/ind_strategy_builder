@@ -159,7 +159,7 @@ def insert_legs(cursor, strategy_id, version, request) -> int:
 
 class SaveStrategyService:
     @staticmethod
-    def save_strategy(request):
+    def save_strategy(request, user_id: int):
         conn = None
         cursor = None
 
@@ -183,18 +183,24 @@ class SaveStrategyService:
                 version = 1
 
             else:
+                # "Save As New" on an existing id: only its owner may add a
+                # version to it.
                 cursor.execute(
                     """
-                    SELECT COALESCE(MAX(version), 0) + 1
+                    SELECT COALESCE(MAX(version), 0)
                     FROM strategy
-                    WHERE strategy_id = %s;
+                    WHERE strategy_id = %s AND user_id = %s;
                     """,
-                    (strategy_id,)
+                    (strategy_id, user_id)
                 )
-                version = cursor.fetchone()[0]
+                latest = cursor.fetchone()[0]
+                if not latest:
+                    return {"status": False, "message": f"Strategy {strategy_id} not found.", "not_found": True}
+                version = latest + 1
 
             strategy_query = """
                 INSERT INTO strategy (
+                    user_id,
                     strategy_id,
                     strategy_name,
                     symbol,
@@ -237,7 +243,7 @@ class SaveStrategyService:
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 RETURNING id;
             """
@@ -245,6 +251,7 @@ class SaveStrategyService:
             cursor.execute(
                 strategy_query,
                 (
+                    user_id,
                     strategy_id,
                     strategy["strategy_name"],
                     strategy["symbol"],

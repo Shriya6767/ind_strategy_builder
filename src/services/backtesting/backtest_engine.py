@@ -432,6 +432,8 @@ class BacktestEngine:
         for day_block in self.trade_results:
             for leg in day_block["legs"]:
                 leg.pop("_trade_date", None)
+                for key in ("_trade_key", "_trade_closed_pnl", "_trade_closed_entry_value"):
+                    leg.pop(key, None)
                 # A re-entry that filled on Day 2 carries the date of the trade
                 # it continues; everything else is bucketed by its own entry.
                 chain_date = leg.pop("_chain_date", None)
@@ -1063,11 +1065,44 @@ class BacktestEngine:
                 result["legs"].append(leg_result)
 
         result = self._apply_overall_risk_management(day_df, result)
+        self._tag_overnight_legs_with_trade_totals(trade_date, result, prior_legs)
 
         if result["legs"]:
             self.trade_results.append(result)
 
-   
+
+    @staticmethod
+    def _tag_overnight_legs_with_trade_totals(trade_date, result: dict, prior_legs: list) -> None:
+        """The overall SL/target is a property of the whole trade, not of the
+        legs that happen to still be open. When Day 2 judges a carried-over
+        leg it must add what its Day-1 siblings already realised, against a
+        PERCENT base of the trade's TOTAL entry premium (AlgoTest: a straddle
+        whose CE lost 6,101 on Day 1 is not 'at target' because the PE alone
+        shows +1,658 next morning). Those Day-1 numbers are stashed on every
+        held leg here, keyed by the trade date so `_find_overall_breach`
+        adds them once per trade."""
+        prior_ids = {id(leg) for leg in prior_legs}
+        closed_pnl = 0.0
+        closed_entry_value = 0.0
+        held = []
+        for leg in result["legs"]:
+            if id(leg) in prior_ids:
+                continue
+            entry_dt = leg.get("entry_datetime")
+            if entry_dt is None or entry_dt.date() != trade_date:
+                continue
+            status = leg.get("status")
+            if status == "HELD_OVERNIGHT":
+                held.append(leg)
+            elif status == "EXIT_DONE" and leg.get("pnl") is not None:
+                closed_pnl += leg["pnl"]
+                closed_entry_value += leg["entry_price"] * (leg.get("quantity_multiplier") or QUANTITY)
+        for leg in held:
+            leg["_trade_key"] = trade_date
+            leg["_trade_closed_pnl"] = closed_pnl
+            leg["_trade_closed_entry_value"] = closed_entry_value
+
+
     def execute_leg(self, leg_meta, entry_snapshot: pd.DataFrame, day_df: pd.DataFrame):
         """Execute entry logic for a single leg. Shared by INTRADAY and BTST."""
         
@@ -2759,8 +2794,12 @@ class BacktestEngine:
         fresh_legs = [leg for leg in active_legs if id(leg) not in carryover_ids]
 
         if carryover_legs:
+            # The carryover is yesterday's trade; today's fresh legs enter
+            # AFTER it is squared off and are a separate trade, so its breach
+            # must not cancel them (cancel_later_entries=False).
             result = self._run_overall_risk_cycles(
-                day_df, result, carryover_legs, has_sl, has_target, cutoff=self.exit_time
+                day_df, result, carryover_legs, has_sl, has_target, cutoff=self.exit_time,
+                cancel_later_entries=False,
             )
 
         if fresh_legs:
@@ -2771,7 +2810,8 @@ class BacktestEngine:
 
 
     def _run_overall_risk_cycles(self, day_df: pd.DataFrame, result: dict, active_legs: list,
-                                  has_sl: bool, has_target: bool, cutoff) -> dict:
+                                  has_sl: bool, has_target: bool, cutoff,
+                                  cancel_later_entries: bool = True) -> dict:
         remaining_sl_reentries = (
             int(self.strategy.get("overall_reentry_sl_value"))
             if self.strategy.get("is_overall_reentry_sl") else 0
@@ -2792,7 +2832,9 @@ class BacktestEngine:
 
             breach_datetime, breach_reason, breach_mtm = breach
 
-            self._truncate_legs_at_overall_breach(result, active_legs, day_df, breach_datetime, breach_reason)
+            self._truncate_legs_at_overall_breach(
+                result, active_legs, day_df, breach_datetime, breach_reason, cancel_later_entries
+            )
 
             if self.strategy_type == "btst":
                 for leg_result in active_legs:
@@ -2986,6 +3028,18 @@ class BacktestEngine:
                 leg["entry_price"] * QUANTITY * lot_size, index=pivot.index
             ).where(pivot.index >= leg["entry_datetime"], 0.0)
 
+        # BTST Day 2: the carried leg is judged as part of its whole trade --
+        # add the Day-1 siblings' realised P&L and their premium (once per
+        # trade; see _tag_overnight_legs_with_trade_totals).
+        seen_trades = set()
+        for leg in active_legs:
+            trade_key = leg.get("_trade_key")
+            if trade_key is None or trade_key in seen_trades:
+                continue
+            seen_trades.add(trade_key)
+            combined_mtm = combined_mtm + leg.get("_trade_closed_pnl", 0.0)
+            entry_value = entry_value + leg.get("_trade_closed_entry_value", 0.0)
+
         live = combined_mtm.notna()
         combined_mtm = combined_mtm[live]
         entry_value = entry_value[live]
@@ -3020,7 +3074,9 @@ class BacktestEngine:
         return pd.Timestamp(timestamps[idx]), reason, round(float(values[idx]), 2)
 
 
-    def _truncate_legs_at_overall_breach(self, result: dict, active_legs: list, day_df: pd.DataFrame, breach_datetime, breach_reason: str) -> None:
+    def _truncate_legs_at_overall_breach(self, result: dict, active_legs: list, day_df: pd.DataFrame,
+                                         breach_datetime, breach_reason: str,
+                                         cancel_later_entries: bool = True) -> None:
         """Once the overall SL/target fires, the strategy is flat as of the
         breach candle: every leg still open is force-closed there, and any
         entry that would only have happened AFTER the breach (delayed
@@ -3028,7 +3084,12 @@ class BacktestEngine:
         outright -- no fresh leg may enter once the overall exit has
         triggered. Only legs spawned by an OVERALL re-entry cycle trade on
         after this instant (they arrive as the next cycle's active_legs and
-        are judged against that cycle's own breach)."""
+        are judged against that cycle's own breach).
+
+        cancel_later_entries=False limits the cancellation to the legs of
+        this cycle: a BTST carryover closing on Day 2 must leave that day's
+        fresh position (a different trade, entered after the square-off)
+        untouched."""
         active_ids = {id(leg) for leg in active_legs}
 
         cancelled_ids = set()
@@ -3042,7 +3103,8 @@ class BacktestEngine:
             if id(leg_result) in cancelled_ids:
                 continue
             entry_dt = leg_result.get("entry_datetime")
-            if entry_dt is not None and entry_dt > breach_datetime and id(leg_result) not in active_ids:
+            if (cancel_later_entries and entry_dt is not None and entry_dt > breach_datetime
+                    and id(leg_result) not in active_ids):
                 continue
             kept_legs.append(leg_result)
         result["legs"] = kept_legs

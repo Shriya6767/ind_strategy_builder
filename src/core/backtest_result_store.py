@@ -1,34 +1,53 @@
+from src.core.modules import OrderedDict, threading
 from src.core.config import Database
 from src.core.logger import get_logger
 
 logger = get_logger(__name__)
 
+
 class ResultStore:
-    """Caches the RAW (pre-slippage) trade_results from a backtest run so
-    /apply-slippage can recompute against it repeatedly without re-running
-    the simulation. In-memory dict for now, matching DataStore's pattern --
-    swap for Redis/a DB table if backtests need to survive a restart or be
-    shared across multiple app instances."""
+    """Caches the RAW (pre-slippage) trade_results of a user's latest run
+    of each strategy so /apply-slippage can recompute without re-running
+    the simulation.
 
-    _results: dict[str, list] = {}
+    Keyed by (user_id, strategy_id): unsaved strategies all arrive with the
+    frontend's placeholder id (e.g. -999), so keying by strategy_id alone
+    would let one user's slippage recalculation read another user's
+    results. Bounded LRU so 60 users cannot grow it without limit -- the
+    oldest entries fall out and their /apply-slippage answers "re-run".
+    In-memory, per process; swap for Redis if the API ever runs as
+    several processes."""
 
-    @classmethod
-    def save_result(cls, trade_results: list, strategy_id: str) -> None:
-        cls._results[strategy_id] = trade_results
-
-    @classmethod
-    def get_result(cls, strategy_id: str) -> list:
-        if strategy_id not in cls._results:
-            raise KeyError(strategy_id)
-        return cls._results[strategy_id]
+    MAX_ENTRIES = 300
+    _results: "OrderedDict[tuple, list]" = OrderedDict()
+    _lock = threading.Lock()
 
     @classmethod
-    def clear(cls, strategy_id: str | None = None) -> None:
-        if strategy_id is None:
-            cls._results.clear()
-        else:
-            cls._results.pop(strategy_id, None)
-            
+    def save_result(cls, trade_results: list, user_id: int, strategy_id) -> None:
+        key = (user_id, str(strategy_id))
+        with cls._lock:
+            cls._results.pop(key, None)
+            cls._results[key] = trade_results
+            while len(cls._results) > cls.MAX_ENTRIES:
+                cls._results.popitem(last=False)
+
+    @classmethod
+    def get_result(cls, user_id: int, strategy_id) -> list:
+        key = (user_id, str(strategy_id))
+        with cls._lock:
+            if key not in cls._results:
+                raise KeyError(key)
+            cls._results.move_to_end(key)
+            return cls._results[key]
+
+    @classmethod
+    def clear(cls, user_id: int | None = None, strategy_id=None) -> None:
+        with cls._lock:
+            if user_id is None:
+                cls._results.clear()
+            else:
+                cls._results.pop((user_id, str(strategy_id)), None)
+
 
 class VersionedResultStore:
     @classmethod
