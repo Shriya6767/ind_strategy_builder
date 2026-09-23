@@ -106,7 +106,12 @@ class BacktestEngine:
             self.day1_market_close = self._parse_day1_market_close()
             self.day2_market_open = self._parse_day2_market_open()
             # Delay-restart: when enabled, carry-day monitoring of overnight
-            # positions starts at delay_restart_time instead of the market open.
+            # positions resumes at delay_restart_time instead of the market
+            # open. Like every other clock time in the engine it is a
+            # completion label: 09:16 means the first candle judged is the
+            # one completed at 09:16 (09:15:00-09:15:59). AlgoTest reads its
+            # "9:16" as the candle STARTING at 09:16, i.e. our 09:17 -- a
+            # user reproducing an AlgoTest setting enters one minute later.
             if self.is_delay_restart and self.strategy.get("delay_restart_time"):
                 self.day2_market_open = _parse_hms(self.strategy["delay_restart_time"])
 
@@ -395,13 +400,25 @@ class BacktestEngine:
 
 
     def _dedupe_carryover_legs(self):
+        """A leg held overnight is appended to the block of the day it was
+        opened AND to the block of the day it was closed (the same dict).
+        Keep only the later appearance -- the one recorded where it actually
+        closed. Walking the blocks newest-first and remembering object ids
+        catches every such duplicate, including a re-entry that filled and
+        exited on Day 2 (its Day-1 appearance passes the same-day exemption
+        below, which exists for tomorrow-range fills that are recorded ONLY
+        in the Day-1 block)."""
         if self.strategy_type != "btst":
             return
 
-        for day_block in self.trade_results:
+        seen = set()
+        for day_block in reversed(self.trade_results):
             block_date = day_block["trade_date"]
             kept_legs = []
             for leg in day_block["legs"]:
+                if id(leg) in seen:
+                    continue
+                seen.add(id(leg))
                 exit_dt = leg.get("exit_datetime")
                 if exit_dt is not None:
                     exit_date = exit_dt.date() if hasattr(exit_dt, "date") else exit_dt
@@ -867,8 +884,10 @@ class BacktestEngine:
                         closed_leg["pnl"] = round(
                             (closed_leg["exit_price"] - closed_leg["entry_price"]) * QUANTITY * lot_size * direction, 2
                         )
-                        closed_leg["is_reentry"] = False
-                        closed_leg["reentry_mode"] = None
+                        # A re-entry leg that was held overnight keeps its
+                        # re-entry identity in the report.
+                        closed_leg["is_reentry"] = bool(closed_leg.get("is_reentry"))
+                        closed_leg["reentry_mode"] = closed_leg.get("reentry_mode") if closed_leg["is_reentry"] else None
                         closed_leg["is_held_overnight"] = True
                         
                         del self.held_from_previous_day[leg_key]
@@ -1558,8 +1577,12 @@ class BacktestEngine:
 
         A pending re-entry order (return-to-cost, momentum level) that never
         fills before the close is still live overnight -- AlgoTest fills it
-        the next morning. Bounded by exit_time rather than the market close,
-        because a BTST position must be square by the Day-2 cutoff.
+        the next morning. The Day-2 part starts at the same candle Day-2
+        monitoring resumes on (day2_market_open: the open, or the
+        delay-restart candle), so a delay-restart strategy never fills off
+        the skipped opening candle's wild prints, and is bounded by
+        exit_time rather than the market close, because a BTST position
+        must be square by the Day-2 cutoff.
 
         INTRADAY is unaffected: there is no Day 2 to spill into."""
         if self.strategy_type != "btst" or day_df.empty:
@@ -1575,7 +1598,10 @@ class BacktestEngine:
                 next_day = self._next_day[1]
             else:                                   # not iterating, or order surprise
                 next_day = self.df.loc[self.df["trade_date"] == pd.Timestamp(next_date)]
-            tail = next_day.loc[next_day["trade_time"] <= self.exit_time]
+            tail = next_day.loc[
+                (next_day["trade_time"] >= self.day2_market_open)
+                & (next_day["trade_time"] <= self.exit_time)
+            ]
             if not tail.empty:
                 frame = pd.concat([day_df, tail])
         self._reentry_frame_cache[today] = frame
