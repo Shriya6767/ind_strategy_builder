@@ -311,7 +311,9 @@ class GetStrategyService:
             "premium_value": v(row, "premium_value", int, 0),
             "lower_range": v(row, "lower_range", int, 0),
             "upper_range": v(row, "upper_range", int, 0),
-            "multiplier_percentage": v(row, "multiplier_percentage", int, 0),
+            # NUMERIC(10,2) in the DB: int() here truncated 0.5 to 0, so
+            # "ATM + 0.5%" silently resolved to the ATM strike itself.
+            "multiplier_percentage": v(row, "multiplier_percentage", float, 0.0),
 
             "is_target": v(row, "is_target", bool, False),
             "target_type": v(row, "target_type", str, "POINTS"),

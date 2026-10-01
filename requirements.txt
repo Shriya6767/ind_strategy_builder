@@ -24,3 +24,9 @@ orjson==3.12.0
 bcrypt==5.0.0
 PyJWT==2.14.0
 google-auth==2.58.0
+# --- live trading (Symphony XTS) ---
+httpx==0.28.1
+# Socket.IO is spoken by our own minimal client (src/live/sio_client.py) over
+# `websockets`, because Symphony servers mix Engine.IO v3/v4 keep-alive rules.
+websockets==15.0.1
+cryptography==45.0.5

@@ -16,6 +16,9 @@ from src.services.delete_portfolio import DeletePortfolioService
 from src.core.logger import get_logger
 from src.services.get_strategy import GetStrategyService
 from src.services.delete_strategy import DeleteStrategyService
+from src.live.broker_store import BrokerAccountService
+from src.live.service import LiveTradeService, LiveValidationError
+from src.live.xts_client import XTSError
 
 
 logger = get_logger(__name__)
@@ -379,15 +382,143 @@ def run_portfolio_backtest(request: dict, user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/run-trading")
-async def run_trading(user=Depends(get_current_user)):
+# Live trading (Symphony Open XTS). State lives in PostgreSQL; execution in
+# the live worker process (src/live/worker.py), which these routes call.
+
+def _live_error(e: Exception):
+    if isinstance(e, LiveValidationError) or isinstance(e, ValueError):
+        raise HTTPException(status_code=400, detail={"status": False, "message": str(e)})
+    if isinstance(e, LookupError):
+        raise HTTPException(status_code=404, detail={"status": False, "message": str(e)})
+    if isinstance(e, PermissionError):
+        raise HTTPException(status_code=403, detail={"status": False, "message": str(e)})
+    if isinstance(e, XTSError):
+        raise HTTPException(status_code=502, detail={"status": False, "message": f"Broker: {e}"})
+    logger.exception(f"[LIVE] unexpected error: {e}")
+    raise HTTPException(status_code=500, detail={"status": False, "message": f"Internal server error: {e}"})
+
+
+#Broker Setup
+@router.get("/live/brokers")
+def live_list_brokers(user=Depends(get_current_user)):
+    return {"status": True, "data": BrokerAccountService.list(user["user_id"])}
+
+
+@router.post("/live/brokers")
+def live_add_broker(request: dict, user=Depends(get_current_user)):
+    """{connection_name, interactive_key, interactive_secret, connection_url,
+        marketdata_key?, marketdata_secret?, marketdata_url?, host_lookup_url?,
+        host_lookup_password?, dealer_client_id?}"""
     try:
-        logger.info("Trading started successfully.")
-        return {
-            "success": True,
-            "message": "Trading started successfully.",
-            "data": {}
-        }
+        return {"status": True, "message": "Broker added.", "data": BrokerAccountService.add(user["user_id"], request)}
     except Exception as e:
-        logger.error(f"Unexpected error in run_trading: {e}")
-        raise HTTPException(status_code=500, detail="Failed to start trading.")
+        _live_error(e)
+
+
+@router.delete("/live/brokers/{broker_account_id}")
+def live_delete_broker(broker_account_id: int, user=Depends(get_current_user)):
+    if not BrokerAccountService.delete(broker_account_id, user["user_id"]):
+        raise HTTPException(status_code=404, detail={"status": False, "message": "Broker account not found"})
+    return {"status": True, "message": "Broker removed."}
+
+
+@router.post("/live/brokers/{broker_account_id}/login")
+async def live_broker_login(broker_account_id: int, user=Depends(get_current_user)):
+    """Daily broker login: HostLookUp (if configured) + Interactive API session."""
+    try:
+        data = await BrokerAccountService.login(broker_account_id, user["user_id"])
+        return {"status": True, "message": "Broker login successful.", "data": data}
+    except Exception as e:
+        _live_error(e)
+
+
+@router.post("/live/brokers/{broker_account_id}/logout")
+async def live_broker_logout(broker_account_id: int, user=Depends(get_current_user)):
+    try:
+        return {"status": True, "message": "Logged out.", "data": await BrokerAccountService.logout(broker_account_id, user["user_id"])}
+    except Exception as e:
+        _live_error(e)
+
+
+@router.get("/live/brokers/{broker_account_id}/funds")
+async def live_broker_funds(broker_account_id: int, user=Depends(get_current_user)):
+    try:
+        return {"status": True, "data": await BrokerAccountService.funds(broker_account_id, user["user_id"])}
+    except Exception as e:
+        _live_error(e)
+
+
+@router.put("/live/execution-settings")
+def live_save_execution_settings(request: dict, user=Depends(get_current_user)):
+    """{strategy_id, version?, broker_account_id?, auto_activate?,
+        settings: {mode, qty_multiplier, trade_monitoring, monitoring_frequency_sec, strategy_execution_time,
+                   order_timeout_sec, exit_fallback_market, execution_days_mode, execution_days, execution_dte,
+                   squareoff_on_entry_error, max_daily_loss, paper_slippage_pct,
+                   legs: {"<leg number>": {product, tgt_sl_ref_price, delay_entry_sec, entry_order_type,
+                          exit_order_type, entry_buffer_type, exit_buffer_type, entry_trigger_buffer,
+                          entry_limit_buffer, exit_trigger_buffer, exit_limit_buffer, sl_order_at_broker,
+                          trail_monitoring, trail_frequency_sec, entry_convert_to_market_sec,
+                          exit_convert_to_market_sec}}}}"""
+    try:
+        return {"status": True, "message": "Execution settings saved.", "data": LiveTradeService.save_execution_settings(user["user_id"], request)}
+    except Exception as e:
+        _live_error(e)
+
+
+@router.get("/live/overview")
+def live_overview(user=Depends(get_current_user)):
+    """Everything the Algo Trade page needs on load: saved execution settings + today's deployments."""
+    return ORJSONResponse({"status": True, "data": LiveTradeService.overview(user["user_id"])})
+
+
+@router.post("/live/deployments")
+def live_activate(request: dict, user=Depends(get_current_user)):
+    """Activate: {strategy_id, version?, broker_account_id?, mode?, settings?} -> deployment (starts in the worker)."""
+    try:
+        return {"status": True, "message": "Strategy activated.", "data": LiveTradeService.activate(user["user_id"], request)}
+    except Exception as e:
+        _live_error(e)
+
+
+@router.get("/live/deployments")
+def live_list_deployments(trade_date: str | None = None, include_archived: bool = False, user=Depends(get_current_user)):
+    try:
+        return ORJSONResponse({"status": True, "data": LiveTradeService.list(user["user_id"], trade_date, include_archived)})
+    except Exception as e:
+        _live_error(e)
+
+
+@router.get("/live/deployments/{deployment_id}")
+def live_deployment_detail(deployment_id: int, user=Depends(get_current_user)):
+    try:
+        return ORJSONResponse({"status": True, "data": LiveTradeService.detail(user["user_id"], deployment_id)})
+    except Exception as e:
+        _live_error(e)
+
+
+@router.post("/live/deployments/{deployment_id}/{cmd}")
+def live_deployment_command(deployment_id: int, cmd: str, user=Depends(get_current_user)):
+    """cmd = pause | resume | squareoff | activate (re-send to the worker)"""
+    try:
+        return {"status": True, "data": LiveTradeService.command(user["user_id"], deployment_id, cmd)}
+    except Exception as e:
+        _live_error(e)
+
+
+@router.delete("/live/deployments/{deployment_id}")
+def live_archive_deployment(deployment_id: int, user=Depends(get_current_user)):
+    if not LiveTradeService.archive(user["user_id"], deployment_id):
+        raise HTTPException(status_code=400, detail={"status": False, "message": "Only finished deployments can be archived"})
+    return {"status": True, "message": "Archived."}
+
+
+@router.post("/live/squareoff-all")
+def live_squareoff_all(user=Depends(get_current_user)):
+    """Kill switch: exits every open leg of every running deployment of the caller."""
+    return {"status": True, "data": LiveTradeService.squareoff_all(user["user_id"])}
+
+
+@router.get("/live/snapshots")
+def live_snapshots(user=Depends(get_current_user)):
+    """REST fallback for the /ws/live stream (same payload, polled)."""
+    return ORJSONResponse({"status": True, "data": LiveTradeService.live_snapshots(user["user_id"])})
