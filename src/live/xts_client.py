@@ -163,13 +163,13 @@ class XTSInteractiveClient(_BaseClient):
         self.set_token(result["token"], result.get("userID"))
         self.is_investor_client = bool(result.get("isInvestorClient", True))
         self.enums = result.get("enums") or {}
-        codes = result.get("clientCodes") or []
         # Investor clients trade their own account: clientID = userID (this is
-        # what Symphony's own SDK sends). Dealers must name the client.
+        # what Symphony's own SDK sends). Dealer / Pro accounts send "*****"
+        # unless they trade a named client (dealer_client_id).
         if self.is_investor_client:
             self.client_id = self.user_id
         else:
-            self.client_id = dealer_client_id or (codes[0] if codes else None)
+            self.client_id = dealer_client_id or "*****"
         return result
 
 
