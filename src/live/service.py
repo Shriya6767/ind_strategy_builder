@@ -61,7 +61,7 @@ class LiveTradeService:
             "strategy_id": r["strategy_id"], "version": r["version"], "broker_account_id": r["broker_account_id"],
             "settings": r["settings"], "auto_activate": r["auto_activate"], "updated_at": str(r["updated_at"]),
         } for r in store.list_execution_settings(user_id)]
-        deployments = [_row_public(r) for r in store.list_deployments(user_id, today)]
+        deployments = [_row_public(r) for r in store.list_deployments(user_id, today, with_active=True)]
         return {"trade_date": str(today), "execution_settings": settings, "deployments": deployments}
 
 
@@ -293,10 +293,8 @@ class LiveTradeService:
             raise LookupError("Deployment not found")
         out = _row_public(dep)
         out["settings"] = dep["settings"]
-        out["strategy"] = dep["strategy_snapshot"]
-        out["legs"] = [_jsonable(r) for r in store.list_legs(deployment_id)]
+        out["legs"] = [_leg_public(r) for r in store.list_legs(deployment_id)]
         out["events"] = [_jsonable(r) for r in store.list_events(deployment_id)]
-        out["orders"] = [_jsonable(r) for r in store.list_orders(deployment_id)]
         return out
 
     @staticmethod
@@ -306,6 +304,26 @@ class LiveTradeService:
 
 def _jsonable(row: dict) -> dict:
     return orjson.loads(orjson.dumps(row, default=str))
+
+
+def _num(v):
+    return float(v) if v is not None else None
+
+
+def _leg_public(r: dict) -> dict:
+    entry_ts, exit_ts = r.get("entry_time"), r.get("exit_time")
+    return {
+        "leg_number": r["leg_number"], "attempt": r["attempt"], "status": r["status"],
+        "symbol": r.get("symbol"), "side": r["side"], "qty": r["quantity"],
+        "entry_price": _num(r.get("entry_price")),
+        "entry_date": entry_ts.strftime("%Y-%m-%d") if entry_ts else None,
+        "entry_time": entry_ts.strftime("%H:%M:%S") if entry_ts else None,
+        "stoploss": _num(r.get("stoploss_price")), "target": _num(r.get("target_price")),
+        "exit_price": _num(r.get("exit_price")),
+        "exit_date": exit_ts.strftime("%Y-%m-%d") if exit_ts else None,
+        "exit_time": exit_ts.strftime("%H:%M:%S") if exit_ts else None,
+        "exit_reason": r.get("exit_reason"), "pnl": _num(r.get("pnl")), "error": r.get("error"),
+    }
 
 
 def _row_public(r: dict) -> dict:

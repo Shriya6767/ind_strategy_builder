@@ -172,6 +172,7 @@ class DeploymentRunner:
         self.leg_defs: list[dict] = [_prepare_meta(l, i) for i, l in enumerate(snap["legs"], start=1)]
         self.settings = ExecutionSettings.from_dict(dep["settings"])
         self.mode = dep["mode"]
+        self.venue = "broker" if self.mode == "live" else "paper broker"
         self.trade_date: date = _as_date(dep["trade_date"])
         self.exit_date: date = _as_date(dep["exit_date"])
         self.strategy_type = str(self.strategy.get("strategy_type", "intraday")).lower()
@@ -271,19 +272,15 @@ class DeploymentRunner:
             if leg.kind == "observation" and leg.status == "done":
                 continue
             ltp = self.store.ltp(leg.key) if leg.key else None
-            c = leg.contract
             legs.append({
-                "leg_number": leg.leg_number, "attempt": leg.attempt, "status": leg.status, "kind": leg.kind,
-                "entry_mode": leg.entry_mode, "wait": leg.wait, "trigger": leg.trigger,
-                "range_high": leg.range_hi, "range_low": leg.range_lo,
-                "symbol": getattr(c, "symbol", None), "instrument_id": getattr(c, "instrument_id", None),
-                "expiry": str(getattr(c, "expiry", "") or ""), "strike": getattr(c, "strike", None),
-                "option_type": leg.option_type, "side": leg.side, "lots": leg.lots, "qty": leg.qty,
-                "entry_price": leg.entry_price, "ltp": ltp, "stoploss": leg.sl, "target": leg.tgt,
-                "sl_order_id": leg.sl_order_id,          # set when the stop rests at the broker as an SL-L order
-                "exit_price": leg.exit_price, "exit_reason": leg.exit_reason,
+                "leg_number": leg.leg_number, "attempt": leg.attempt, "status": leg.status,
+                "symbol": getattr(leg.contract, "symbol", None), "side": leg.side, "qty": leg.qty,
+                "entry_price": leg.entry_price, "entry_date": _day(leg.entry_ts), "entry_time": _clock(leg.entry_ts),
+                "initial_sl": leg.base_sl, "stoploss": leg.sl, "target": leg.tgt, "ltp": ltp,
+                "exit_price": leg.exit_price, "exit_date": _day(leg.exit_ts), "exit_time": _clock(leg.exit_ts),
+                "exit_reason": leg.exit_reason,
                 "pnl": round(leg.pnl if leg.status == "closed" else leg.unrealised(ltp), 2),
-                "error": leg.error,
+                "wait": leg.wait, "trigger": leg.trigger, "error": leg.error,
             })
         unreal = self.unrealised()
         return {
@@ -1165,7 +1162,7 @@ class DeploymentRunner:
             try:
                 await self.broker.modify(sl_oid, sl_payload, order_type="LIMIT", limit_price=price)
                 app_id, payload = sl_oid, sl_payload
-                self._event(f"Leg {leg.leg_number}: SL-L order {sl_oid} converted to the {reason} exit (limit {price})")
+                self._event(f"Leg {leg.leg_number}: SL-L order {sl_oid} at the {self.venue} converted to the {reason} exit (limit {price})")
             except XTSError as e:
                 await self.broker.refresh_order(sl_oid)
                 latest = self.broker.tracker.latest(sl_oid)
@@ -1303,7 +1300,7 @@ class DeploymentRunner:
                 pass
             return
         leg.sl_order_id, leg.sl_payload = app_id, payload
-        self._event(f"Leg {leg.leg_number}: stop-loss resting at broker as SL-L {side} -- trigger {trigger}, limit {limit}")
+        self._event(f"Leg {leg.leg_number}: stop-loss resting at the {self.venue} as SL-L {side} -- trigger {trigger}, limit {limit}")
         self._persist_leg(leg)
         self._spawn(self._watch_sl_order(leg, app_id))
 
@@ -1326,7 +1323,7 @@ class DeploymentRunner:
                            side=_flip(leg.side), order_type="STOPLIMIT", quantity=leg.qty, status=upd.status,
                            filled_qty=upd.filled_qty, avg_price=upd.avg_price, reason=upd.reason, payload=upd.raw)
             if upd.status == "Filled":
-                self._event(f"Leg {leg.leg_number}: stop-loss order filled at the broker @ {upd.avg_price}")
+                self._event(f"Leg {leg.leg_number}: stop-loss order filled at the {self.venue} @ {upd.avg_price}")
                 self._close_leg(leg, upd.avg_price or leg.sl, "stoploss")
             else:
                 leg.sl_order_id = leg.sl_payload = None
@@ -1483,6 +1480,8 @@ class DeploymentRunner:
             leg.exit_reason = r.get("exit_reason")
             leg.ref_price = float(r["ref_price"]) if r.get("ref_price") is not None else None
             leg.sl_order_id = r.get("sl_order_id")
+            leg.entry_ts = r["entry_time"].replace(tzinfo=IST) if r.get("entry_time") else None
+            leg.exit_ts = r["exit_time"].replace(tzinfo=IST) if r.get("exit_time") else None
             self.legs.append(leg)
             if leg.status in ("entering", "exiting"):
                 oid = leg.entry_order_id if leg.status == "entering" else leg.exit_order_id
@@ -1519,7 +1518,7 @@ class DeploymentRunner:
                     sl_row = book.get(str(leg.sl_order_id))
                     sl_upd = OrderUpdate.from_xts(sl_row) if sl_row else None
                     if sl_upd and sl_upd.status == "Filled":
-                        self._event(f"Leg {leg.leg_number}: stop-loss order filled at the broker while the worker was down")
+                        self._event(f"Leg {leg.leg_number}: stop-loss order filled at the {self.venue} while the worker was down")
                         self._close_leg(leg, sl_upd.avg_price or leg.sl, "stoploss")
                         continue
                     if sl_upd and not sl_upd.terminal:
@@ -1532,7 +1531,7 @@ class DeploymentRunner:
                             tag=str(sl_row.get("OrderUniqueIdentifier") or ""))
                         self.broker.tracker.handle(sl_upd)
                         self._spawn(self._watch_sl_order(leg, leg.sl_order_id))
-                        self._event(f"Leg {leg.leg_number}: SL-L order {leg.sl_order_id} is still resting at the broker -- watching it")
+                        self._event(f"Leg {leg.leg_number}: SL-L order {leg.sl_order_id} is still resting at the {self.venue} -- watching it")
                     else:
                         leg.sl_order_id = None       # gone (cancelled / not in today's book)
                 if self._broker_sl_ok(leg):
@@ -1760,6 +1759,14 @@ def _num(v) -> float:
 
 def _flip(side: str) -> str:
     return "SELL" if side == "BUY" else "BUY"
+
+
+def _day(ts: datetime | None) -> str | None:
+    return ts.strftime("%Y-%m-%d") if ts else None
+
+
+def _clock(ts: datetime | None) -> str | None:
+    return ts.strftime("%H:%M:%S") if ts else None
 
 
 def _as_date(v) -> date:

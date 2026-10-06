@@ -101,15 +101,20 @@ def get_deployment(deployment_id: int, user_id: int | None = None) -> dict | Non
     return _run(q)
 
 
-def list_deployments(user_id: int, trade_date: date | None = None, include_archived: bool = False) -> list[dict]:
+def list_deployments(user_id: int, trade_date: date | None = None, include_archived: bool = False,
+                     with_active: bool = False) -> list[dict]:
     def q(cur):
         sql = """SELECT deployment_id, strategy_id, strategy_name, version, broker_account_id, mode, trade_date,
                         exit_date, status, status_reason, realised_pnl, is_archived, created_at, updated_at
                  FROM live_deployment WHERE user_id = %s"""
         params = [user_id]
         if trade_date is not None:
-            sql += " AND (trade_date = %s OR exit_date = %s)"
-            params += [trade_date, trade_date]
+            if with_active:
+                sql += " AND (%s BETWEEN trade_date AND exit_date OR status IN %s)"
+                params += [trade_date, ACTIVE_STATUSES]
+            else:
+                sql += " AND %s BETWEEN trade_date AND exit_date"
+                params.append(trade_date)
         if not include_archived:
             sql += " AND is_archived = FALSE"
         sql += " ORDER BY created_at DESC"
