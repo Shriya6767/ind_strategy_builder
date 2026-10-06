@@ -69,6 +69,12 @@ async def squareoff_all(user_id: int, request: Request):
     return {"status": True, "data": await engine.squareoff_all(user_id)}
 
 
+@app.post("/internal/users/{user_id}/manual-all")
+async def manual_all(user_id: int, request: Request):
+    _internal(request)
+    return {"status": True, "data": await engine.manual_all(user_id)}
+
+
 @app.get("/internal/users/{user_id}/snapshots")
 async def snapshots(user_id: int, request: Request):
     _internal(request)

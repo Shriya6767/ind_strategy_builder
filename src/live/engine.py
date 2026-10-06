@@ -176,6 +176,8 @@ class LiveEngine:
             await runner.resume()
         elif cmd == "squareoff":
             await runner.squareoff("manual")
+        elif cmd == "manual":
+            await runner.switch_to_manual("manual")
         else:
             raise ValueError("Unknown command")
         return runner.snapshot()
@@ -186,6 +188,14 @@ class LiveEngine:
         for r in list(self.runners.values()):
             if r.user_id == user_id and r.active:
                 await r.squareoff("manual_all")
+                out.append(r.snapshot())
+        return out
+
+    async def manual_all(self, user_id: int) -> list[dict]:
+        out = []
+        for r in list(self.runners.values()):
+            if r.user_id == user_id and r.active:
+                await r.switch_to_manual("manual_all")
                 out.append(r.snapshot())
         return out
 

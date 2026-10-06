@@ -153,11 +153,11 @@ def set_realised_pnl(deployment_id: int, pnl: float) -> None:
     _run(q)
 
 
-def archive_deployment(deployment_id: int, user_id: int) -> bool:
+def archive_deployment(deployment_id: int, user_id: int, archived: bool = True) -> bool:
     def q(cur):
-        cur.execute("""UPDATE live_deployment SET is_archived = TRUE, updated_at = NOW()
+        cur.execute("""UPDATE live_deployment SET is_archived = %s, updated_at = NOW()
                        WHERE deployment_id = %s AND user_id = %s AND status NOT IN %s""",
-                    (deployment_id, user_id, ACTIVE_STATUSES))
+                    (archived, deployment_id, user_id, ACTIVE_STATUSES))
         return cur.rowcount > 0
     return _run(q)
 

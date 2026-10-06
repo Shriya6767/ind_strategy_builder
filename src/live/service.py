@@ -258,17 +258,17 @@ class LiveTradeService:
 
     @staticmethod
     def command(user_id: int, deployment_id: int, cmd: str) -> dict:
-        if cmd not in ("pause", "resume", "squareoff", "activate"):
+        if cmd not in ("pause", "resume", "squareoff", "manual", "activate"):
             raise LiveValidationError("Unknown command")
         dep = store.get_deployment(deployment_id, user_id)
         if not dep:
             raise LookupError("Deployment not found")
-        if dep["status"] in ("squared_off", "completed", "error", "cancelled") and cmd != "activate":
+        if dep["status"] in ("squared_off", "completed", "error", "cancelled", "manual") and cmd != "activate":
             raise LiveValidationError(f"Deployment is already {dep['status']}")
         fwd = LiveTradeService.forward(f"/internal/deployments/{deployment_id}/{cmd}")
         if not fwd.get("forwarded"):
-            if cmd == "squareoff":
-                raise RuntimeError(fwd.get("error") or "worker unreachable -- square off at the broker terminal")
+            if cmd in ("squareoff", "manual"):
+                raise RuntimeError(fwd.get("error") or "worker unreachable -- manage the position at the broker terminal")
             store.log_event(deployment_id, f"{cmd}: {fwd.get('error')}", "warn")
         return {"deployment_id": deployment_id, "command": cmd, "worker": fwd}
 
@@ -277,10 +277,13 @@ class LiveTradeService:
         return LiveTradeService.forward(f"/internal/users/{user_id}/squareoff-all")
 
     @staticmethod
+    def manual_all(user_id: int) -> dict:
+        return LiveTradeService.forward(f"/internal/users/{user_id}/manual-all")
+
+    @staticmethod
     def live_snapshots(user_id: int) -> dict:
         return LiveTradeService.forward(f"/internal/users/{user_id}/snapshots", method="GET", timeout=4.0)
 
-    # ------------------------------------------------------------ read models
     @staticmethod
     def list(user_id: int, trade_date: str | None, include_archived: bool) -> list[dict]:
         d = date.fromisoformat(trade_date) if trade_date else None
@@ -298,8 +301,8 @@ class LiveTradeService:
         return out
 
     @staticmethod
-    def archive(user_id: int, deployment_id: int) -> bool:
-        return store.archive_deployment(deployment_id, user_id)
+    def archive(user_id: int, deployment_id: int, archived: bool = True) -> bool:
+        return store.archive_deployment(deployment_id, user_id, archived)
 
 
 def _jsonable(row: dict) -> dict:

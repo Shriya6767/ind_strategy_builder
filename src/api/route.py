@@ -496,9 +496,16 @@ def live_deployment_detail(deployment_id: int, user=Depends(get_current_user)):
         _live_error(e)
 
 
+@router.post("/live/deployments/{deployment_id}/unarchive")
+def live_unarchive_deployment(deployment_id: int, user=Depends(get_current_user)):
+    if not LiveTradeService.archive(user["user_id"], deployment_id, archived=False):
+        raise HTTPException(status_code=400, detail={"status": False, "message": "Deployment not found"})
+    return {"status": True, "message": "Unarchived."}
+
+
 @router.post("/live/deployments/{deployment_id}/{cmd}")
 def live_deployment_command(deployment_id: int, cmd: str, user=Depends(get_current_user)):
-    """cmd = pause | resume | squareoff | activate (re-send to the worker)"""
+    """cmd = pause | resume | squareoff | manual (switch to manual) | activate (re-send to the worker)"""
     try:
         return {"status": True, "data": LiveTradeService.command(user["user_id"], deployment_id, cmd)}
     except Exception as e:
@@ -516,6 +523,12 @@ def live_archive_deployment(deployment_id: int, user=Depends(get_current_user)):
 def live_squareoff_all(user=Depends(get_current_user)):
     """Kill switch: exits every open leg of every running deployment of the caller."""
     return {"status": True, "data": LiveTradeService.squareoff_all(user["user_id"])}
+
+
+@router.post("/live/manual-all")
+def live_manual_all(user=Depends(get_current_user)):
+    """Switch every running deployment of the caller to manual: positions stay at the broker, no further orders."""
+    return {"status": True, "data": LiveTradeService.manual_all(user["user_id"])}
 
 
 @router.get("/live/snapshots")

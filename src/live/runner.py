@@ -48,7 +48,7 @@ from src.live.timeutil import (
 logger = get_logger(__name__)
 
 LAST_EXIT_SECS = MARKET_CLOSE_SECS - 30           # never plan an exit after 15:29:30
-TERMINAL_STATUSES = ("squared_off", "completed", "error", "cancelled")
+TERMINAL_STATUSES = ("squared_off", "completed", "error", "cancelled", "manual")
 PREMIUM_TYPES = ("POINTS", "PERCENT")
 UNDERLYING_TYPES = ("UNDERLYING_POINTS", "UNDERLYING_PERCENT")
 OPEN_STATUSES = ("open", "exiting")
@@ -251,6 +251,50 @@ class DeploymentRunner:
         if self.status not in TERMINAL_STATUSES:
             self._finish("squared_off", reason)
 
+    async def switch_to_manual(self, reason: str = "manual"):
+        """AlgoTest 'Switch to Manual': disconnect the strategy. Open positions stay at the
+        broker for the user to manage; our resting / pending orders are cancelled and no
+        further orders are generated."""
+        if self.status in TERMINAL_STATUSES:
+            return
+        self._squaring = True
+        for leg in self.legs:
+            if leg.status in ("open", "exiting"):
+                filled = None
+                for oid in (leg.sl_order_id, leg.exit_order_id if leg.status == "exiting" else None):
+                    if not oid:
+                        continue
+                    try:
+                        await self.broker.cancel(oid, "")
+                    except XTSError as e:
+                        await self.broker.refresh_order(oid)
+                        latest = self.broker.tracker.latest(oid)
+                        if latest is not None and latest.status == "Filled":
+                            filled = latest
+                        else:
+                            self._event(f"Leg {leg.leg_number}: could not cancel order {oid} ({e}) -- cancel it at the broker", "warn")
+                if filled is not None:
+                    leg.sl_order_id = None
+                    self._close_leg(leg, filled.avg_price, "stoploss")
+                    continue
+                leg.sl_order_id = leg.sl_payload = None
+                leg.exit_price, leg.exit_ts, leg.exit_reason = self.store.ltp(leg.key), now_ist(), "manual"
+                leg.pnl = round(leg.unrealised(leg.exit_price), 2)
+                leg.status = "manual"
+                self._persist_leg(leg)
+                self._event(f"Leg {leg.leg_number}: {leg.side} {leg.qty} {getattr(leg.contract, 'symbol', '')} handed over to manual at {leg.exit_price}")
+            elif leg.status == "waiting":
+                leg.status, leg.error = "skipped", "switched to manual before the entry condition was met"
+                self._persist_wait(leg, "cancelled")
+                self._persist_leg(leg)
+            elif leg.status == "entering" and leg.entry_order_id:
+                try:
+                    await self.broker.cancel(leg.entry_order_id, leg.entry_payload.get("orderUniqueIdentifier", ""))
+                except XTSError:
+                    pass
+        self._waiting.clear()
+        self._finish("manual", reason)
+
     async def stop(self):
         if self._task and not self._task.done():
             self._task.cancel()
@@ -279,7 +323,7 @@ class DeploymentRunner:
                 "initial_sl": leg.base_sl, "stoploss": leg.sl, "target": leg.tgt, "ltp": ltp,
                 "exit_price": leg.exit_price, "exit_date": _day(leg.exit_ts), "exit_time": _clock(leg.exit_ts),
                 "exit_reason": leg.exit_reason,
-                "pnl": round(leg.pnl if leg.status == "closed" else leg.unrealised(ltp), 2),
+                "pnl": round(leg.pnl if leg.status in ("closed", "manual") else leg.unrealised(ltp), 2),
                 "wait": leg.wait, "trigger": leg.trigger, "error": leg.error,
             })
         unreal = self.unrealised()
@@ -1733,7 +1777,7 @@ class DeploymentRunner:
                        entry_price=leg.entry_price, entry_time=to_naive_ist(leg.entry_ts),
                        underlying_at_entry=leg.spot_at_entry, stoploss_price=leg.sl, target_price=leg.tgt,
                        exit_order_id=leg.exit_order_id, exit_price=leg.exit_price, exit_time=to_naive_ist(leg.exit_ts),
-                       exit_reason=leg.exit_reason, pnl=leg.pnl if leg.status == "closed" else None,
+                       exit_reason=leg.exit_reason, pnl=leg.pnl if leg.status in ("closed", "manual") else None,
                        error=leg.error, quantity=leg.qty, sl_order_id=leg.sl_order_id, ref_price=leg.ref_price)
 
     async def _release_subscriptions(self):
