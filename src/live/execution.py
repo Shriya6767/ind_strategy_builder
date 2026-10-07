@@ -8,7 +8,7 @@ VALID_DAYS = ("M", "T", "W", "Th", "F", "Sa", "Su")
 STRATEGY_KEYS = frozenset({
     "mode", "qty_multiplier", "trade_monitoring", "monitoring_frequency_sec", "strategy_execution_time",
     "order_timeout_sec", "exit_fallback_market", "execution_days_mode", "execution_days", "execution_dte",
-    "squareoff_on_entry_error", "max_daily_loss", "paper_slippage_pct", "legs",
+    "squareoff_on_entry_error", "max_daily_loss", "paper_slippage_pct", "auto_restart", "legs",
 })
 LEG_KEYS = frozenset({
     "product", "tgt_sl_ref_price", "delay_entry_sec", "entry_order_type", "exit_order_type",
@@ -102,6 +102,7 @@ class ExecutionSettings:
     squareoff_on_entry_error: bool = True
     max_daily_loss: float | None = None
     paper_slippage_pct: float = 0.0
+    auto_restart: bool = False               # BTST / positional: restart the overnight pause on broker login / 08:45
     legs: dict = dataclasses.field(default_factory=dict)   # {"1": LegExecution, ...}
 
     @classmethod
@@ -144,6 +145,7 @@ class ExecutionSettings:
         mdl = raw.get("max_daily_loss")
         s.max_daily_loss = abs(float(mdl)) if mdl not in (None, "", 0, "0") else None
         s.paper_slippage_pct = float(raw.get("paper_slippage_pct", 0) or 0)
+        s.auto_restart = bool(raw.get("auto_restart", s.auto_restart))
         legs = raw.get("legs") or {}
         if not isinstance(legs, dict):
             raise ValueError("legs must be an object keyed by leg number")

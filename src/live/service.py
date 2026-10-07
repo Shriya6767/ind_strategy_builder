@@ -233,11 +233,11 @@ class LiveTradeService:
 
 
     @staticmethod
-    def forward(path: str, method: str = "POST", timeout: float = 8.0) -> dict:
+    def forward(path: str, method: str = "POST", timeout: float = 8.0, body: dict | None = None) -> dict:
         url = f"{config.LIVE_WORKER_URL}{path}"
         try:
             with httpx.Client(timeout=timeout) as http:
-                r = http.request(method, url, headers=LiveTradeService._headers())
+                r = http.request(method, url, headers=LiveTradeService._headers(), json=body)
             body = orjson.loads(r.content) if r.content else {}
             if r.status_code >= 400:
                 return {"forwarded": False, "error": body.get("detail") or body.get("message") or f"HTTP {r.status_code}"}
@@ -257,17 +257,19 @@ class LiveTradeService:
 
 
     @staticmethod
-    def command(user_id: int, deployment_id: int, cmd: str) -> dict:
-        if cmd not in ("pause", "resume", "squareoff", "manual", "activate"):
+    def command(user_id: int, deployment_id: int, cmd: str, body: dict | None = None) -> dict:
+        if cmd not in ("pause", "resume", "squareoff", "manual", "cancel", "activate"):
             raise LiveValidationError("Unknown command")
         dep = store.get_deployment(deployment_id, user_id)
         if not dep:
             raise LookupError("Deployment not found")
         if dep["status"] in ("squared_off", "completed", "error", "cancelled", "manual") and cmd != "activate":
             raise LiveValidationError(f"Deployment is already {dep['status']}")
-        fwd = LiveTradeService.forward(f"/internal/deployments/{deployment_id}/{cmd}")
+        if cmd == "cancel" and dep["status"] not in ("scheduled", "paused"):
+            raise LiveValidationError("Cancel Deployment is only available while scheduled or paused -- use Square Off or Switch to Manual")
+        fwd = LiveTradeService.forward(f"/internal/deployments/{deployment_id}/{cmd}", body=body or None)
         if not fwd.get("forwarded"):
-            if cmd in ("squareoff", "manual"):
+            if cmd in ("squareoff", "manual", "cancel"):
                 raise RuntimeError(fwd.get("error") or "worker unreachable -- manage the position at the broker terminal")
             store.log_event(deployment_id, f"{cmd}: {fwd.get('error')}", "warn")
         return {"deployment_id": deployment_id, "command": cmd, "worker": fwd}

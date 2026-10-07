@@ -53,7 +53,8 @@ async def health():
 async def deployment_command(deployment_id: int, cmd: str, request: Request):
     _internal(request)
     try:
-        return {"status": True, "data": await engine.command(deployment_id, cmd)}
+        body = await request.json() if int(request.headers.get("content-length") or 0) else None
+        return {"status": True, "data": await engine.command(deployment_id, cmd, body)}
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:

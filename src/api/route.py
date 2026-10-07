@@ -504,10 +504,11 @@ def live_unarchive_deployment(deployment_id: int, user=Depends(get_current_user)
 
 
 @router.post("/live/deployments/{deployment_id}/{cmd}")
-def live_deployment_command(deployment_id: int, cmd: str, user=Depends(get_current_user)):
-    """cmd = pause | resume | squareoff | manual (switch to manual) | activate (re-send to the worker)"""
+def live_deployment_command(deployment_id: int, cmd: str, request: dict | None = None, user=Depends(get_current_user)):
+    """cmd = pause | resume (restart; optional body {exit_date}) | squareoff | manual (switch to manual)
+    | cancel (cancel deployment, scheduled/paused only) | activate (re-send to the worker)"""
     try:
-        return {"status": True, "data": LiveTradeService.command(user["user_id"], deployment_id, cmd)}
+        return {"status": True, "data": LiveTradeService.command(user["user_id"], deployment_id, cmd, request)}
     except Exception as e:
         _live_error(e)
 

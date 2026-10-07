@@ -27,6 +27,9 @@ from src.live.timeutil import today_ist, now_ist, parse_hms, secs_now, weekday_c
 
 logger = get_logger(__name__)
 
+AUTO_RESTART_FROM_SECS = 8 * 3600
+AUTO_RESTART_SCAN_SECS = 8 * 3600 + 45 * 60
+
 
 class LiveEngine:
     def __init__(self):
@@ -131,7 +134,22 @@ class LiveEngine:
         for r in self.runners.values():
             if r.active and r.dep.get("broker_account_id") == acct and r.mode == "live":
                 r.broker = broker
+        await self.auto_restart(acct)
         return broker
+
+    async def auto_restart(self, broker_account_id: int | None = None):
+        """after 08:00, a broker login (or the 08:45 scan) restarts the
+        overnight-paused BTST / positional deployments that opted in."""
+        if secs_now() < AUTO_RESTART_FROM_SECS or not is_trading_day(today_ist()):
+            return
+        for r in list(self.runners.values()):
+            if r.overnight_paused and r.settings.auto_restart \
+                    and (broker_account_id is None or r.dep.get("broker_account_id") == broker_account_id):
+                try:
+                    await r.resume()
+                    logger.info(f"[ENGINE] auto-restarted deployment {r.id}")
+                except Exception as e:
+                    logger.error(f"[ENGINE] auto-restart of deployment {r.id} failed: {e}")
 
 
     async def activate(self, deployment_id: int, restore: bool = False) -> dict:
@@ -158,7 +176,7 @@ class LiveEngine:
             return runner.snapshot()
 
 
-    async def command(self, deployment_id: int, cmd: str) -> dict:
+    async def command(self, deployment_id: int, cmd: str, body: dict | None = None) -> dict:
         if cmd == "activate":
             return await self.activate(deployment_id)
         runner = self.runners.get(deployment_id)
@@ -173,11 +191,16 @@ class LiveEngine:
         if cmd == "pause":
             await runner.pause()
         elif cmd == "resume":
-            await runner.resume()
+            raw = (body or {}).get("exit_date")
+            await runner.resume(date.fromisoformat(str(raw)) if raw else None)
         elif cmd == "squareoff":
             await runner.squareoff("manual")
         elif cmd == "manual":
             await runner.switch_to_manual("manual")
+        elif cmd == "cancel":
+            if runner.status not in ("scheduled", "paused"):
+                raise ValueError("Cancel Deployment is only available while scheduled or paused -- use Square Off or Switch to Manual")
+            await runner.cancel_deployment()
         else:
             raise ValueError("Unknown command")
         return runner.snapshot()
@@ -225,6 +248,8 @@ class LiveEngine:
                         except Exception as e:
                             logger.error(f"[ENGINE] scan: deployment {dep['deployment_id']} failed to start: {e}")
                 await self._auto_activate()
+                if secs_now() >= AUTO_RESTART_SCAN_SECS:
+                    await self.auto_restart()
                 # forget finished runners after 16:00 so memory does not grow across days
                 if secs_now() > 16 * 3600:
                     for did, r in list(self.runners.items()):

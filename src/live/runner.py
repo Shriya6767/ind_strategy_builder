@@ -42,12 +42,14 @@ from src.live.feed import Key, Candle
 from src.live.brokers import Broker, OrderUpdate
 from src.live.timeutil import (
     now_ist, today_ist, parse_hms, hms, at, secs_now, MARKET_CLOSE_SECS, MARKET_OPEN_SECS, to_naive_ist,
-    weekdays_before_expiry, is_trading_day, IST,
+    weekdays_before_expiry, is_trading_day, next_trading_day, IST,
 )
 
 logger = get_logger(__name__)
 
 LAST_EXIT_SECS = MARKET_CLOSE_SECS - 30           # never plan an exit after 15:29:30
+OVERNIGHT_PAUSE_SECS = 15 * 3600 + 45 * 60        # BTST / positional holds pause at 15:45
+OVERNIGHT_REASON = "market closed -- restart before 09:15"
 TERMINAL_STATUSES = ("squared_off", "completed", "error", "cancelled", "manual")
 PREMIUM_TYPES = ("POINTS", "PERCENT")
 UNDERLYING_TYPES = ("UNDERLYING_POINTS", "UNDERLYING_PERCENT")
@@ -207,6 +209,8 @@ class DeploymentRunner:
         self.status: str = dep["status"]
         self.status_reason: str | None = dep.get("status_reason")
         self.paused = self.status == "paused"
+        self.overnight_paused = self.paused and (self.status_reason or "").startswith(OVERNIGHT_REASON)
+        self.last_unpaused: datetime | None = None
         self.legs: list[LegState] = []
         self._by_key: dict[Key, list[LegState]] = {}      # open legs by contract key
         self._waiting: list[LegState] = []                # legs with a pending conditional entry
@@ -239,19 +243,65 @@ class DeploymentRunner:
         self._set_status("paused", "paused by user")
         self._event("Paused: no new entries or exits until resumed")
 
-    async def resume(self):
+    async def resume(self, exit_date: date | None = None):
         if self.status != "paused":
             return
-        self.paused = False
-        self._set_status("running", None)
-        self._event("Resumed")
+        if self.overnight_paused and not (8 * 3600 <= secs_now() < MARKET_CLOSE_SECS):
+            raise ValueError("Restart is available between 08:00 and 15:30 -- the strategy stays paused overnight")
+        if exit_date is not None and exit_date != self.exit_date:
+            if exit_date < today_ist() or (self.cycle_expiry and exit_date > self.cycle_expiry):
+                raise ValueError(f"exit_date must be between today and the contract expiry ({self.cycle_expiry})")
+            self.exit_date, self.exit_dt = exit_date, at(exit_date, self.exit_secs)
+            self.db.submit(store.update_deployment_dates, self.id, self.trade_date, exit_date)
+            self._event(f"Exit date changed to {exit_date}")
+        overnight, self.paused, self.overnight_paused = self.overnight_paused, False, False
+        self.last_unpaused = now_ist()
+        if overnight and secs_now() < MARKET_OPEN_SECS:
+            self._set_status("scheduled", "restarted -- monitoring starts at 09:15")   # AlgoTest: Scheduled until the open
+        else:
+            self._set_status("running", "restarted" if overnight else None)
+        self._event("Restarted" if overnight else "Resumed")
+        if overnight:
+            self._spawn(self._rearm_broker_stops())
+
+    async def _rearm_broker_stops(self):
+        """After an overnight restart the day-1 SL-L orders are gone (DAY validity):
+        put them back once the market is open and flip Scheduled -> Running."""
+        await asyncio.sleep(max(0.0, MARKET_OPEN_SECS + 5 - secs_now()))
+        if not self.active or self.paused:
+            return
+        if self.status == "scheduled":
+            self._set_status("running", None)
+        for leg in self.legs:
+            if self.active and not self.paused and self._broker_sl_ok(leg):
+                await self._place_sl_order(leg)
+
+    async def _pause_overnight(self):
+        """15:45 on a carry day: monitoring stops, resting stops are
+        cancelled, the position stays at the broker until the user restarts."""
+        for leg in self.legs:
+            if leg.status == "open" and leg.sl_order_id:
+                try:
+                    await self.broker.cancel(leg.sl_order_id, "")
+                except XTSError:
+                    pass
+                leg.sl_order_id = leg.sl_payload = None
+                self._persist_leg(leg)
+        self.paused = self.overnight_paused = True
+        self._set_status("paused", f"{OVERNIGHT_REASON} on {next_trading_day(today_ist())}")
+        self._event("Strategy has been paused -- market closed; restart it before the open to continue monitoring", "warn")
+
+    async def cancel_deployment(self):
+        """AlgoTest 'Cancel Deployment' on a scheduled / paused strategy: no further
+        orders; an open position stays at the broker for the user."""
+        await self.switch_to_manual("cancelled", status="cancelled")
 
     async def squareoff(self, reason: str = "manual"):
         await self._squareoff_all(reason)
         if self.status not in TERMINAL_STATUSES:
             self._finish("squared_off", reason)
 
-    async def switch_to_manual(self, reason: str = "manual"):
+    async def switch_to_manual(self, reason: str = "manual", status: str = "manual"):
         """AlgoTest 'Switch to Manual': disconnect the strategy. Open positions stay at the
         broker for the user to manage; our resting / pending orders are cancelled and no
         further orders are generated."""
@@ -293,7 +343,7 @@ class DeploymentRunner:
                 except XTSError:
                     pass
         self._waiting.clear()
-        self._finish("manual", reason)
+        self._finish(status, reason)
 
     async def stop(self):
         if self._task and not self._task.done():
@@ -336,6 +386,7 @@ class DeploymentRunner:
             "entry_time": hms(self.entry_secs), "exit_time": hms(self.exit_secs),
             "realised_pnl": round(self.realised, 2), "unrealised_pnl": round(unreal, 2),
             "mtm": round(self.realised + unreal, 2), "legs": legs, "updated": self.updated,
+            "last_unpaused": self.last_unpaused.strftime("%Y-%m-%d %H:%M:%S") if self.last_unpaused else None,
             # overall risk as currently armed (overall_sl is the TRAILED stop, as a positive MTM distance)
             "overall_sl": (self._overall or {}).get("sl_now", (self._overall or {}).get("sl")),
             "overall_target": (self._overall or {}).get("tgt"),
@@ -1455,15 +1506,20 @@ class DeploymentRunner:
                 return
         await self._enter_conditional(new)
 
-    # ------------------------------------------------------------------ exit time
     async def _monitor_until_exit(self):
         while self.active:
             now = now_ist()
             if now >= self.exit_dt:
+                if self.overnight_paused:
+                    self._event(f"Exit time {hms(self.exit_secs)} on {self.exit_date} reached while paused -- strategy was not restarted", "error")
+                    await self.switch_to_manual("not restarted before exit time -- position still open at the broker", status="error")
+                    break
                 self._event(f"Exit time {hms(self.exit_secs)} on {self.exit_date} reached -- squaring off")
                 await self._squareoff_all("exit_time")
                 self._finish("squared_off", "exit_time")
                 break
+            if self.is_multiday and not self.paused and now.date() < self.exit_date and secs_now() >= OVERNIGHT_PAUSE_SECS:
+                await self._pause_overnight()
             if self.mode == "live" and time.time() - self._last_reconcile >= self.RECONCILE_EVERY_SECS \
                     and MARKET_OPEN_SECS <= secs_now() <= MARKET_CLOSE_SECS:
                 self._last_reconcile = time.time()
@@ -1477,7 +1533,6 @@ class DeploymentRunner:
                 break
             await asyncio.sleep(min(1.0, max(0.05, (self.exit_dt - now).total_seconds())))
 
-    # ------------------------------------------------------------------ restore after restart
     async def _restore(self):
         rows = await asyncio.to_thread(store.list_legs, self.id)
         pending = await asyncio.to_thread(store.list_waits, self.id)
@@ -1578,7 +1633,7 @@ class DeploymentRunner:
                         self._event(f"Leg {leg.leg_number}: SL-L order {leg.sl_order_id} is still resting at the {self.venue} -- watching it")
                     else:
                         leg.sl_order_id = None       # gone (cancelled / not in today's book)
-                if self._broker_sl_ok(leg):
+                if not self.paused and secs_now() >= MARKET_OPEN_SECS and self._broker_sl_ok(leg):
                     self._spawn(self._place_sl_order(leg))   # no resting stop: put one back
         if self.engine.index_key:
             await self._spot()
@@ -1586,6 +1641,9 @@ class DeploymentRunner:
         await self._restore_waits()
         if self.status == "paused":
             self.paused = True
+        elif self.is_multiday and secs_now() < MARKET_OPEN_SECS:
+            self._set_status("scheduled", "restored after restart -- monitoring starts at 09:15")
+            self._spawn(self._rearm_broker_stops())
         else:
             self._set_status("running", "restored after restart")
         self._arm()
@@ -1641,7 +1699,6 @@ class DeploymentRunner:
                       else f"range {leg.range_lo}..{leg.range_hi}, window until {leg.range_end_dt:%Y-%m-%d %H:%M}")
             self._event(f"Leg {leg.leg_number}: restored pending {leg.wait} entry on {contract.symbol} ({detail})")
 
-    # ------------------------------------------------------------------ helpers
     async def _reconcile_with_broker(self, where: str):
         """The broker's position book is the truth. For every leg we believe
         is open, check the broker still holds a position in that contract on
