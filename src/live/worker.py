@@ -21,6 +21,7 @@ from src.core import config
 from src.core.security import decode_access_token
 from src.core.logger import get_logger
 from src.live.engine import LiveEngine
+from src.live.runner import positional_cycle
 
 logger = get_logger(__name__)
 
@@ -49,6 +50,20 @@ async def health():
     return engine.health()
 
 
+@app.post("/internal/positional-cycle")
+async def positional_cycle_dates(request: Request):
+    """Activation dialog defaults for a positional strategy (needs the contract master's expiry list)."""
+    _internal(request)
+    body = await request.json()
+    if engine.master is None:
+        raise HTTPException(status_code=503, detail="contract master not loaded yet")
+    plan = positional_cycle(engine.master, body["strategy"], int(body["exit_secs"]))
+    if plan is None:
+        raise HTTPException(status_code=400, detail="no positional expiry cycle ahead in the contract master")
+    expiry, entry_date, exit_date = plan
+    return {"status": True, "data": {"expiry": str(expiry), "entry_date": str(entry_date), "exit_date": str(exit_date)}}
+
+
 @app.post("/internal/deployments/{deployment_id}/{cmd}")
 async def deployment_command(deployment_id: int, cmd: str, request: Request):
     _internal(request)
@@ -68,6 +83,19 @@ async def deployment_command(deployment_id: int, cmd: str, request: Request):
 async def squareoff_all(user_id: int, request: Request):
     _internal(request)
     return {"status": True, "data": await engine.squareoff_all(user_id)}
+
+
+@app.post("/internal/users/{user_id}/restart-all")
+async def restart_all(user_id: int, request: Request):
+    _internal(request)
+    body = await request.json()
+    return {"status": True, "data": await engine.restart_all(user_id, body.get("restarts") or [])}
+
+
+@app.post("/internal/users/{user_id}/cancel-all")
+async def cancel_all(user_id: int, request: Request):
+    _internal(request)
+    return {"status": True, "data": await engine.cancel_all(user_id)}
 
 
 @app.post("/internal/users/{user_id}/manual-all")

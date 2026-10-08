@@ -11,7 +11,15 @@ from src.services.get_strategy import GetStrategyService
 from src.live import deployment_store as store
 from src.live.broker_store import BrokerAccountService
 from src.live.execution import ExecutionSettings, STRATEGY_KEYS
-from src.live.timeutil import today_ist, next_trading_day, is_trading_day, weekday_code, now_ist, parse_hms, secs_now
+from src.live.timeutil import today_ist, next_trading_day, is_trading_day, weekday_code, now_ist, parse_hms, hms, secs_now
+
+ENTRY_TIME_RANGE = (parse_hms("09:15:15"), parse_hms("15:29:00"))
+EXIT_TIME_RANGE = (parse_hms("09:15:05"), parse_hms("15:29:30"))
+
+
+def _secs(strategy: dict, key: str) -> int:
+    return parse_hms(strategy.get(f"{key}_time") or ("09:30:00" if key == "entry" else "15:15:00")) \
+        + int(strategy.get(f"{key}_delay") or 0) * 60
 
 logger = get_logger(__name__)
 
@@ -169,6 +177,32 @@ class LiveTradeService:
 
 
     @staticmethod
+    def activation_timings(user_id: int, strategy_id: int, version: int = 0) -> dict:
+        """Defaults for the 'Edit Entry/Exit Timings' box of the activation dialog."""
+        head = LiveTradeService._strategy_head(strategy_id, user_id, version)
+        loaded = GetStrategyService.get_strategy(strategy_id, head["strategy_name"], head["version"], user_id)
+        if not loaded.get("success"):
+            raise LiveValidationError(loaded.get("error") or "Strategy could not be loaded")
+        strategy = loaded["data"]["strategy"]
+        stype = str(strategy.get("strategy_type", "intraday")).lower()
+        today = today_ist()
+        out = {"strategy_id": strategy_id, "version": head["version"], "strategy_type": stype,
+               "entry_date": str(today), "entry_time": hms(_secs(strategy, "entry")),
+               "exit_date": str(today), "exit_time": hms(_secs(strategy, "exit")), "expiry": None,
+               "editable": {"entry_date": False, "entry_time": False, "exit_date": False, "exit_time": False}}
+        if stype == "btst":
+            out["exit_date"] = str(next_trading_day(today))
+            out["editable"].update(entry_time=True, exit_date=True, exit_time=True)
+        elif stype.startswith("positional"):
+            fwd = LiveTradeService.forward("/internal/positional-cycle",
+                                           body={"strategy": strategy, "exit_secs": _secs(strategy, "exit")})
+            if not fwd.get("forwarded"):
+                raise RuntimeError(fwd.get("error") or "worker unreachable")
+            out.update(fwd["data"])
+            out["editable"] = dict.fromkeys(out["editable"], True)
+        return out
+
+    @staticmethod
     def create_deployment(user_id: int, body: dict) -> dict:
         """Validates and inserts a 'scheduled' deployment for today. Does NOT
         start it -- call `forward(id, 'activate')` (API) or engine.activate (worker)."""
@@ -181,20 +215,13 @@ class LiveTradeService:
         version = head["version"]
         raw_settings = {k: v for k, v in ((saved or {}).get("settings") or {}).items() if k in STRATEGY_KEYS}
         raw_settings.update(body.get("settings") or {})
-        if body.get("mode"):
-            raw_settings["mode"] = body["mode"]
         settings = ExecutionSettings.from_dict(raw_settings)
         broker_account_id = body.get("broker_account_id") or (saved or {}).get("broker_account_id")
         broker_account_id = int(broker_account_id) if broker_account_id else None
 
         today = today_ist()
-        if not is_trading_day(today):
-            raise LiveValidationError(f"{today} is not a trading day")
-        # DTE mode is judged by the worker (it needs the expiry calendar); weekdays here
-        if settings.execution_days_mode == "weekdays" and weekday_code(today) not in settings.execution_days:
-            raise LiveValidationError(f"Today ({weekday_code(today)}) is not in the strategy's execution days {list(settings.execution_days)}")
-        if store.has_active_deployment(user_id, strategy_id, today):
-            raise LiveValidationError("This strategy is already deployed today")
+        if store.has_active_deployment(user_id, strategy_id):
+            raise LiveValidationError("This strategy is already deployed")
 
         if settings.mode == "live":
             if not broker_account_id:
@@ -208,19 +235,41 @@ class LiveTradeService:
         loaded = GetStrategyService.get_strategy(strategy_id, head["strategy_name"], version, user_id)
         if not loaded.get("success"):
             raise LiveValidationError(loaded.get("error") or "Strategy could not be loaded")
-        strategy, legs = loaded["data"]["strategy"], loaded["data"]["legs"]
-        LiveTradeService.validate_strategy(strategy, legs, settings)
-        exit_secs = parse_hms(strategy.get("exit_time", "15:15:00")) + int(strategy.get("exit_delay") or 0) * 60
+        strategy, legs = dict(loaded["data"]["strategy"]), loaded["data"]["legs"]
         stype = str(strategy.get("strategy_type", "intraday")).lower()
-        # positional: the worker computes the expiry cycle (needs the contract
-        # master) and rewrites trade_date/exit_date once it starts.
-        exit_date = next_trading_day(today) if stype == "btst" else today
-        if stype in ("intraday", "sequential") and secs_now() >= exit_secs:
+        multiday = stype == "btst" or stype.startswith("positional")
+        # Activation dialog: intraday fixed; BTST entry time / exit date / exit time; positional all four.
+        for key, rng in (("entry_time", ENTRY_TIME_RANGE), ("exit_time", EXIT_TIME_RANGE)):
+            if body.get(key) and multiday:
+                s = parse_hms(body[key])
+                if not (rng[0] <= s <= rng[1]):
+                    raise LiveValidationError(f"{key} must be between {hms(rng[0])} and {hms(rng[1])}")
+                strategy[key], strategy[key.replace("_time", "_delay")] = hms(s), 0
+        LiveTradeService.validate_strategy(strategy, legs, settings)
+        entry_secs, exit_secs = _secs(strategy, "entry"), _secs(strategy, "exit")
+        entry_date, exit_date = today, (next_trading_day(today) if stype == "btst" else today)
+        if body.get("entry_date") and stype.startswith("positional"):
+            entry_date = date.fromisoformat(str(body["entry_date"]))
+            strategy["entry_date_override"] = str(entry_date)
+        if body.get("exit_date") and multiday:
+            exit_date = date.fromisoformat(str(body["exit_date"]))
+            if stype.startswith("positional"):
+                strategy["exit_date_override"] = str(exit_date)
+        if entry_date < today or not is_trading_day(entry_date):
+            raise LiveValidationError("entry_date must be a trading day today or later")
+        if exit_date < entry_date or not is_trading_day(exit_date):
+            raise LiveValidationError("exit_date must be a trading day on or after the entry date")
+        if exit_date == entry_date and exit_secs <= entry_secs:
+            raise LiveValidationError("Exit time must be after the entry time")
+        if exit_date == today and secs_now() >= exit_secs:
             raise LiveValidationError(f"Exit time {strategy.get('exit_time')} has already passed today")
+        # DTE mode is judged by the worker (it needs the expiry calendar); weekdays here
+        if settings.execution_days_mode == "weekdays" and weekday_code(entry_date) not in settings.execution_days:
+            raise LiveValidationError(f"{weekday_code(entry_date)} is not in the strategy's execution days {list(settings.execution_days)}")
 
         dep_id = store.create_deployment(
             user_id=user_id, strategy_id=strategy_id, strategy_name=head["strategy_name"], version=version,
-            broker_account_id=broker_account_id, mode=settings.mode, trade_date=today, exit_date=exit_date,
+            broker_account_id=broker_account_id, mode=settings.mode, trade_date=entry_date, exit_date=exit_date,
             settings=settings.to_dict(), snapshot={"strategy": strategy, "legs": legs})
         store.log_event(dep_id, f"Activated by user ({settings.mode} mode, version {version})")
         logger.info(f"[LIVE] deployment {dep_id} created strategy={strategy_id} v{version} user={user_id} mode={settings.mode}")
@@ -281,6 +330,23 @@ class LiveTradeService:
     @staticmethod
     def manual_all(user_id: int) -> dict:
         return LiveTradeService.forward(f"/internal/users/{user_id}/manual-all")
+
+    @staticmethod
+    def cancel_all(user_id: int) -> list[dict]:
+        fwd = LiveTradeService.forward(f"/internal/users/{user_id}/cancel-all")
+        if not fwd.get("forwarded"):
+            raise RuntimeError(fwd.get("error") or "worker unreachable")
+        return fwd.get("data")
+
+    @staticmethod
+    def restart_all(user_id: int, body: dict) -> list[dict]:
+        items = (body or {}).get("restarts") or []
+        if not isinstance(items, list) or not items:
+            raise LiveValidationError("restarts must be a non-empty list of {deployment_id, restart_at}")
+        fwd = LiveTradeService.forward(f"/internal/users/{user_id}/restart-all", body={"restarts": items})
+        if not fwd.get("forwarded"):
+            raise RuntimeError(fwd.get("error") or "worker unreachable")
+        return fwd.get("data")
 
     @staticmethod
     def live_snapshots(user_id: int) -> dict:

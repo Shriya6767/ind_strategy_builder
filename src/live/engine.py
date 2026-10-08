@@ -31,6 +31,11 @@ AUTO_RESTART_FROM_SECS = 8 * 3600
 AUTO_RESTART_SCAN_SECS = 8 * 3600 + 45 * 60
 
 
+def _restart_at(body: dict | None) -> int | None:
+    raw = (body or {}).get("restart_at")
+    return parse_hms(raw) if raw else None
+
+
 class LiveEngine:
     def __init__(self):
         self.db = DbWriter()
@@ -200,8 +205,7 @@ class LiveEngine:
         if cmd == "pause":
             await runner.pause()
         elif cmd == "resume":
-            raw = (body or {}).get("exit_date")
-            await runner.resume(date.fromisoformat(str(raw)) if raw else None)
+            await runner.resume(_restart_at(body))
         elif cmd == "squareoff":
             await runner.squareoff("manual")
         elif cmd == "manual":
@@ -221,6 +225,36 @@ class LiveEngine:
             if r.user_id == user_id and r.active:
                 await r.squareoff("manual_all")
                 out.append(r.snapshot())
+        return out
+
+    async def restart_all(self, user_id: int, items: list[dict]) -> list[dict]:
+        out = []
+        for item in items:
+            did = int(item.get("deployment_id") or 0)
+            row = {"deployment_id": did, "status": None, "status_reason": None, "error": None}
+            try:
+                r = self.runners.get(did)
+                if r is None or r.user_id != user_id:
+                    raise LookupError("Deployment not found")
+                await r.resume(_restart_at(item))
+                row["status"], row["status_reason"] = r.status, r.status_reason
+            except (LookupError, ValueError) as e:
+                row["error"] = str(e)
+            out.append(row)
+        return out
+
+    async def cancel_all(self, user_id: int) -> list[dict]:
+        """Cancel Deployment for every scheduled / paused deployment of the user."""
+        out = []
+        for r in list(self.runners.values()):
+            if r.user_id == user_id and r.status in ("scheduled", "paused"):
+                row = {"deployment_id": r.id, "status": None, "error": None}
+                try:
+                    await r.cancel_deployment()
+                    row["status"] = r.status
+                except Exception as e:
+                    row["error"] = str(e)
+                out.append(row)
         return out
 
     async def manual_all(self, user_id: int) -> list[dict]:

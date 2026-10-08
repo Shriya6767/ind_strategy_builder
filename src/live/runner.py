@@ -50,6 +50,8 @@ logger = get_logger(__name__)
 LAST_EXIT_SECS = MARKET_CLOSE_SECS - 30           # never plan an exit after 15:29:30
 OVERNIGHT_PAUSE_SECS = 15 * 3600 + 45 * 60        # BTST / positional holds pause at 15:45
 OVERNIGHT_REASON = "market closed -- restart before 09:15"
+RESTART_REASON = "restart scheduled at "
+RESTART_EARLIEST_SECS = MARKET_OPEN_SECS + 5 
 TERMINAL_STATUSES = ("squared_off", "completed", "error", "cancelled", "manual")
 PREMIUM_TYPES = ("POINTS", "PERCENT")
 UNDERLYING_TYPES = ("UNDERLYING_POINTS", "UNDERLYING_PERCENT")
@@ -208,8 +210,10 @@ class DeploymentRunner:
 
         self.status: str = dep["status"]
         self.status_reason: str | None = dep.get("status_reason")
-        self.paused = self.status == "paused"
-        self.overnight_paused = self.paused and (self.status_reason or "").startswith(OVERNIGHT_REASON)
+        reason = self.status_reason or ""
+        self.overnight_paused = (self.status == "paused" and reason.startswith(OVERNIGHT_REASON)) \
+            or (self.status == "scheduled" and reason.startswith(RESTART_REASON))
+        self.paused = self.status == "paused" or self.overnight_paused
         self.last_unpaused: datetime | None = None
         self.legs: list[LegState] = []
         self._by_key: dict[Key, list[LegState]] = {}      # open legs by contract key
@@ -243,38 +247,54 @@ class DeploymentRunner:
         self._set_status("paused", "paused by user")
         self._event("Paused: no new entries or exits until resumed")
 
-    async def resume(self, exit_date: date | None = None):
-        if self.status != "paused":
+    async def resume(self, restart_at: int | None = None):
+        if self.status not in ("paused", "scheduled") or not self.paused:
             return
-        if self.overnight_paused and not (8 * 3600 <= secs_now() < MARKET_CLOSE_SECS):
-            raise ValueError("Restart is available between 08:00 and 15:30 -- the strategy stays paused overnight")
-        if exit_date is not None and exit_date != self.exit_date:
-            if exit_date < today_ist() or (self.cycle_expiry and exit_date > self.cycle_expiry):
-                raise ValueError(f"exit_date must be between today and the contract expiry ({self.cycle_expiry})")
-            self.exit_date, self.exit_dt = exit_date, at(exit_date, self.exit_secs)
-            self.db.submit(store.update_deployment_dates, self.id, self.trade_date, exit_date)
-            self._event(f"Exit date changed to {exit_date}")
-        overnight, self.paused, self.overnight_paused = self.overnight_paused, False, False
-        self.last_unpaused = now_ist()
-        if overnight and secs_now() < MARKET_OPEN_SECS:
-            self._set_status("scheduled", "restarted -- monitoring starts at 09:15")   # AlgoTest: Scheduled until the open
-        else:
-            self._set_status("running", "restarted" if overnight else None)
-        self._event("Restarted" if overnight else "Resumed")
-        if overnight:
-            self._spawn(self._rearm_broker_stops())
-
-    async def _rearm_broker_stops(self):
-        """After an overnight restart the day-1 SL-L orders are gone (DAY validity):
-        put them back once the market is open and flip Scheduled -> Running."""
-        await asyncio.sleep(max(0.0, MARKET_OPEN_SECS + 5 - secs_now()))
-        if not self.active or self.paused:
-            return
-        if self.status == "scheduled":
+        if not self.overnight_paused:
+            self.paused = False
             self._set_status("running", None)
+            self._event("Resumed")
+            return
+        when = self._restart_when(restart_at)
+        if when is None:
+            self._go_live()
+        else:
+            self._spawn(self._scheduled_restart(when))
+
+    def _restart_when(self, restart_at: int | None) -> datetime | None:
+        """'Restart Strategy' dialog: a restart time of day. Already past ->
+        restart now (after the close: the same time next trading day); before the
+        open the restart waits for 09:15:05 so stops are placed on live quotes."""
+        if restart_at is not None and not (RESTART_EARLIEST_SECS <= restart_at <= LAST_EXIT_SECS):
+            raise ValueError(f"restart_at must be between {hms(RESTART_EARLIEST_SECS)} and {hms(LAST_EXIT_SECS)}")
+        secs = restart_at if restart_at is not None else RESTART_EARLIEST_SECS
+        now = now_ist()
+        when = at(now.date(), secs)
+        if when <= now:
+            if secs_now() < MARKET_CLOSE_SECS:
+                return None
+            when = at(next_trading_day(now.date()), secs)
+        if when >= self.exit_dt:
+            raise ValueError(f"restart at {when:%Y-%m-%d %H:%M:%S} is after the exit time ({self.exit_date} {hms(self.exit_secs)})")
+        return when
+
+    async def _scheduled_restart(self, when: datetime):
+        self._set_status("scheduled", f"{RESTART_REASON}{when:%Y-%m-%d %H:%M:%S}")
+        self._event(f"Restart scheduled at {when:%Y-%m-%d %H:%M:%S}")
+        await asyncio.sleep(max(0.0, (when - now_ist()).total_seconds()))
+        if self.active and self.status == "scheduled" and self.overnight_paused:
+            self._go_live()
+
+    def _go_live(self):
+        """The restart moment: monitoring on, status running, the day-1 SL-L
+        orders (DAY validity, gone overnight) put back at the broker."""
+        self.paused = self.overnight_paused = False
+        self.last_unpaused = now_ist()
+        self._set_status("running", "restarted")
+        self._event("Restarted")
         for leg in self.legs:
-            if self.active and not self.paused and self._broker_sl_ok(leg):
-                await self._place_sl_order(leg)
+            if self._broker_sl_ok(leg):
+                self._spawn(self._place_sl_order(leg))
 
     async def _pause_overnight(self):
         """15:45 on a carry day: monitoring stops, resting stops are
@@ -427,38 +447,25 @@ class DeploymentRunner:
             self._done.set()
 
     def _plan_dates(self) -> bool:
-        """Positional: pick the expiry cycle (the first whose exit day is not
-        past) and derive entry/exit days the engine's way; rewrite the
-        deployment row so restarts and the UI see the real dates."""
+        """Positional: pick the expiry cycle and the entry/exit days (the
+        strategy's rule, or the dates chosen in the activation dialog); rewrite
+        the deployment row so restarts and the UI see the real dates."""
         if not self.is_positional:
             return True
-        expire_on = str(self.strategy.get("positional_expire_on") or "weekly").lower()
-        entry_day = int(self.strategy.get("positional_entry_day") or 0)
-        exit_day = int(self.strategy.get("positional_exit_day") or 0)
-        if expire_on == "monthly":
-            monthly = {}
-            for e in self.master.expiries:
-                monthly[(e.year, e.month)] = e
-            candidates = [e for _, e in sorted(monthly.items())]
-        else:
-            candidates = list(self.master.expiries)
-        today = today_ist()
-        for expiry in candidates:
-            entry_date = weekdays_before_expiry(expiry, entry_day)
-            exit_date = weekdays_before_expiry(expiry, exit_day)
-            if exit_date < today or entry_date > exit_date:
-                continue
-            if exit_date == today and secs_now() >= self.exit_secs:
-                continue
-            self.cycle_expiry = expiry
-            self.trade_date, self.exit_date = entry_date, exit_date
-            self.entry_dt, self.exit_dt = at(entry_date, self.entry_secs), at(exit_date, self.exit_secs)
-            self.db.submit(store.update_deployment_dates, self.id, entry_date, exit_date)
-            self._event(f"Positional cycle: expiry {expiry}, entry {entry_date} {hms(self.entry_secs)}, "
-                        f"exit {exit_date} {hms(self.exit_secs)} (T-{entry_day} / T-{exit_day})")
-            return True
-        self._finish("error", "no positional expiry cycle ahead in the contract master")
-        return False
+        chosen = (self.strategy.get("entry_date_override"), self.strategy.get("exit_date_override"))
+        plan = positional_cycle(self.master, self.strategy, self.exit_secs,
+                                _as_date(chosen[0]) if chosen[0] else None, _as_date(chosen[1]) if chosen[1] else None)
+        if plan is None:
+            self._finish("error", "no positional expiry cycle ahead in the contract master")
+            return False
+        expiry, entry_date, exit_date = plan
+        self.cycle_expiry = expiry
+        self.trade_date, self.exit_date = entry_date, exit_date
+        self.entry_dt, self.exit_dt = at(entry_date, self.entry_secs), at(exit_date, self.exit_secs)
+        self.db.submit(store.update_deployment_dates, self.id, entry_date, exit_date)
+        self._event(f"Positional cycle: expiry {expiry}, entry {entry_date} {hms(self.entry_secs)}, "
+                    f"exit {exit_date} {hms(self.exit_secs)}")
+        return True
 
     def _dte_allowed(self) -> bool:
         """Execution Days in DTE mode: run only when today's trading days to
@@ -1641,9 +1648,12 @@ class DeploymentRunner:
         await self._restore_waits()
         if self.status == "paused":
             self.paused = True
+        elif self.status == "scheduled" and self.overnight_paused:      # a restart scheduled before the worker died
+            when = datetime.strptime(self.status_reason[len(RESTART_REASON):], "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
+            self._spawn(self._scheduled_restart(when))
         elif self.is_multiday and secs_now() < MARKET_OPEN_SECS:
-            self._set_status("scheduled", "restored after restart -- monitoring starts at 09:15")
-            self._spawn(self._rearm_broker_stops())
+            self.paused = self.overnight_paused = True
+            self._spawn(self._scheduled_restart(at(today_ist(), RESTART_EARLIEST_SECS)))
         else:
             self._set_status("running", "restored after restart")
         self._arm()
@@ -1863,6 +1873,36 @@ def _num(v) -> float:
 
 def _flip(side: str) -> str:
     return "SELL" if side == "BUY" else "BUY"
+
+
+def positional_cycle(master, strategy: dict, exit_secs: int, entry_date: date | None = None,
+                     exit_date: date | None = None) -> tuple[date, date, date] | None:
+    """(expiry, entry_date, exit_date) of the first expiry cycle still ahead:
+    entry/exit = `positional_entry_day` / `positional_exit_day` calendar weekdays
+    before expiry (holidays held through), or the dates chosen at activation
+    (exit capped at that expiry). An entry day already past means enter today."""
+    expire_on = str(strategy.get("positional_expire_on") or "weekly").lower()
+    entry_day = int(strategy.get("positional_entry_day") or 0)
+    exit_day = int(strategy.get("positional_exit_day") or 0)
+    if expire_on == "monthly":
+        monthly = {}
+        for e in master.expiries:
+            monthly[(e.year, e.month)] = e
+        candidates = [e for _, e in sorted(monthly.items())]
+    else:
+        candidates = list(master.expiries)
+    today = today_ist()
+    for expiry in candidates:
+        xd = exit_date or weekdays_before_expiry(expiry, exit_day)
+        if xd > expiry:
+            continue
+        ed = entry_date or max(weekdays_before_expiry(expiry, entry_day), today)
+        if xd < today or ed > xd:
+            continue
+        if xd == today and secs_now() >= exit_secs:
+            continue
+        return expiry, ed, xd
+    return None
 
 
 def _day(ts: datetime | None) -> str | None:

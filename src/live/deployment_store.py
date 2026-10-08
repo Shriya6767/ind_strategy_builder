@@ -123,10 +123,10 @@ def list_deployments(user_id: int, trade_date: date | None = None, include_archi
     return _run(q)
 
 
-def has_active_deployment(user_id: int, strategy_id: int, trade_date: date) -> bool:
+def has_active_deployment(user_id: int, strategy_id: int, trade_date: date | None = None) -> bool:
     def q(cur):
-        cur.execute("""SELECT 1 FROM live_deployment WHERE user_id = %s AND strategy_id = %s AND trade_date = %s
-                       AND status IN %s LIMIT 1""", (user_id, strategy_id, trade_date, ACTIVE_STATUSES))
+        cur.execute("""SELECT 1 FROM live_deployment WHERE user_id = %s AND strategy_id = %s
+                       AND status IN %s LIMIT 1""", (user_id, strategy_id, ACTIVE_STATUSES))
         return cur.fetchone() is not None
     return _run(q)
 

@@ -473,7 +473,8 @@ def live_overview(user=Depends(get_current_user)):
 
 @router.post("/live/deployments")
 def live_activate(request: dict, user=Depends(get_current_user)):
-    """Activate: {strategy_id, version?, broker_account_id?, mode?, settings?} -> deployment (starts in the worker)."""
+    """Activate: {strategy_id, version?, broker_account_id?, settings?, entry_date?, entry_time?, exit_date?, exit_time?}
+    -> deployment (starts in the worker). Timings: intraday fixed; BTST entry time / exit date / exit time; positional all."""
     try:
         return {"status": True, "message": "Strategy activated.", "data": LiveTradeService.activate(user["user_id"], request)}
     except Exception as e:
@@ -505,7 +506,7 @@ def live_unarchive_deployment(deployment_id: int, user=Depends(get_current_user)
 
 @router.post("/live/deployments/{deployment_id}/{cmd}")
 def live_deployment_command(deployment_id: int, cmd: str, request: dict | None = None, user=Depends(get_current_user)):
-    """cmd = pause | resume (restart; optional body {exit_date}) | squareoff | manual (switch to manual)
+    """cmd = pause | resume (restart; body {restart_at: "HH:MM:SS"}) | squareoff | manual (switch to manual)
     | cancel (cancel deployment, scheduled/paused only) | activate (re-send to the worker)"""
     try:
         return {"status": True, "data": LiveTradeService.command(user["user_id"], deployment_id, cmd, request)}
@@ -524,6 +525,33 @@ def live_archive_deployment(deployment_id: int, user=Depends(get_current_user)):
 def live_squareoff_all(user=Depends(get_current_user)):
     """Kill switch: exits every open leg of every running deployment of the caller."""
     return {"status": True, "data": LiveTradeService.squareoff_all(user["user_id"])}
+
+
+@router.post("/live/restart-all")
+def live_restart_all(request: dict, user=Depends(get_current_user)):
+    """Restart All dialog: {restarts: [{deployment_id, restart_at: "HH:MM:SS"}, ...]} -> per-deployment result."""
+    try:
+        return {"status": True, "data": LiveTradeService.restart_all(user["user_id"], request)}
+    except Exception as e:
+        _live_error(e)
+
+
+@router.get("/live/activation-timings")
+def live_activation_timings(strategy_id: int, version: int = 0, user=Depends(get_current_user)):
+    """Defaults + editability of the activation dialog's Entry/Exit timings box."""
+    try:
+        return ORJSONResponse({"status": True, "data": LiveTradeService.activation_timings(user["user_id"], strategy_id, version)})
+    except Exception as e:
+        _live_error(e)
+
+
+@router.post("/live/cancel-all")
+def live_cancel_all(user=Depends(get_current_user)):
+    """Cancel Deployment for every scheduled / paused deployment of the caller (running ones are untouched)."""
+    try:
+        return {"status": True, "data": LiveTradeService.cancel_all(user["user_id"])}
+    except Exception as e:
+        _live_error(e)
 
 
 @router.post("/live/manual-all")
