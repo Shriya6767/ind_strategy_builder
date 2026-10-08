@@ -11,7 +11,6 @@ so a strategy trades the same contract live that it traded in the backtest:
 from src.core.modules import np
 
 VALID_EXPIRY_TYPES = ("weekly", "next_weekly", "monthly", "next_monthly")
-PREMIUM_WINDOW = 15          # strikes each side of ATM quoted (via REST) for premium criteria
 
 
 def map_option_type(raw) -> str:
@@ -69,11 +68,8 @@ def candidate_strikes(leg: dict, option_type: str, spot: float, strikes: np.ndar
         sign = 1 if str(leg.get("strike_sign", "+")).strip() == "+" else -1
         atm = ladder_atm(spot, step)
         return [_nearest_listed(strikes, atm + sign * atm * pct / 100.0)]
-    # premium criteria: a window around ATM
-    atm = ladder_atm(spot, step)
-    centre = int(np.abs(strikes - atm).argmin())
-    lo, hi = max(0, centre - PREMIUM_WINDOW), min(strikes.size, centre + PREMIUM_WINDOW + 1)
-    return [int(s) for s in strikes[lo:hi]]
+    # premium criteria: the whole listed chain is quoted (REST, batches of 50), as the backtest scans it
+    return [int(s) for s in strikes]
 
 
 def select_strike(leg: dict, option_type: str, spot: float, strikes: np.ndarray, step: int,
