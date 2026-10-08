@@ -44,6 +44,7 @@ class LiveEngine:
         self._dirty: set[int] = set()
         self._tasks: list[asyncio.Task] = []
         self._auto_done_for: date | None = None
+        self._waiting_broker: set[int] = set()            # restores blocked on a stale broker session (logged once)
         self._lock = asyncio.Lock()
         self.started_at = time.time()
 
@@ -166,9 +167,17 @@ class LiveEngine:
                 feed = await self.feed_for(dep.get("broker_account_id"))
                 broker = await self.broker_for(dep)
             except Exception as e:
+                if restore:
+                    # a held position must not be abandoned because the broker session is stale
+                    # (yesterday's token): keep the status and let the 30 s scan retry after login
+                    if deployment_id not in self._waiting_broker:
+                        self._waiting_broker.add(deployment_id)
+                        store.log_event(deployment_id, f"Waiting for broker login to resume: {e}", "warn")
+                    raise
                 store.update_deployment_status(deployment_id, "error", str(e)[:300])
                 store.log_event(deployment_id, f"Cannot start: {e}", "error")
                 raise
+            self._waiting_broker.discard(deployment_id)
             runner = DeploymentRunner(self, dep, feed, broker, restore=restore)
             self.runners[deployment_id] = runner
             runner.start()
@@ -246,7 +255,8 @@ class LiveEngine:
                         try:
                             await self.activate(dep["deployment_id"], restore=dep["status"] != "scheduled")
                         except Exception as e:
-                            logger.error(f"[ENGINE] scan: deployment {dep['deployment_id']} failed to start: {e}")
+                            if dep["deployment_id"] not in self._waiting_broker:
+                                logger.error(f"[ENGINE] scan: deployment {dep['deployment_id']} failed to start: {e}")
                 await self._auto_activate()
                 if secs_now() >= AUTO_RESTART_SCAN_SECS:
                     await self.auto_restart()

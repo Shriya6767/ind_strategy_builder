@@ -155,8 +155,12 @@ class XTSBroker(Broker):
             await self.stream.start()
         except Exception as e:
             logger.error(f"[XTS-BROKER] order stream connect failed (will poll order book): {e}")
-        # sanity: the token works
-        await self.client.order_book()
+        # sanity: the token works; a dead token must not leave the order stream running
+        try:
+            await self.client.order_book()
+        except Exception:
+            await self.close()
+            raise
 
     async def close(self):
         if self.stream:

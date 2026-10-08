@@ -1805,6 +1805,9 @@ class DeploymentRunner:
         self._disarm()
         self._set_status(status, reason)
         self.db.submit(store.set_realised_pnl, self.id, self.realised)
+        if today_ist() < self.exit_date:                 # finished early: the exit date is the day it ended
+            self.exit_date = today_ist()
+            self.db.submit(store.update_deployment_dates, self.id, self.trade_date, self.exit_date)
         self._event(f"Deployment {status} ({reason}); realised PnL {self.realised:+.2f}")
 
     def _event(self, message: str, level: str = "info"):
