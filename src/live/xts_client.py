@@ -43,6 +43,19 @@ class XTSError(Exception):
         self.http_status = http_status
 
 
+class XTSTransportError(XTSError):
+    """We could not talk to the XTS server -- the broker never answered.
+    phase 'connect': nothing was sent (safe to retry);
+    phase 'read'   : the request may have been received (verify before resending)."""
+    def __init__(self, description: str, phase: str, kind: str):
+        super().__init__(description)
+        self.phase = phase
+        self.kind = kind
+
+
+_CONNECT_PHASE = (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout)
+
+
 def _unwrap(body: Any) -> Any:
     """Both APIs answer {"type": "success", "result": ...}; the market data
     docs sometimes show the envelope inside a one-element list."""
@@ -83,11 +96,14 @@ class _BaseClient:
         self.base_url = self.origin + self.path
         self.token: str | None = None
         self.user_id: str | None = None
+        # Warm keep-alive pool: connections stay open for 2 minutes of idleness
+        # (httpx's default 5 s would make every order after a pause pay a new
+        # TCP handshake -- a burst of handshakes is where SYNs get lost).
         self._http = httpx.AsyncClient(
             base_url=self.base_url,
-            timeout=httpx.Timeout(timeout, connect=5.0),
+            timeout=httpx.Timeout(timeout, connect=3.0),
             headers={"Content-Type": "application/json"},
-            limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
+            limits=httpx.Limits(max_connections=16, max_keepalive_connections=8, keepalive_expiry=120.0),
         )
 
     def set_token(self, token: str, user_id: str | None = None):
@@ -101,7 +117,8 @@ class _BaseClient:
         try:
             r = await self._http.request(method, path, content=content, params=params)
         except httpx.HTTPError as e:
-            raise XTSError(f"{method} {path}: {e.__class__.__name__}: {e}") from e
+            phase = "connect" if isinstance(e, _CONNECT_PHASE) else "read"
+            raise XTSTransportError(f"{method} {path}: {e.__class__.__name__}: {e}", phase, e.__class__.__name__) from e
         try:
             body = orjson.loads(r.content) if r.content else {}
         except ValueError:
@@ -122,6 +139,11 @@ class XTSInteractiveClient(_BaseClient):
     # 10/s for place+modify+cancel combined, but this is OFF (0) until a real
     # rate-limit rejection (HTTP 429) is observed from the broker.
     ORDER_THROTTLE_RATE = 0
+    MAX_IN_FLIGHT = 8          # order calls in flight at once (a 50-leg strategy streams, it does not burst)
+    CONNECT_RETRIES = 3        # attempts when the TCP connect fails (nothing was sent yet)
+    RETRY_DELAY = 0.2
+    WARM_CONNECTIONS = 4       # connections opened at login and kept alive for order bursts
+    KEEPALIVE_EVERY = 20.0     # seconds between keep-alive pings (servers drop idle connections after ~60 s)
 
     def __init__(self, origin: str, path: str = "/interactive", timeout: float = 10.0):
         super().__init__(origin, path, timeout)
@@ -129,6 +151,59 @@ class XTSInteractiveClient(_BaseClient):
         self.is_investor_client: bool | None = None
         self.enums: dict = {}
         self._throttle = _OrderThrottle(self.ORDER_THROTTLE_RATE)
+        self._in_flight = asyncio.Semaphore(self.MAX_IN_FLIGHT)
+
+    async def _order_call(self, method: str, path: str, *, json_body=None, params=None, tag: str = "") -> Any:
+        """Order placement / modify / cancel with the rules a lost packet needs:
+        connect-phase failures are retried (the broker saw nothing); a reply lost
+        after sending (read phase) is resolved from the order book by the order's
+        tag so an order is never duplicated."""
+        async with self._in_flight:
+            for attempt in range(1, self.CONNECT_RETRIES + 1):
+                await self._throttle.acquire()
+                try:
+                    return await self._request(method, path, json_body=json_body, params=params)
+                except XTSTransportError as e:
+                    if e.phase == "read":
+                        if method == "POST" and tag:
+                            found = await self._find_by_tag(tag)
+                            if found is not None:
+                                logger.warning(f"[XTS] {e.kind} on {path} but order {tag} is in the book -- adopted")
+                                return found
+                        raise
+                    if attempt == self.CONNECT_RETRIES:
+                        raise
+                    logger.warning(f"[XTS] {e.kind} on {method} {path} (attempt {attempt}) -- retrying")
+                    await asyncio.sleep(self.RETRY_DELAY)
+
+    async def _find_by_tag(self, tag: str) -> dict | None:
+        try:
+            for row in await self.order_book():
+                if str(row.get("OrderUniqueIdentifier") or "") == tag:
+                    return row
+        except XTSError:
+            pass
+        return None
+
+    async def profile(self) -> Any:
+        return await self._request("GET", "/user/profile", params=self._client_params())
+
+    async def warm_up(self) -> None:
+        """Open WARM_CONNECTIONS keep-alive connections in parallel so a multi-leg
+        entry never has to complete TCP handshakes first."""
+        results = await asyncio.gather(*(self.profile() for _ in range(self.WARM_CONNECTIONS)), return_exceptions=True)
+        bad = [r for r in results if isinstance(r, Exception)]
+        if bad:
+            logger.warning(f"[XTS] warm-up: {len(bad)}/{self.WARM_CONNECTIONS} connections failed ({bad[0]})")
+
+    async def keepalive_loop(self) -> None:
+        """One light request per KEEPALIVE_EVERY seconds keeps the pooled connections open."""
+        while True:
+            await asyncio.sleep(self.KEEPALIVE_EVERY)
+            try:
+                await self.profile()
+            except XTSError as e:
+                logger.debug(f"[XTS] keep-alive ping failed: {e}")
 
 
     @staticmethod
@@ -207,8 +282,7 @@ class XTSInteractiveClient(_BaseClient):
     async def place_order(self, payload: dict) -> str:
         """-> AppOrderID as a string. Acceptance only: the fill arrives on the
         order stream (or shows in the order book)."""
-        await self._throttle.acquire()
-        result = await self._request("POST", "/orders", json_body=payload)
+        result = await self._order_call("POST", "/orders", json_body=payload, tag=payload.get("orderUniqueIdentifier", ""))
         return str(result["AppOrderID"])
 
 
@@ -228,8 +302,7 @@ class XTSInteractiveClient(_BaseClient):
         }
         if self.client_id:
             body["clientID"] = self.client_id
-        await self._throttle.acquire()
-        result = await self._request("PUT", "/orders", json_body=body)
+        result = await self._order_call("PUT", "/orders", json_body=body)
         return str(result["AppOrderID"])
 
 
@@ -239,8 +312,7 @@ class XTSInteractiveClient(_BaseClient):
             params["orderUniqueIdentifier"] = tag[:20]
         if self.client_id:
             params["clientID"] = self.client_id
-        await self._throttle.acquire()
-        await self._request("DELETE", "/orders", params=params)
+        await self._order_call("DELETE", "/orders", params=params)
 
 
     async def cancel_all(self, segment: str = "BSEFO", instrument_id: int = 0) -> Any:

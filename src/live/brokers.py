@@ -168,8 +168,12 @@ class XTSBroker(Broker):
         except Exception:
             await self.close()
             raise
+        await self.client.warm_up()
+        self._keepalive = asyncio.get_running_loop().create_task(self.client.keepalive_loop())
 
     async def close(self):
+        if getattr(self, "_keepalive", None):
+            self._keepalive.cancel()
         if self.stream:
             await self.stream.stop()
         await self.client.aclose()

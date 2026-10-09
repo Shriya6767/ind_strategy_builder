@@ -37,7 +37,7 @@ from src.live.execution import (
     ExecutionSettings, LegExecution, limit_price, order_limit_price, mpp_price, mpp_pct, round_tick, stop_limit_prices,
 )
 from src.live.strike_resolver import map_option_type, normalize_expiry_type, candidate_strikes, select_strike
-from src.live.xts_client import SEG_BSEFO, SEG_BSECM, XTSError
+from src.live.xts_client import SEG_BSEFO, SEG_BSECM, XTSError, XTSTransportError
 from src.live.feed import Key, Candle
 from src.live.brokers import Broker, OrderUpdate
 from src.live.timeutil import (
@@ -691,8 +691,8 @@ class DeploymentRunner:
         try:
             app_id = await self.broker.place(payload)
         except XTSError as e:
-            leg.status, leg.error = "error", f"entry rejected: {e}"
-            self._event(f"Leg {leg.leg_number}: entry order rejected by broker -- {e}", "error")
+            leg.status, leg.error = "error", _order_failure("entry", e)
+            self._event(f"Leg {leg.leg_number}: {leg.error}", "error")
             self._persist_leg(leg)
             return
         leg.entry_order_id = app_id
@@ -1286,8 +1286,8 @@ class DeploymentRunner:
             try:
                 app_id = await self.broker.place(payload)
             except XTSError as e:
-                leg.status, leg.error = "open", f"exit rejected: {e}"
-                self._event(f"Leg {leg.leg_number}: EXIT ORDER REJECTED -- {e}. Position still open!", "error")
+                leg.status, leg.error = "open", _order_failure("exit", e)
+                self._event(f"Leg {leg.leg_number}: {leg.error.upper() if not isinstance(e, XTSTransportError) else leg.error}. Position still open!", "error")
                 self._exit_failed(leg)
                 self._persist_leg(leg)
                 return
@@ -1393,7 +1393,7 @@ class DeploymentRunner:
         try:
             app_id = await self.broker.place(payload)
         except XTSError as e:
-            self._event(f"Leg {leg.leg_number}: SL-L order rejected by broker ({e}) -- the stop-loss stays in software", "warn")
+            self._event(f"Leg {leg.leg_number}: {_order_failure('SL-L', e)} -- the stop-loss stays in software", "warn")
             return
         if leg.status != "open":                     # the leg closed while the order was being placed
             try:
@@ -1873,6 +1873,15 @@ def _num(v) -> float:
 
 def _flip(side: str) -> str:
     return "SELL" if side == "BUY" else "BUY"
+
+
+def _order_failure(what: str, e: XTSError) -> str:
+    """Wording that tells a broker REJECTION from a request that never reached it."""
+    if isinstance(e, XTSTransportError):
+        if e.phase == "connect":
+            return f"{what} order not sent -- could not reach the broker ({e.kind})"
+        return f"{what} order status unknown -- no reply from the broker ({e.kind}) and not in the order book"
+    return f"{what} order rejected by broker -- {e}"
 
 
 def positional_cycle(master, strategy: dict, exit_secs: int, entry_date: date | None = None,
