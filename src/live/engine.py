@@ -27,7 +27,7 @@ from src.live.timeutil import today_ist, now_ist, parse_hms, secs_now, weekday_c
 
 logger = get_logger(__name__)
 
-AUTO_RESTART_FROM_SECS = 8 * 3600
+AUTO_RESTART_FROM_SECS = parse_hms(config.LIVE_SESSION_RESET_TIME)   # a login before the broker's reset is dead on arrival
 AUTO_RESTART_SCAN_SECS = 8 * 3600 + 45 * 60
 
 
@@ -49,6 +49,7 @@ class LiveEngine:
         self._dirty: set[int] = set()
         self._tasks: list[asyncio.Task] = []
         self._auto_done_for: date | None = None
+        self._feed_relogin_for: date | None = None
         self._waiting_broker: set[int] = set()            # restores blocked on a stale broker session (logged once)
         self._lock = asyncio.Lock()
         self.started_at = time.time()
@@ -133,6 +134,7 @@ class LiveEngine:
         # for this account (stops stay in software); unknown -> try and fall back on rejection
         listed = (sess.get("order_types") or "").lower()
         broker.supports_stop_limit = ("stoplimit" in listed) if listed else None
+        broker.on_session_lost = lambda acct=acct, token=sess["token"]: self._session_lost(acct, token)
         await broker.connect()
         self.brokers[acct] = broker
         # runners that started on an older session (overnight BTST / positional
@@ -144,7 +146,7 @@ class LiveEngine:
         return broker
 
     async def auto_restart(self, broker_account_id: int | None = None):
-        """after 08:00, a broker login (or the 08:45 scan) restarts the
+        """after the broker's session reset, a broker login (or the 08:45 scan) restarts the
         overnight-paused BTST / positional deployments that opted in."""
         if secs_now() < AUTO_RESTART_FROM_SECS or not is_trading_day(today_ist()):
             return
@@ -280,10 +282,42 @@ class LiveEngine:
                 logger.error(f"[ENGINE] could not restore deployment {dep['deployment_id']}: {e}")
 
 
+    def _session_lost(self, acct: int, token: str):
+        """The broker rejected this account's token (daily reset / login elsewhere):
+        clear the stored session so the Broker page shows logged-out and the user
+        logs in again; `_refresh_brokers` rebuilds the adapter from that login."""
+        sess = BrokerAccountService.get_session(acct)
+        if sess and sess["token"] == token:
+            self.db.submit(BrokerAccountService.invalidate_session, acct, "session rejected by the broker -- log in again")
+            logger.warning(f"[ENGINE] broker account {acct}: session rejected by the broker -- waiting for a new login")
+
+    async def _refresh_brokers(self):
+        """A broker login on the API side issues a new token: rebuild that
+        account's adapter (order socket) now, not at the next activation."""
+        for acct, b in list(self.brokers.items()):
+            sess = BrokerAccountService.get_session(acct)
+            if sess and (sess["token"] != b.client.token or b.session_lost):
+                try:
+                    await self.broker_for({"mode": "live", "broker_account_id": acct, "settings": {}})
+                    logger.info(f"[ENGINE] broker account {acct}: adapter rebuilt on the new login")
+                except Exception as e:
+                    logger.warning(f"[ENGINE] broker account {acct}: rebuild on the new login failed: {e}")
+
+    async def _refresh_feeds(self):
+        """Proactive market-data re-login right after the broker's daily session reset."""
+        today = today_ist()
+        if self._feed_relogin_for == today or secs_now() < parse_hms(config.LIVE_SESSION_RESET_TIME) + 60:
+            return
+        self._feed_relogin_for = today
+        for f in self.feeds.values():
+            await f.relogin("daily session reset")
+
     async def _scan_loop(self):
         while True:
             try:
                 await asyncio.sleep(30)
+                await self._refresh_feeds()
+                await self._refresh_brokers()
                 for dep in store.list_active_deployments():
                     if dep["deployment_id"] not in self.runners:
                         try:

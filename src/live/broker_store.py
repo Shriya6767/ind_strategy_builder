@@ -7,17 +7,22 @@ app key, so a second login from the API would kick the worker's feed).
 """
 from src.core.modules import RealDictCursor, datetime, timedelta
 from urllib.parse import urlparse
-from src.core.config import Database
+from src.core.config import Database, LIVE_SESSION_RESET_TIME
 from src.core.logger import get_logger
 from src.live import crypto
 from src.live.xts_client import XTSInteractiveClient, XTSError
-from src.live.timeutil import now_ist, to_naive_ist
+from src.live.timeutil import now_ist, to_naive_ist, parse_hms
 
 logger = get_logger(__name__)
 
-SESSION_HOURS = 24
-SESSION_SAFETY_MINUTES = 10
 HOST_LOOKUP_DEFAULT_PASSWORD = "2021HostLookUpAccess"   # Symphony's documented default
+
+
+def session_expiry(now: datetime) -> datetime:
+    """A token lives until the broker's next daily session reset (naive IST)."""
+    reset = parse_hms(LIVE_SESSION_RESET_TIME)
+    nxt = now.replace(hour=reset // 3600, minute=(reset % 3600) // 60, second=reset % 60, microsecond=0)
+    return nxt if nxt > now else nxt + timedelta(days=1)
 
 
 def _split_url(raw: str, default_path: str) -> tuple[str, str]:
@@ -213,7 +218,7 @@ class BrokerAccountService:
                       is_investor: bool | None, interactive_path: str | None, error: str | None,
                       origin: str | None = None, order_types: str | None = None) -> None:
         now = to_naive_ist(now_ist())
-        expires = now + timedelta(hours=SESSION_HOURS) - timedelta(minutes=SESSION_SAFETY_MINUTES) if token else None
+        expires = session_expiry(now) if token else None
         conn = Database.get_connection()
         try:
             cur = conn.cursor()
@@ -289,6 +294,13 @@ class BrokerAccountService:
         logger.info(f"[BROKER] login ok account={broker_account_id} user={user_id} xts_user={client.user_id}")
         return BrokerAccountService.get_public(broker_account_id, user_id)
 
+
+    @staticmethod
+    def invalidate_session(broker_account_id: int, reason: str) -> None:
+        """The broker rejected the stored token (daily reset / login elsewhere):
+        clear it so the UI shows logged-out and nothing else uses it."""
+        BrokerAccountService._save_session(broker_account_id, token=None, xts_user_id=None, client_id=None,
+                                           is_investor=None, interactive_path=None, error=reason)
 
     @staticmethod
     async def logout(broker_account_id: int, user_id: int) -> dict | None:

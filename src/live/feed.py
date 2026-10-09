@@ -184,6 +184,33 @@ class XTSMarketFeed:
         self.connected = False
         self._flush_task: asyncio.Task | None = None
         self._binary_warned = False
+        self._relogin_at = 0.0
+
+    RELOGIN_EVERY_SECS = 60
+
+    async def relogin(self, why: str) -> bool:
+        """The market-data token died (the broker's daily session reset, or a
+        login elsewhere with the same key). This key is the worker's own
+        credential, so it logs in again and reconnects with the new token;
+        at most once a minute."""
+        if time.time() - self._relogin_at < self.RELOGIN_EVERY_SECS:
+            return False
+        self._relogin_at = time.time()
+        try:
+            await self.client.login(self.app_key, self.secret)
+        except Exception as e:
+            logger.error(f"[FEED:{self.name}] re-login failed ({why}): {e}")
+            return False
+        logger.warning(f"[FEED:{self.name}] re-logged in ({why}) -- reconnecting with the new token")
+        if self.sio is not None:
+            self.sio.query.update(token=self.client.token, userID=self.client.user_id)
+            self.sio.kicked = 0
+            if self.sio._ws is not None:
+                try:
+                    await self.sio._ws.close()
+                except Exception:
+                    pass
+        return True
 
 
     def _bind(self, sio: SocketIOClient):
@@ -199,6 +226,7 @@ class XTSMarketFeed:
 
         sio.on_connect = on_connect
         sio.on_disconnect = on_disconnect
+        sio.on_kick = lambda: asyncio.get_running_loop().create_task(self.relogin("server rejected the session"))
         sio.on("error", lambda data=None: logger.error(f"[FEED:{self.name}] error: {str(data)[:300]}"))
         sio.on("1501-json-full", self._apply_touchline_json)
         sio.on("1501-json-partial", self._apply_partial)
@@ -353,8 +381,12 @@ class XTSMarketFeed:
                     self._apply_snapshot(quotes)
                     self.remaining_subscriptions = remaining
                 except XTSError as e:
-                    if "already subscribed" in str(e).lower():
+                    msg = str(e).lower()
+                    if "already subscribed" in msg:
                         await self.snapshot(chunk)
+                    elif "token" in msg or "authorization" in msg:
+                        await self.relogin("resubscribe rejected the token")
+                        return                       # the reconnect with the new token resubscribes
                     else:
                         logger.error(f"[FEED:{self.name}] resubscribe failed: {e}")
 

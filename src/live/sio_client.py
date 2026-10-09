@@ -26,6 +26,7 @@ logger = get_logger(__name__)
 
 class SocketIOClient:
     RECONNECT_MIN, RECONNECT_MAX = 1.0, 15.0
+    KICK_MIN, KICK_MAX = 30.0, 300.0              # the server keeps closing the namespace (dead token)
     OPEN_TIMEOUT = 15.0
 
     def __init__(self, origin: str, candidates: list[tuple[str, int]], query: dict, name: str = "sio",
@@ -52,6 +53,8 @@ class SocketIOClient:
         self._stopping = False
         self._first = None  # future resolved by the first connect attempt
         self._pending_binary: tuple[str, int, list] | None = None
+        self.kicked = 0     # consecutive server-initiated namespace disconnects (a rejected token)
+        self.on_kick: Optional[Callable] = None
 
 
     def on(self, event: str, cb: Callable):
@@ -111,6 +114,11 @@ class SocketIOClient:
                 logger.warning(f"[SIO:{self.name}] session ended: {e.__class__.__name__}: {e}")
             if self._stopping:
                 return
+            if self.kicked:
+                wait = min(self.KICK_MIN * 2 ** (self.kicked - 1), self.KICK_MAX)
+                logger.warning(f"[SIO:{self.name}] server rejected the session {self.kicked}x -- next attempt in {wait:.0f}s")
+                await asyncio.sleep(wait)
+                continue
             await asyncio.sleep(delay)
             delay = min(delay * 2, self.RECONNECT_MAX)
 
@@ -219,6 +227,7 @@ class SocketIOClient:
                     logger.info(f"[SIO:{self.name}] connected")
                     self._fire(self.on_connect)
             elif st == "2":
+                self.kicked = 0                      # real traffic: the session is accepted
                 name, args = self._parse_event(msg[2:])
                 if name:
                     self._dispatch(name, args)
@@ -227,7 +236,9 @@ class SocketIOClient:
             elif st == "4":
                 logger.error(f"[SIO:{self.name}] server error: {msg[2:][:300]}")
             elif st == "1":
+                self.kicked += 1
                 logger.warning(f"[SIO:{self.name}] server sent namespace disconnect")
+                self._fire(self.on_kick)
                 await ws.close()
 
 

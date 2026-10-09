@@ -130,7 +130,6 @@ class Broker:
     async def balance(self) -> dict: return {}
 
 
-# ---------------------------------------------------------------------------
 class XTSBroker(Broker):
     name = "open_xts"
     mode = "live"
@@ -145,6 +144,14 @@ class XTSBroker(Broker):
         self.stream: XTSInteractiveStream | None = None
         self._last_event = 0.0
         self.session_lost = False
+        self.on_session_lost: Callable[[], Any] | None = None   # engine hook: invalidate the stored session
+
+    SESSION_DEAD_MARKERS = ("session has been expired", "session expired", "invalid token", "token/authorization",
+                            "wrong instance", "not logged in")
+
+    def _check_session(self, e: Exception):
+        if any(m in str(e).lower() for m in self.SESSION_DEAD_MARKERS):
+            self._on_logout()
 
     async def connect(self):
         self.stream = self.client.stream()
@@ -172,22 +179,37 @@ class XTSBroker(Broker):
         self.tracker.handle(OrderUpdate.from_xts(d))
 
     def _on_logout(self):
-        self.session_lost = True
+        if not self.session_lost:
+            self.session_lost = True
+            if self.on_session_lost:
+                self.on_session_lost()
 
     def build_order(self, **kw) -> dict:
         return self.client.build_order(**kw)
 
     async def place(self, payload: dict) -> str:
-        return await self.client.place_order(payload)
+        try:
+            return await self.client.place_order(payload)
+        except XTSError as e:
+            self._check_session(e)
+            raise
 
     async def cancel(self, app_order_id: str, tag: str = "") -> None:
-        await self.client.cancel_order(app_order_id, tag)
+        try:
+            await self.client.cancel_order(app_order_id, tag)
+        except XTSError as e:
+            self._check_session(e)
+            raise
 
     async def modify(self, app_order_id: str, payload: dict, *, order_type: str, limit_price: float,
                      stop_price: float = 0.0) -> str:
-        out = await self.client.modify_order(
-            app_order_id, quantity=payload["orderQuantity"], limit_price=limit_price, order_type=order_type,
-            product=payload["productType"], stop_price=stop_price, tag=payload.get("orderUniqueIdentifier", ""))
+        try:
+            out = await self.client.modify_order(
+                app_order_id, quantity=payload["orderQuantity"], limit_price=limit_price, order_type=order_type,
+                product=payload["productType"], stop_price=stop_price, tag=payload.get("orderUniqueIdentifier", ""))
+        except XTSError as e:
+            self._check_session(e)
+            raise
         payload.update(orderType=order_type, limitPrice=float(limit_price), stopPrice=float(stop_price))
         return out
 

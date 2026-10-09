@@ -32,15 +32,7 @@ DATABASE_PORT = os.getenv("DATABASE_PORT")
 DATABASE_NAME = os.getenv("DATABASE_NAME")
 DATABASE_USER = os.getenv("DATABASE_USER")
 DATABASE_PASSWORD = os.getenv("DATABASE_PASSWORD")
-# Connection pool: connections kept open and handed out per request instead
-# of a fresh TCP + password handshake (~20-50 ms) on every call.
-#   MIN  = connections kept WARM. psycopg2's pool closes any connection
-#          returned while MIN are already idle, so MIN is the real "pool
-#          size" for steady traffic; set it to the normal number of
-#          simultaneous DB requests (10 is plenty for 50 users).
-#   MAX  = hard cap under bursts (extra ones are opened and closed again).
-#          Must stay below PostgreSQL's max_connections (default 100).
-#   WAIT = seconds a request waits for a free connection before failing.
+
 DB_POOL_MIN: int = _int("DB_POOL_MIN", 5)
 DB_POOL_MAX: int = _int("DB_POOL_MAX", 20)
 DB_POOL_WAIT_SECONDS: int = _int("DB_POOL_WAIT_SECONDS", 10)
@@ -62,43 +54,25 @@ CORS_ORIGINS: list[str] = [
     o.strip() for o in (os.getenv("CORS_ORIGINS") or "*").split(",") if o.strip()
 ]
 
-# ---------------------------------------------------------------------------
-# Live trading (Symphony XTS "Open XTS" broker + live worker process)
-# ---------------------------------------------------------------------------
-# Fernet key that encrypts broker API keys/secrets at rest. Generate one with
-#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-# Without it a key is derived from JWT_SECRET (fine for dev, rotate for prod).
 BROKER_SECRET_KEY: str | None = os.getenv("BROKER_SECRET_KEY") or None
 
-# The live worker is a SEPARATE uvicorn process (`uvicorn src.live.worker:app
-# --port 8001`). The API forwards activate/pause/square-off commands to it and
-# the browser opens its /ws/live socket for LTP/MTM streaming.
 LIVE_WORKER_URL: str = (os.getenv("LIVE_WORKER_URL") or "http://127.0.0.1:8001").rstrip("/")
 LIVE_WORKER_PORT: int = _int("LIVE_WORKER_PORT", 8001)
 LIVE_INTERNAL_TOKEN: str | None = os.getenv("LIVE_INTERNAL_TOKEN") or None
 
-# Optional platform-wide market data feed (the manager's Market Data API app).
-# When set, every user's deployment streams from this ONE socket and the
-# per-user market data keys become optional. Symphony allows one session per
-# appKey, so one shared feed is also the only way to serve many users.
 LIVE_FEED_ROOT: str | None = os.getenv("LIVE_FEED_ROOT") or None          # e.g. https://xts.broker.com/apimarketdata
 LIVE_FEED_APP_KEY: str | None = os.getenv("LIVE_FEED_APP_KEY") or None
 LIVE_FEED_SECRET: str | None = os.getenv("LIVE_FEED_SECRET") or None
 LIVE_FEED_PUBLISH_FORMAT: str = (os.getenv("LIVE_FEED_PUBLISH_FORMAT") or "JSON").strip()   # JSON | Binary
 
-# Sensex index instrument on BSECM (segment 11). Resolved from the index list
-# API at startup; set this to skip the lookup or override it.
 LIVE_SENSEX_INDEX_ID: int = _int("LIVE_SENSEX_INDEX_ID", 0)
-# XTS orderQuantity is sent in UNITS (lots x lot size) by every broker seen so
-# far; flip this if your broker's XTS expects lots.
+
 LIVE_ORDER_QTY_IN_LOTS: bool = _bool("LIVE_ORDER_QTY_IN_LOTS", False)
-# Seconds a limit order may stay open before it is cancelled (AlgoTest: 50).
 LIVE_ORDER_TIMEOUT_SECONDS: int = _int("LIVE_ORDER_TIMEOUT_SECONDS", 50)# Where the daily contract master is cached (one text file per day).
 LIVE_MASTER_CACHE_DIR: str = os.getenv("LIVE_MASTER_CACHE_DIR") or "cache"
-# Comma-separated YYYY-MM-DD exchange holidays (BTST next-day exit skips them).
 LIVE_HOLIDAYS: list[str] = [d.strip() for d in (os.getenv("LIVE_HOLIDAYS") or "").split(",") if d.strip()]
-# Daily auto-activation time (IST) for strategies with auto_activate enabled.
 LIVE_AUTO_ACTIVATE_TIME: str = os.getenv("LIVE_AUTO_ACTIVATE_TIME") or "09:05:00"
+LIVE_SESSION_RESET_TIME: str = os.getenv("LIVE_SESSION_RESET_TIME") or "08:30:00"
 
 
 class _PooledConnection:

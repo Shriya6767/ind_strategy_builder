@@ -300,6 +300,7 @@ class XTSInteractiveStream:
         self.on_position: Optional[Callable[[dict], Any]] = None
         self.on_logout: Optional[Callable[[], Any]] = None
         self.connected = False
+        self.rejected = False
 
 
     @staticmethod
@@ -335,8 +336,18 @@ class XTSInteractiveStream:
             if self.on_logout:
                 return self.on_logout()
 
+        def kicked():
+            # the server closed the namespace: the token is dead -- stop, do not loop
+            if not self.rejected:
+                self.rejected = True
+                logger.error(f"[XTS-INTERACTIVE] session rejected by the server user={self.user_id} -- a fresh broker login is needed")
+                sio._stopping = True
+                if self.on_logout:
+                    self.on_logout()
+
         sio.on_connect = on_connect
         sio.on_disconnect = on_disconnect
+        sio.on_kick = kicked
         sio.on("joined", lambda data=None: logger.info(f"[XTS-INTERACTIVE] joined: {str(data)[:120]}"))
         sio.on("error", lambda data=None: logger.error(f"[XTS-INTERACTIVE] error: {str(data)[:300]}"))
         sio.on("order", forward("on_order"))
