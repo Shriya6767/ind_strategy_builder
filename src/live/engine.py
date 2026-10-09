@@ -61,6 +61,8 @@ class LiveEngine:
                 await self._open_feed("platform", config.LIVE_FEED_ROOT, "", config.LIVE_FEED_APP_KEY, config.LIVE_FEED_SECRET)
             except Exception as e:
                 logger.error(f"[ENGINE] platform feed failed to start: {e}")
+        if secs_now() >= parse_hms(config.LIVE_SESSION_RESET_TIME):
+            self._feed_relogin_for = today_ist()      # the start-up login is already after today's reset
         await self._restore_active()
         loop = asyncio.get_running_loop()
         self._tasks = [loop.create_task(self._broadcast_loop()), loop.create_task(self._scan_loop())]
