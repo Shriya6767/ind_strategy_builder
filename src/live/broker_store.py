@@ -304,6 +304,11 @@ class BrokerAccountService:
 
     @staticmethod
     async def logout(broker_account_id: int, user_id: int) -> dict | None:
+        from src.live.deployment_store import count_active_live
+        active = count_active_live(broker_account_id)
+        if active:
+            raise ValueError(f"{active} live deployment(s) are still running on this broker -- "
+                             "square off or switch them to manual before logging out")
         sess = BrokerAccountService.get_session(broker_account_id)
         if sess and sess["user_id"] == user_id:
             client = XTSInteractiveClient(sess["origin"], sess["interactive_path"])

@@ -131,6 +131,16 @@ def has_active_deployment(user_id: int, strategy_id: int, trade_date: date | Non
     return _run(q)
 
 
+def count_active_live(broker_account_id: int) -> int:
+    """Live-mode deployments still scheduled / running / paused on this broker account."""
+    def q(cur):
+        cur.execute("""SELECT COUNT(*) AS n FROM live_deployment
+                       WHERE broker_account_id = %s AND mode = 'live' AND status IN %s""",
+                    (broker_account_id, ACTIVE_STATUSES))
+        return cur.fetchone()["n"]
+    return _run(q)
+
+
 def list_active_deployments() -> list[dict]:
     """Everything the worker must (re)start: today's + BTST holds exiting today."""
     def q(cur):
