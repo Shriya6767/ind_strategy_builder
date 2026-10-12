@@ -34,7 +34,7 @@ from src.core.constant import QUANTITY, COST_BUFFER_PCT
 from src.core.logger import get_logger
 from src.live import deployment_store as store
 from src.live.execution import (
-    ExecutionSettings, LegExecution, limit_price, order_limit_price, mpp_price, mpp_pct, round_tick, stop_limit_prices,
+    ExecutionSettings, LegExecution, limit_price, order_limit_price, mpp_price, round_tick, stop_limit_prices,
 )
 from src.live.strike_resolver import map_option_type, normalize_expiry_type, candidate_strikes, select_strike
 from src.live.xts_client import SEG_BSEFO, SEG_BSECM, XTSError, XTSTransportError
@@ -1366,18 +1366,15 @@ class DeploymentRunner:
         ls = self._ls(leg.leg_number)
         return (leg.sl is not None and leg.status == "open" and not leg.sl_order_id
                 and str(leg.meta.get("stoploss_type") or "POINTS").upper() in PREMIUM_TYPES
+                and ls.exit_order_type == "LIMIT"            # MPP exits: AlgoTest keeps the stop in software, no SL-L / buffers
                 and ls.sl_order_at_broker
                 and self.settings.trade_monitoring == "LTP"
                 and getattr(self.broker, "supports_stop_limit", None) is not False)
 
     def _sl_prices(self, leg: LegState) -> tuple[float, float]:
         ls = self._ls(leg.leg_number)
-        if ls.exit_order_type == "MPP":
-            limit_buffer, buffer_type = mpp_pct(leg.sl), "PERCENT"
-        else:
-            limit_buffer, buffer_type = ls.exit_limit_buffer, ls.buffer_kind("exit")
-        return stop_limit_prices(leg.sl, _flip(leg.side), ls.exit_trigger_buffer, limit_buffer,
-                                 buffer_type, leg.contract.tick_size)
+        return stop_limit_prices(leg.sl, _flip(leg.side), ls.exit_trigger_buffer, ls.exit_limit_buffer,
+                                 ls.buffer_kind("exit"), leg.contract.tick_size)
 
     async def _place_sl_order(self, leg: LegState):
         ls = self._ls(leg.leg_number)
