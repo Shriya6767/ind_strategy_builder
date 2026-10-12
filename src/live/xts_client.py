@@ -116,6 +116,16 @@ class _BaseClient:
         content = orjson.dumps(json_body) if json_body is not None else None
         try:
             r = await self._http.request(method, path, content=content, params=params)
+        except (httpx.RemoteProtocolError, httpx.ReadError) as e:
+            if method != "GET":
+                raise XTSTransportError(f"{method} {path}: {e.__class__.__name__}: {e}", "read", e.__class__.__name__) from e
+            # a pooled keep-alive connection the server had already closed: a read-only
+            # call is idempotent, so repeat it once on a fresh connection
+            try:
+                r = await self._http.request(method, path, content=content, params=params)
+            except httpx.HTTPError as e2:
+                phase = "connect" if isinstance(e2, _CONNECT_PHASE) else "read"
+                raise XTSTransportError(f"{method} {path}: {e2.__class__.__name__}: {e2}", phase, e2.__class__.__name__) from e2
         except httpx.HTTPError as e:
             phase = "connect" if isinstance(e, _CONNECT_PHASE) else "read"
             raise XTSTransportError(f"{method} {path}: {e.__class__.__name__}: {e}", phase, e.__class__.__name__) from e
@@ -197,13 +207,15 @@ class XTSInteractiveClient(_BaseClient):
             logger.warning(f"[XTS] warm-up: {len(bad)}/{self.WARM_CONNECTIONS} connections failed ({bad[0]})")
 
     async def keepalive_loop(self) -> None:
-        """One light request per KEEPALIVE_EVERY seconds keeps the pooled connections open."""
+        """WARM_CONNECTIONS concurrent light requests every KEEPALIVE_EVERY seconds, so
+        EVERY pooled connection carries traffic inside the server's idle timeout (one
+        ping would keep a single connection alive and let the others go stale)."""
         while True:
             await asyncio.sleep(self.KEEPALIVE_EVERY)
-            try:
-                await self.profile()
-            except XTSError as e:
-                logger.debug(f"[XTS] keep-alive ping failed: {e}")
+            results = await asyncio.gather(*(self.profile() for _ in range(self.WARM_CONNECTIONS)), return_exceptions=True)
+            bad = [r for r in results if isinstance(r, Exception)]
+            if bad:
+                logger.debug(f"[XTS] keep-alive: {len(bad)}/{self.WARM_CONNECTIONS} pings failed ({bad[0]})")
 
 
     @staticmethod
