@@ -499,9 +499,33 @@ class DeploymentRunner:
                 if remaining <= 0:
                     break
                 await asyncio.sleep(min(remaining, 30.0))
-        else:
+        if not await self._wait_for_predecessor():
+            return False
+        if now >= self.entry_dt:
             self._event(f"Activated after entry time {hms(self.entry_secs)} -- entering now", "warn")
         return True
+
+    PREDECESSOR_POLL_SECS = 5
+
+    async def _wait_for_predecessor(self) -> bool:
+        """The same strategy may still hold an older multi-day deployment that
+        exits today: this one enters only after it has finished."""
+        waiting_on = None
+        while True:
+            older = [d for d in await asyncio.to_thread(store.active_deployments_of, self.user_id, self.dep["strategy_id"])
+                     if d["deployment_id"] < self.id]
+            if not older:
+                if waiting_on is not None:
+                    self._event(f"Deployment {waiting_on} has exited -- entering now")
+                return True
+            pred = older[0]["deployment_id"]
+            if now_ist() >= self.exit_dt:
+                self._finish("completed", f"deployment {pred} did not exit before the exit time -- nothing to do")
+                return False
+            if pred != waiting_on:
+                waiting_on = pred
+                self._set_status("scheduled", f"waiting for deployment {pred} to exit")
+            await asyncio.sleep(self.PREDECESSOR_POLL_SECS)
 
     def _expiry_for(self, meta: dict) -> date | None:
         if self.is_positional:
@@ -796,11 +820,9 @@ class DeploymentRunner:
             self._spawn(self._place_sl_order(leg))      # rest the stop-loss at the broker as an SL-L order
 
     def _wait_deadline(self, kind: str, tomorrow: bool = False) -> datetime:
-        """Momentum and at-cost waits fill on the entry day only for BTST
-        (the engine scans day 1); everything else may fill until just before
-        the exit."""
-        if self.is_btst and not tomorrow:          # momentum / cost / same-day range: day 1 only
-            return at(self.trade_date, LAST_EXIT_SECS)
+        """Every conditional entry (momentum / range / at-cost) and re-entry may
+        fill until just before the exit -- for BTST / positional that includes
+        the carry days (live-only rule; the backtest engine scans day 1)."""
         return self.exit_dt - timedelta(seconds=self.REENTRY_CUTOFF_SECS)
 
     def _arm_condition(self, leg: LegState, meta: dict, momentum_only: bool = False) -> bool:

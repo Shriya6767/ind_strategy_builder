@@ -220,9 +220,6 @@ class LiveTradeService:
         broker_account_id = int(broker_account_id) if broker_account_id else None
 
         today = today_ist()
-        if store.has_active_deployment(user_id, strategy_id):
-            raise LiveValidationError("This strategy is already deployed")
-
         if settings.mode == "live":
             if not broker_account_id:
                 raise LiveValidationError("Live mode needs a broker account")
@@ -266,6 +263,11 @@ class LiveTradeService:
         # DTE mode is judged by the worker (it needs the expiry calendar); weekdays here
         if settings.execution_days_mode == "weekdays" and weekday_code(entry_date) not in settings.execution_days:
             raise LiveValidationError(f"{weekday_code(entry_date)} is not in the strategy's execution days {list(settings.execution_days)}")
+        # A still-active deployment that ends on/before the new entry day is a predecessor: the
+        # new one is created `scheduled` and the worker enters only after it has exited.
+        for d in store.active_deployments_of(user_id, strategy_id):
+            if d["exit_date"] > entry_date:
+                raise LiveValidationError(f"This strategy is already deployed until {d['exit_date']} (deployment {d['deployment_id']})")
 
         dep_id = store.create_deployment(
             user_id=user_id, strategy_id=strategy_id, strategy_name=head["strategy_name"], version=version,

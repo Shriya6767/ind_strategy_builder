@@ -141,6 +141,16 @@ def count_active_live(broker_account_id: int) -> int:
     return _run(q)
 
 
+def active_deployments_of(user_id: int, strategy_id: int) -> list[dict]:
+    """The strategy's deployments still scheduled / running / paused, oldest first."""
+    def q(cur):
+        cur.execute("""SELECT deployment_id, status, trade_date, exit_date FROM live_deployment
+                       WHERE user_id = %s AND strategy_id = %s AND status IN %s ORDER BY deployment_id""",
+                    (user_id, strategy_id, ACTIVE_STATUSES))
+        return cur.fetchall()
+    return _run(q)
+
+
 def list_active_deployments() -> list[dict]:
     """Everything the worker must (re)start: today's + BTST holds exiting today."""
     def q(cur):
