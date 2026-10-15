@@ -39,7 +39,7 @@ class OrderUpdate:
             app_order_id=str(d.get("AppOrderID", "")),
             status=str(d.get("OrderStatus", "")),
             filled_qty=int(float(d.get("CumulativeQuantity") or 0)),
-            avg_price=float(d.get("OrderAverageTradedPrice") or 0),
+            avg_price=float(str(d.get("OrderAverageTradedPrice") or 0).replace(",", "") or 0),   # "1,417.60" on some builds
             reason=str(d.get("CancelRejectReason") or ""),
             tag=str(d.get("OrderUniqueIdentifier") or ""),
             raw=d,

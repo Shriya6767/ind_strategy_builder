@@ -85,6 +85,23 @@ class DataLoader:
 
 
     @classmethod
+    def ensure_range(cls, start_date: str, end_date: str) -> None:
+        """`/run-backtest` loads its own data: nothing to do when the resident
+        frame already covers the strategy's dates (the preload fast path);
+        otherwise load exactly that range the way /load-data did, add the
+        engine columns once and retire the forked workers so they re-fork
+        from the new frame."""
+        if DataStore.covers(start_date, end_date):
+            return
+        logger.info(f"Market data {start_date}..{end_date} not resident -- loading it now.")
+        cls().load(start_date, end_date)
+        from src.services.backtesting.backtest_engine import BacktestEngine
+        from src.core.executor import reset_pool
+        BacktestEngine.derive_day_columns(DataStore.get_df())
+        reset_pool()
+        logger.info(f"Market data resident: {len(DataStore.get_df()):,} rows, {start_date}..{end_date}.")
+
+    @classmethod
     def preload_from_env(cls) -> None:
         """Startup: load the resident frame ONCE for every process, then
         every backtest slices its own dates from it (see DataStore).

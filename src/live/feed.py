@@ -139,31 +139,38 @@ class TickStore:
 _HDR = struct.Struct("<bHhiHhHH")          # isGzip, msgCode, seg, instId, bookType, marketType, uncompressedSize, compressedSize
 
 
+# XTS 1.162 binary layout: prices are int32 scaled by the segment's divisor, sizes int64
+_PRICE_DIVISOR = {1: 100, 11: 100, 2: 100, 12: 100, 51: 100, 3: 10_000_000, 13: 10_000, 4: 10_000}
+
+
 def decode_binary_touchline(data: bytes) -> tuple[Key, float, float | None, float | None] | None:
     """-> ((segment, instrument_id), ltp, bid, ask) for a 1501 packet, else None.
-    Layout per the Symphony doc; verify byte order against a live packet
-    before relying on Binary publishFormat (JSON is the default)."""
+    Layout per the Symphony change log 1.162 (sample decoder in the doc):
+    header, then messageVersion/applicationType/tokenID[/sequenceNumber/skipBytes],
+    segment, instrument, timestamp, bid row, ask row, lastUpdateTime, LTP.
+    Only used with LIVE_FEED_PUBLISH_FORMAT=Binary (JSON is the default)."""
     try:
         is_gzip, msg, seg, inst_id, _bt, _mt, _usz, _csz = _HDR.unpack_from(data, 0)
         payload = data[_HDR.size:]
         if is_gzip:
-            payload = zlib.decompress(payload)
+            payload = zlib.decompressobj(-15).decompress(payload)
         off = 0
         code, version, _app = struct.unpack_from("<HHH", payload, off); off += 6
         off += 8                                                     # tokenID uint64
         if version >= 4:
             off += 8                                                 # sequenceNumber
-            (skip,) = struct.unpack_from("<i", payload, off); off += 4
-            off += max(skip, 0)
+            off += 4                                                 # skipBytes
         if code != MSG_TOUCHLINE:
             return None
         seg2, inst2 = struct.unpack_from("<hi", payload, off); off += 6
         off += 8                                                     # exchangeTimestamp
-        bid_size, bid_price, _bo, _bf = struct.unpack_from("<qdIh", payload, off); off += 22
-        ask_size, ask_price, _ao, _af = struct.unpack_from("<qdIh", payload, off); off += 22
+        div = _PRICE_DIVISOR.get(int(seg2 or seg), 1)
+        _bs, bid_price, _bo, _bf = struct.unpack_from("<qiIh", payload, off); off += 18
+        _as, ask_price, _ao, _af = struct.unpack_from("<qiIh", payload, off); off += 18
         off += 8                                                     # LastUpdateTime
-        (ltp,) = struct.unpack_from("<d", payload, off)
-        return (int(seg2 or seg), int(inst2 or inst_id)), float(ltp), float(bid_price) or None, float(ask_price) or None
+        (ltp,) = struct.unpack_from("<i", payload, off)
+        return ((int(seg2 or seg), int(inst2 or inst_id)), ltp / div,
+                (bid_price / div) if bid_price else None, (ask_price / div) if ask_price else None)
     except Exception:
         return None
 

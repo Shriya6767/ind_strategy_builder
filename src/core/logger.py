@@ -1,13 +1,8 @@
-from src.core.modules import logging, RotatingFileHandler, os
+from src.core.modules import logging, os, date
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
-
-
-INFO_LOG_FILE = os.path.join(LOG_DIR, "info.log")
-ERROR_LOG_FILE = os.path.join(LOG_DIR, "error.log")
-
 
 # Log Format
 LOG_FORMAT = (
@@ -17,48 +12,50 @@ LOG_FORMAT = (
 FORMATTER = logging.Formatter(LOG_FORMAT)
 
 
+class DailyFileHandler(logging.FileHandler):
+    """One log file per calendar day -- logs/YYYY-MM-DD.log -- switched the
+    moment the first record of a new day is written."""
+
+    def __init__(self, directory: str, encoding: str = "utf-8"):
+        self.directory = directory
+        self._day = date.today()
+        super().__init__(self._path(), encoding=encoding)
+
+    def _path(self) -> str:
+        return os.path.join(self.directory, f"{self._day:%Y-%m-%d}.log")
+
+    def emit(self, record):
+        today = date.today()
+        if today != self._day:
+            self.acquire()
+            try:
+                self._day = today
+                if self.stream:
+                    self.stream.close()
+                    self.stream = None
+                self.baseFilename = os.path.abspath(self._path())
+            finally:
+                self.release()
+        super().emit(record)
+
+
 def get_logger(name: str) -> logging.Logger:
 
     logger = logging.getLogger(name)
-
     # Prevent duplicate handlers
     if logger.handlers:
         return logger
-
     logger.setLevel(logging.INFO)
 
-    # ---------------- INFO HANDLER ----------------
-    info_handler = RotatingFileHandler(
-        INFO_LOG_FILE,
-        maxBytes=10 * 1024 * 1024,   # 10 MB
-        backupCount=5,
-        encoding="utf-8"
-    )
+    file_handler = DailyFileHandler(LOG_DIR)
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(FORMATTER)
 
-    info_handler.setLevel(logging.INFO)
-    info_handler.setFormatter(FORMATTER)
-
-    # ---------------- ERROR HANDLER ----------------
-    error_handler = RotatingFileHandler(
-        ERROR_LOG_FILE,
-        maxBytes=10 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8"
-    )
-
-    error_handler.setLevel(logging.ERROR)
-    error_handler.setFormatter(FORMATTER)
-
-    # ---------------- CONSOLE HANDLER ----------------
     console_handler = logging.StreamHandler()
-
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(FORMATTER)
 
-    logger.addHandler(info_handler)
-    logger.addHandler(error_handler)
+    logger.addHandler(file_handler)
     logger.addHandler(console_handler)
-
     logger.propagate = False
-
     return logger

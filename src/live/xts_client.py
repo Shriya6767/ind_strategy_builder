@@ -302,7 +302,7 @@ class XTSInteractiveClient(_BaseClient):
                            order_type: str = "LIMIT", product: str = "NRML", stop_price: float = 0.0,
                            tag: str = "", time_in_force: str = "DAY") -> str:
         body = {
-            "appOrderID": int(app_order_id),
+            "appOrderID": str(app_order_id),                 # XTS V2: AppOrderID is a string (20-digit ids)
             "modifiedProductType": product,
             "modifiedOrderType": order_type,
             "modifiedOrderQuantity": int(quantity),

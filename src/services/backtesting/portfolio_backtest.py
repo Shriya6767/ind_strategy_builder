@@ -6,6 +6,7 @@ from src.core.config import PORTFOLIO_MAX_WORKERS
 from src.core.data_store import DataStore
 from src.core.logger import get_logger
 from src.services.backtesting.backtest_engine import BacktestEngine
+from src.services.backtesting.load_data import DataLoader
 from src.services.backtesting.report_builder import BacktestReportBuilder
 from src.services.backtesting.portfolio_report_builder import PortfolioReportBuilder
 from src.services.backtesting.slippage_service import SlippageService
@@ -129,6 +130,7 @@ class PortfolioBacktestService:
         concurrent portfolios from different users share the same
         read-only frame; each Sensex daily file carries every live expiry,
         so one frame serves every strategy."""
+        DataLoader.ensure_range(start_date, end_date)
         lo, hi = DataStore.bounds(start_date, end_date)
         if lo >= hi:
             avail = DataStore.loaded_range

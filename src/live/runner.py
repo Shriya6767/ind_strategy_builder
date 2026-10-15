@@ -1586,6 +1586,7 @@ class DeploymentRunner:
         self._trade_id = 1
         used: dict[int, list[int]] = {}                  # leg_number -> [SL re-entries used, target re-entries used]
         prev_exit: dict[int, str | None] = {}            # leg_number -> exit_reason of the previous attempt
+        overall_seen: dict[int, int] = {}                # leg_number -> OVERALL_* re-entries seen so far
         for r in rows:
             meta = self.leg_defs[r["leg_number"] - 1] if 0 < r["leg_number"] <= len(self.leg_defs) else {}
             if meta.get("sequential_leg"):
@@ -1607,7 +1608,12 @@ class DeploymentRunner:
                 leg.reentry_sl_left = max(0, leg.reentry_sl_left - u[0])
                 leg.reentry_tgt_left = max(0, leg.reentry_tgt_left - u[1])
             prev_exit[n] = r.get("exit_reason")
-            leg.trade_id = self._trade_id
+            # every OVERALL_* attempt opened a new trade: the leg belongs to that trade and the
+            # overall re-entry budget was spent once (rebuilt below, not reset to full)
+            if mode.startswith("OVERALL_"):
+                overall_seen[n] = overall_seen.get(n, 0) + 1
+            leg.trade_id = 1 + overall_seen.get(n, 0)
+            self._trade_id = max(self._trade_id, leg.trade_id)
             leg.live_leg_id = r["live_leg_id"]
             leg.option_type = r.get("option_type") or leg.option_type
             leg.contract = self.master.by_id.get(int(r["instrument_id"])) if r.get("instrument_id") else None
@@ -1698,6 +1704,16 @@ class DeploymentRunner:
         for key in list(self._by_key):
             self._listen(key)
         self._recompute_overall()
+        if self._trade_id > 1 and self._overall_reentry_left == 0:
+            s = self.strategy                             # budget as configured, minus the re-entries already made
+            if s.get("is_overall_reentry_sl") and s.get("overall_reentry_sl_value"):
+                self._overall_reentry_left = int(s["overall_reentry_sl_value"])
+                self._overall_mode = str(s.get("overall_reentry_sl_type") or "RE_ASAP").upper()
+            elif s.get("is_overall_reentry_target") and s.get("overall_reentry_target_value"):
+                self._overall_reentry_left = int(s["overall_reentry_target_value"])
+                self._overall_mode = str(s.get("overall_reentry_target_type") or "RE_ASAP").upper()
+            self._overall_reverse = self._overall_mode.endswith("REVERSE")
+            self._overall_reentry_left = max(0, self._overall_reentry_left - (self._trade_id - 1))
 
     async def _restore_waits(self):
         """Re-arm every pending conditional entry exactly as it was persisted:
@@ -1970,7 +1986,7 @@ def _insert_leg_and_ignore(row: dict):
 
 def _num(v) -> float:
     try:
-        return float(v) if v not in (None, "", "NaN") else 0.0
+        return float(str(v).replace(",", "")) if v not in (None, "", "NaN") else 0.0
     except (TypeError, ValueError):
         return 0.0
 
