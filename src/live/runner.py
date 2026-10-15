@@ -79,7 +79,7 @@ class LegState:
         "live_leg_id", "error", "reentry_sl_left", "reentry_tgt_left", "entry_payload", "last_check",
         "option_type", "entry_mode", "wait", "watch_key", "trigger", "trigger_up", "range_hi", "range_lo",
         "range_end_dt", "range_high_side", "wait_deadline", "seq_meta", "trade_id",
-        "exit_fails", "next_exit_try", "wait_saved_at",
+        "exit_fails", "next_exit_try", "wait_saved_at", "reconcile_miss",
         "ref_price", "sl_order_id", "sl_payload", "sl_busy", "next_trail_at",
     )
 
@@ -123,6 +123,7 @@ class LegState:
         self.exit_fails = 0                       # failed exit attempts (rejected / not filled)
         self.next_exit_try = 0.0                  # epoch before which SL/target must not re-fire an exit
         self.wait_saved_at = 0.0                  # last time the pending wait (range hi/lo) was written to the DB
+        self.reconcile_miss = 0                   # consecutive broker position checks that did not show this leg
         self.ref_price = None                     # intended entry price (tgt_sl_ref_price = TRIGGER)
         self.sl_order_id = None                   # the stop-loss resting at the broker as an SL-L order
         self.sl_payload = None
@@ -1583,11 +1584,29 @@ class DeploymentRunner:
         except Exception as e:
             self._event(f"Order book unavailable during restore: {e}", "warn")
         self._trade_id = 1
+        used: dict[int, list[int]] = {}                  # leg_number -> [SL re-entries used, target re-entries used]
+        prev_exit: dict[int, str | None] = {}            # leg_number -> exit_reason of the previous attempt
         for r in rows:
             meta = self.leg_defs[r["leg_number"] - 1] if 0 < r["leg_number"] <= len(self.leg_defs) else {}
             if meta.get("sequential_leg"):
                 meta = _prepare_meta(meta["sequential_leg"], r["leg_number"])
-            leg = LegState(r["leg_number"], meta, r["attempt"], r["side"], entry_mode=r.get("entry_mode") or "ENTRY")
+            mode = r.get("entry_mode") or "ENTRY"
+            if mode == "LAZY_LEG" and meta.get("lazy_leg"):
+                meta = _prepare_meta(meta["lazy_leg"], r["leg_number"])
+            leg = LegState(r["leg_number"], meta, r["attempt"], r["side"], entry_mode=mode)
+            # the re-entry budget is not stored per row: rebuild it from the attempts that already
+            # consumed it, else a restart hands every restored leg its full budget again
+            n = r["leg_number"]
+            u = used.setdefault(n, [0, 0])
+            if r["attempt"] > 1 and mode.startswith("RE_"):
+                if prev_exit.get(n) == "stoploss":
+                    u[0] += 1
+                elif prev_exit.get(n) == "target":
+                    u[1] += 1
+            if mode != "LAZY_LEG":
+                leg.reentry_sl_left = max(0, leg.reentry_sl_left - u[0])
+                leg.reentry_tgt_left = max(0, leg.reentry_tgt_left - u[1])
+            prev_exit[n] = r.get("exit_reason")
             leg.trade_id = self._trade_id
             leg.live_leg_id = r["live_leg_id"]
             leg.option_type = r.get("option_type") or leg.option_type
@@ -1746,6 +1765,7 @@ class DeploymentRunner:
             return
         products = {self._ls(l.leg_number).product for l in open_legs}     # legs may override the product
         net: dict[int, float] = {}
+        raw_rows: dict[int, str] = {}                 # what the broker literally sent, for the mismatch events
         for p in positions or []:
             try:
                 # Symphony's docs say ExchangeInstrumentID; brokers also send ExchangeInstrumentId
@@ -1756,7 +1776,10 @@ class DeploymentRunner:
                 continue
             buy, sell = _num(p.get("OpenBuyQuantity")), _num(p.get("OpenSellQuantity"))
             net[iid] = net.get(iid, 0.0) + ((buy - sell) if (buy or sell) else _num(p.get("Quantity")))
+            raw_rows[iid] = (f"OpenBuy {p.get('OpenBuyQuantity')} OpenSell {p.get('OpenSellQuantity')} "
+                             f"Quantity {p.get('Quantity')} {p.get('ProductType')} updated {p.get('LastUpdateDateTime') or '?'}")
         now = now_ist()
+        acct = self.dep.get("broker_account_id")
         for leg in open_legs:
             # a fill needs a moment to reach the position book: never judge a fresh leg
             if leg.entry_ts and (now - leg.entry_ts).total_seconds() < self.RECONCILE_GRACE_SECS:
@@ -1769,24 +1792,86 @@ class DeploymentRunner:
                             f"({where}) -- cannot confirm the position; leg left open, check the broker terminal", "warn")
                 continue
             have = net[iid]
-            if have * leg.direction > 0 and abs(have) >= leg.qty:
-                continue                                    # broker agrees
-            if have * leg.direction > 0:
-                self._event(f"Leg {leg.leg_number}: broker holds {abs(have):.0f} of our {leg.qty} units in "
+            # the broker nets the whole ACCOUNT: add what every other deployment on this account
+            # holds in the same contract, else their offsetting legs read as "ours was closed"
+            product = self._ls(leg.leg_number).product
+            others = 0.0
+            for r in getattr(self.engine, "runners", {}).values():
+                if r is self or not r.active or r.dep.get("broker_account_id") != acct or r.mode != "live":
+                    continue
+                others += sum(l.direction * l.qty for l in r.legs
+                              if l.status == "open" and l.contract and l.contract.instrument_id == iid
+                              and r._ls(l.leg_number).product == product)
+            expect = others + sum(l.direction * l.qty for l in open_legs
+                                  if l.contract.instrument_id == iid and self._ls(l.leg_number).product == product)
+            if expect == 0 or (have * expect > 0 and abs(have) >= abs(expect)):
+                if leg.reconcile_miss:                      # the book caught up: clear the alarm
+                    leg.reconcile_miss, leg.error = 0, None
+                    self._event(f"Leg {leg.leg_number}: broker now confirms the {leg.side} position in {leg.contract.symbol}")
+                    self._persist_leg(leg)
+                continue                                    # broker agrees with the account-wide picture
+            if have * expect > 0:
+                leg.reconcile_miss = 0
+                self._event(f"Leg {leg.leg_number}: broker holds {abs(have):.0f} of the {abs(expect):.0f} units we expect in "
                             f"{leg.contract.symbol} ({where}) -- partial position, check the broker terminal", "warn")
                 continue
-            # the book LISTS the contract with a flat or opposite net: it really was closed elsewhere
-            ltp = self.store.ltp(leg.key) or leg.entry_price
-            leg.exit_price, leg.exit_ts, leg.exit_reason = round(ltp, 2), now_ist(), "closed_at_broker"
+            leg.reconcile_miss += 1
+            if others or leg.reconcile_miss < 2:
+                # one reading can be the book lagging a fill; and when another deployment holds the
+                # same contract we cannot tell whose position is gone -- never close on that
+                leg.error = (f"broker shows NO {leg.side} position in {leg.contract.symbol} ({where}, check {leg.reconcile_miss}; "
+                             f"broker row: {raw_rows.get(iid)}; we expect {expect:+.0f}) -- "
+                             f"{'shared with another deployment, ' if others else ''}leg left open, check the broker terminal")
+                self._event(f"Leg {leg.leg_number}: {leg.error}", "error")
+                self._persist_leg(leg)
+                continue
+            # the book LISTS the contract flat/opposite on two consecutive checks: it really was closed
+            # elsewhere -- the closing trade is in the broker's order book with its REAL price
+            trade = await self._closing_trade(leg)
+            if trade is not None:
+                leg.exit_price, leg.exit_ts = trade[0], trade[1]
+                how = f"closed at the broker @ {leg.exit_price} (order {trade[2]})"
+            else:
+                leg.exit_price, leg.exit_ts = round(self.store.ltp(leg.key) or leg.entry_price, 2), now_ist()
+                how = f"exit price not found in the order book -- LTP {leg.exit_price} used"
+            leg.exit_reason, leg.error = "closed_at_broker", None
             leg.pnl = round((leg.exit_price - leg.entry_price) * leg.direction * leg.qty, 2)
             leg.status = "closed"
             self.realised += leg.pnl
             if leg.key in self._by_key and leg in self._by_key[leg.key]:
                 self._by_key[leg.key].remove(leg)
             self._event(f"Leg {leg.leg_number}: broker shows NO {leg.side} position in {leg.contract.symbol} ({where}) -- "
-                        f"marked closed at LTP {leg.exit_price} (PnL approx {leg.pnl:+.2f}); verify in the broker terminal", "error")
+                        f"{how}, PnL {leg.pnl:+.2f}; monitoring of this leg stopped, verify in the broker terminal", "error")
             self._persist_leg(leg)
             self.db.submit(store.set_realised_pnl, self.id, self.realised)
+
+    async def _closing_trade(self, leg: LegState) -> tuple[float, datetime, str] | None:
+        """The trade that closed `leg` outside the worker: the latest FILLED order in the
+        same contract on the opposite side, after our entry, not tagged by this worker.
+        -> (average price, fill time, order id) or None."""
+        try:
+            rows = await self.broker.order_book()
+        except Exception as e:
+            self._event(f"Leg {leg.leg_number}: order book unavailable to find the closing trade ({e})", "warn")
+            return None
+        want_side, iid, best = _flip(leg.side), leg.contract.instrument_id, None
+        for r in rows or []:
+            try:
+                if int(r.get("ExchangeInstrumentID") or r.get("ExchangeInstrumentId")) != iid:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if str(r.get("OrderSide") or "").upper() != want_side or str(r.get("OrderStatus") or "") != "Filled":
+                continue
+            if str(r.get("OrderUniqueIdentifier") or "").startswith("D"):
+                continue                                     # one of ours: already booked by its own leg
+            ts = _xts_time(r.get("LastUpdateDateTime") or r.get("OrderGeneratedDateTime"))
+            if leg.entry_ts and ts and ts < leg.entry_ts:
+                continue
+            price = _num(r.get("OrderAverageTradedPrice"))
+            if price > 0 and (best is None or (ts or now_ist()) >= best[1]):
+                best = (round(price, 2), ts or now_ist(), str(r.get("AppOrderID")))
+        return best
 
     def _exit_failed(self, leg: LegState):
         """A rejected / unfilled exit leaves the leg open with its stop still
@@ -1888,6 +1973,19 @@ def _num(v) -> float:
         return float(v) if v not in (None, "", "NaN") else 0.0
     except (TypeError, ValueError):
         return 0.0
+
+
+def _xts_time(raw) -> datetime | None:
+    """XTS order rows carry IST wall-clock strings in a few layouts."""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    for fmt in ("%d-%m-%Y %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M:%S.%f"):
+        try:
+            return datetime.strptime(s[:26], fmt).replace(tzinfo=IST)
+        except ValueError:
+            continue
+    return None
 
 
 def _flip(side: str) -> str:
