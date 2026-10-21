@@ -406,9 +406,10 @@ def live_list_brokers(user=Depends(get_current_user)):
 
 @router.post("/live/brokers")
 def live_add_broker(request: dict, user=Depends(get_current_user)):
-    """{connection_name, interactive_key, interactive_secret, connection_url,
-        marketdata_key?, marketdata_secret?, marketdata_url?, host_lookup_url?,
-        host_lookup_password?, dealer_client_id?}"""
+    """Symphony (Open XTS) card: {connection_name, interactive_key, interactive_secret, connection_url,
+        marketdata_key?, marketdata_secret?, marketdata_url?, host_lookup_url?, host_lookup_password?, dealer_client_id?}
+    Arham Wealth COLO card: the same WITHOUT connection_url / host_lookup_url -- the server comes from
+        LIVE_COLO_CONNECTION_URL / LIVE_COLO_HOST_LOOKUP_URL in .env (stored as broker 'arham_colo')."""
     try:
         return {"status": True, "message": "Broker added.", "data": BrokerAccountService.add(user["user_id"], request)}
     except Exception as e:

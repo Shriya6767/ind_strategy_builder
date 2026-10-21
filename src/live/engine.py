@@ -22,7 +22,7 @@ from src.live.instrument_master import InstrumentMaster
 from src.live.broker_store import BrokerAccountService
 from src.live.runner import DeploymentRunner, TERMINAL_STATUSES
 from src.live.execution import ExecutionSettings
-from src.live.xts_client import SEG_BSECM, XTSError
+from src.live.xts_client import SEG_BSECM, XTSError, MARKETDATA_PATH
 from src.live.timeutil import today_ist, now_ist, parse_hms, secs_now, weekday_code, is_trading_day
 
 logger = get_logger(__name__)
@@ -58,7 +58,7 @@ class LiveEngine:
     async def start(self):
         if config.LIVE_FEED_APP_KEY and config.LIVE_FEED_SECRET and config.LIVE_FEED_ROOT:
             try:
-                await self._open_feed("platform", config.LIVE_FEED_ROOT, "", config.LIVE_FEED_APP_KEY, config.LIVE_FEED_SECRET)
+                await self._open_feed("platform", config.LIVE_FEED_ROOT, config.LIVE_FEED_APP_KEY, config.LIVE_FEED_SECRET)
             except Exception as e:
                 logger.error(f"[ENGINE] platform feed failed to start: {e}")
         if secs_now() >= parse_hms(config.LIVE_SESSION_RESET_TIME):
@@ -82,16 +82,13 @@ class LiveEngine:
         self.db.stop()
 
 
-    async def _open_feed(self, name: str, root: str, path: str, app_key: str, secret: str) -> XTSMarketFeed:
+    async def _open_feed(self, name: str, root: str, app_key: str, secret: str) -> XTSMarketFeed:
         feed = self.feeds.get(app_key)
         if feed is not None:
             return feed
-        if path:
-            origin, p = root, path
-        else:
-            from src.live.broker_store import _split_url
-            origin, p = _split_url(root, "/apimarketdata")
-        feed = XTSMarketFeed(origin, p, app_key, secret, self.store, config.LIVE_FEED_PUBLISH_FORMAT, name=name)
+        from src.live.broker_store import _split_url
+        origin, _ = _split_url(root, MARKETDATA_PATH)
+        feed = XTSMarketFeed(origin, MARKETDATA_PATH, app_key, secret, self.store, config.LIVE_FEED_PUBLISH_FORMAT, name=name)
         await feed.start()
         self.feeds[app_key] = feed
         if self.master is None or self.master.as_of != today_ist():
@@ -104,15 +101,16 @@ class LiveEngine:
 
 
     async def feed_for(self, broker_account_id: int | None) -> XTSMarketFeed:
-        if "platform" in [f.name for f in self.feeds.values()]:
+        creds = BrokerAccountService.get_credentials(broker_account_id) if broker_account_id else None
+        # a COLO account with its own market data keys reads prices from the COLO server itself
+        colo = bool(creds and creds["broker"] == "arham_colo" and creds.get("marketdata_key"))
+        if not colo and "platform" in [f.name for f in self.feeds.values()]:
             return next(f for f in self.feeds.values() if f.name == "platform")
         if broker_account_id is None:
             raise RuntimeError("No market data feed: set LIVE_FEED_* in .env or add market data keys to the broker account")
-        creds = BrokerAccountService.get_credentials(broker_account_id)
         if not creds or not creds.get("marketdata_key"):
             raise RuntimeError("Broker account has no market data API keys and no platform feed is configured")
-        return await self._open_feed(f"acct{broker_account_id}", creds["origin"], creds["marketdata_path"],
-                                     creds["marketdata_key"], creds["marketdata_secret"])
+        return await self._open_feed(f"acct{broker_account_id}", creds["origin"], creds["marketdata_key"], creds["marketdata_secret"])
 
 
     async def broker_for(self, dep: dict) -> Broker:

@@ -135,8 +135,9 @@ class TickStore:
                 self._close_candle(key, inst, c)
 
 
-# Binary 1501 packet decoder (doc: "Binary Marketdata Event")
-_HDR = struct.Struct("<bHhiHhHH")          # isGzip, msgCode, seg, instId, bookType, marketType, uncompressedSize, compressedSize
+# Binary 1501 packet decoder (doc: "Binary Marketdata Event"), layout verified against live
+# packets 2026-10-16: 16-byte header, a 2-byte compressedSize only when isGzip, payload raw-deflated.
+_HDR = struct.Struct("<bbHhiHhH")          # version, isGzip, msgCode, seg, instId, bookType, marketType, uncompressedSize
 
 
 # XTS 1.162 binary layout: prices are int32 scaled by the segment's divisor, sizes int64
@@ -145,21 +146,21 @@ _PRICE_DIVISOR = {1: 100, 11: 100, 2: 100, 12: 100, 51: 100, 3: 10_000_000, 13: 
 
 def decode_binary_touchline(data: bytes) -> tuple[Key, float, float | None, float | None] | None:
     """-> ((segment, instrument_id), ltp, bid, ask) for a 1501 packet, else None.
-    Layout per the Symphony change log 1.162 (sample decoder in the doc):
-    header, then messageVersion/applicationType/tokenID[/sequenceNumber/skipBytes],
-    segment, instrument, timestamp, bid row, ask row, lastUpdateTime, LTP.
-    Only used with LIVE_FEED_PUBLISH_FORMAT=Binary (JSON is the default)."""
+    Payload: messageCode/messageVersion/applicationType, tokenID, [sequenceNumber, skipBytes],
+    segment, instrument, exchangeTimestamp, bid row, ask row, lastUpdateTime (int64), LTP."""
     try:
-        is_gzip, msg, seg, inst_id, _bt, _mt, _usz, _csz = _HDR.unpack_from(data, 0)
-        payload = data[_HDR.size:]
+        _ver, is_gzip, msg, seg, inst_id, _bt, _mt, usz = _HDR.unpack_from(data, 0)
+        off = _HDR.size
         if is_gzip:
-            payload = zlib.decompressobj(-15).decompress(payload)
+            (csz,) = struct.unpack_from("<H", data, off); off += 2
+            payload = zlib.decompressobj(-15).decompress(data[off:off + csz])
+        else:
+            payload = data[off:off + usz]
         off = 0
         code, version, _app = struct.unpack_from("<HHH", payload, off); off += 6
         off += 8                                                     # tokenID uint64
         if version >= 4:
-            off += 8                                                 # sequenceNumber
-            off += 4                                                 # skipBytes
+            off += 12                                                # sequenceNumber + skipBytes
         if code != MSG_TOUCHLINE:
             return None
         seg2, inst2 = struct.unpack_from("<hi", payload, off); off += 6
@@ -167,7 +168,7 @@ def decode_binary_touchline(data: bytes) -> tuple[Key, float, float | None, floa
         div = _PRICE_DIVISOR.get(int(seg2 or seg), 1)
         _bs, bid_price, _bo, _bf = struct.unpack_from("<qiIh", payload, off); off += 18
         _as, ask_price, _ao, _af = struct.unpack_from("<qiIh", payload, off); off += 18
-        off += 8                                                     # LastUpdateTime
+        off += 8                                                     # LastUpdateTime int64
         (ltp,) = struct.unpack_from("<i", payload, off)
         return ((int(seg2 or seg), int(inst2 or inst_id)), ltp / div,
                 (bid_price / div) if bid_price else None, (ask_price / div) if ask_price else None)
@@ -192,8 +193,27 @@ class XTSMarketFeed:
         self._flush_task: asyncio.Task | None = None
         self._binary_warned = False
         self._relogin_at = 0.0
+        self._sub_batch = 50
 
     RELOGIN_EVERY_SECS = 60
+
+    async def _sub(self, chunk: list[Key], code: int) -> tuple[list[dict], int | None]:
+        """client.subscribe honoring the server's per-request instrument limit
+        (the COLO install accepts one instrument per subscription call)."""
+        if self._sub_batch == 1 and len(chunk) > 1:
+            quotes, remaining = [], None
+            for k in chunk:
+                q, remaining = await self.client.subscribe(self._instrument_bodies([k]), code)
+                quotes += q
+            return quotes, remaining
+        try:
+            return await self.client.subscribe(self._instrument_bodies(chunk), code)
+        except XTSError as e:
+            if len(chunk) > 1 and "instruments allowed per request" in str(e):
+                self._sub_batch = 1
+                logger.warning(f"[FEED:{self.name}] server allows one instrument per subscription request -- switching")
+                return await self._sub(chunk, code)
+            raise
 
     async def relogin(self, why: str) -> bool:
         """The market-data token died (the broker's daily session reset, or a
@@ -247,7 +267,7 @@ class XTSMarketFeed:
             self.store.update(key, ltp, None, bid, ask)
         elif not self._binary_warned:
             self._binary_warned = True
-            logger.warning(f"[FEED:{self.name}] could not decode a binary packet -- switch LIVE_FEED_PUBLISH_FORMAT=JSON")
+            logger.warning(f"[FEED:{self.name}] could not decode a binary packet (len={len(data)} head={bytes(data[:20]).hex()})")
 
 
     def _apply_touchline_json(self, data):
@@ -344,7 +364,7 @@ class XTSMarketFeed:
         for i in range(0, len(new), 50):                       # keep request bodies small
             chunk = new[i:i + 50]
             try:
-                quotes, remaining = await self.client.subscribe(self._instrument_bodies(chunk), code)
+                quotes, remaining = await self._sub(chunk, code)
             except XTSError as e:
                 for k in chunk:
                     self._refs.pop(k, None)
@@ -384,7 +404,7 @@ class XTSMarketFeed:
             for i in range(0, len(ks), 50):
                 chunk = ks[i:i + 50]
                 try:
-                    quotes, remaining = await self.client.subscribe(self._instrument_bodies(chunk), code)
+                    quotes, remaining = await self._sub(chunk, code)
                     self._apply_snapshot(quotes)
                     self.remaining_subscriptions = remaining
                 except XTSError as e:

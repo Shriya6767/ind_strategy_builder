@@ -27,7 +27,7 @@ from src.live.feed import TickStore, XTSMarketFeed
 from src.live.instrument_master import InstrumentMaster
 from src.live.strike_resolver import ladder_atm
 from src.live.timeutil import today_ist, now_ist
-from src.live.xts_client import SEG_BSECM, SEG_BSEFO, XTSError
+from src.live.xts_client import SEG_BSECM, SEG_BSEFO, XTSError, MARKETDATA_PATH
 
 
 def ok(msg):
@@ -42,7 +42,8 @@ def fail(msg):
 async def main(seconds: int):
     if not (config.LIVE_FEED_ROOT and config.LIVE_FEED_APP_KEY and config.LIVE_FEED_SECRET):
         fail("LIVE_FEED_ROOT / LIVE_FEED_APP_KEY / LIVE_FEED_SECRET are not all set in .env")
-    origin, path = _split_url(config.LIVE_FEED_ROOT, "/apimarketdata")
+    origin, _ = _split_url(config.LIVE_FEED_ROOT, MARKETDATA_PATH)
+    path = MARKETDATA_PATH
     print(f"Market data server: {origin}{path}   ({now_ist():%Y-%m-%d %H:%M:%S} IST)")
 
     store = TickStore()

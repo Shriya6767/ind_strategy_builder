@@ -454,8 +454,13 @@ class XTSInteractiveStream:
 
 
 # Market data API
+# The binary market data API is the only one we use (both XTS servers): REST replies are
+# JSON, the socket streams `xts-binary-packet` frames whatever publishFormat is requested.
+MARKETDATA_PATH = "/apibinarymarketdata"
+
+
 class XTSMarketDataClient(_BaseClient):
-    def __init__(self, origin: str, path: str = "/apimarketdata", timeout: float = 20.0):
+    def __init__(self, origin: str, path: str = MARKETDATA_PATH, timeout: float = 20.0):
         super().__init__(origin, path, timeout)
 
 

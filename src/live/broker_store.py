@@ -7,10 +7,10 @@ app key, so a second login from the API would kick the worker's feed).
 """
 from src.core.modules import RealDictCursor, datetime, timedelta
 from urllib.parse import urlparse
-from src.core.config import Database, LIVE_SESSION_RESET_TIME
+from src.core.config import Database, LIVE_SESSION_RESET_TIME, LIVE_COLO_CONNECTION_URL, LIVE_COLO_HOST_LOOKUP_URL
 from src.core.logger import get_logger
 from src.live import crypto
-from src.live.xts_client import XTSInteractiveClient, XTSError
+from src.live.xts_client import XTSInteractiveClient, XTSError, MARKETDATA_PATH
 from src.live.timeutil import now_ist, to_naive_ist, parse_hms
 
 logger = get_logger(__name__)
@@ -35,19 +35,31 @@ def _split_url(raw: str, default_path: str) -> tuple[str, str]:
     return origin, (path if path and path != "/" else default_path)
 
 
+def _colo_urls() -> tuple[str, str, str | None]:
+    """(origin, interactive_path, host_lookup_url) of our Arham Wealth COLO server from .env."""
+    if not LIVE_COLO_CONNECTION_URL:
+        raise ValueError("Arham Wealth COLO server is not configured (LIVE_COLO_CONNECTION_URL in .env)")
+    origin, path = _split_url(LIVE_COLO_CONNECTION_URL, "/interactive")
+    return origin, path, (LIVE_COLO_HOST_LOOKUP_URL or "").strip() or None
+
+
 class BrokerAccountService:
-    REQUIRED = ("connection_name", "interactive_key", "interactive_secret", "connection_url")
+    REQUIRED = ("connection_name", "interactive_key", "interactive_secret")
 
     @staticmethod
     def add(user_id: int, payload: dict) -> dict:
         missing = [k for k in BrokerAccountService.REQUIRED if not str(payload.get(k) or "").strip()]
         if missing:
             raise ValueError(f"Missing: {', '.join(missing)}")
-        origin, interactive_path = _split_url(payload["connection_url"], "/interactive")
-        md_path = "/apimarketdata"
-        if payload.get("marketdata_url"):
-            _, md_path = _split_url(payload["marketdata_url"], md_path)
-        host_lookup_url = (payload.get("host_lookup_url") or "").strip() or None
+        # no connection_url = the Arham Wealth COLO card: the server is ours and comes from .env
+        if str(payload.get("connection_url") or "").strip():
+            broker = "open_xts"
+            origin, interactive_path = _split_url(payload["connection_url"], "/interactive")
+            host_lookup_url = (payload.get("host_lookup_url") or "").strip() or None
+        else:
+            broker = "arham_colo"
+            origin, interactive_path, host_lookup_url = _colo_urls()
+        md_path = MARKETDATA_PATH
         conn = Database.get_connection()
         try:
             cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -55,9 +67,9 @@ class BrokerAccountService:
                 INSERT INTO broker_account (user_id, broker, connection_name, interactive_key_enc, interactive_secret_enc,
                     marketdata_key_enc, marketdata_secret_enc, connection_url, host_lookup_url, host_lookup_password_enc,
                     interactive_path, marketdata_path, dealer_client_id)
-                VALUES (%s, 'open_xts', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING broker_account_id
-            """, (user_id, str(payload["connection_name"]).strip()[:100],
+            """, (user_id, broker, str(payload["connection_name"]).strip()[:100],
                   crypto.encrypt(str(payload["interactive_key"]).strip()),
                   crypto.encrypt(str(payload["interactive_secret"]).strip()),
                   crypto.encrypt((payload.get("marketdata_key") or "").strip() or None),
@@ -76,7 +88,17 @@ class BrokerAccountService:
 
 
     @staticmethod
+    def _row_urls(row: dict) -> tuple[str, str, str | None]:
+        """(origin, interactive_path, host_lookup_url): the stored values for Open XTS,
+        the current .env values for a COLO account (so a URL/port change needs no re-registration)."""
+        if row["broker"] == "arham_colo" and LIVE_COLO_CONNECTION_URL:
+            return _colo_urls()
+        return row["connection_url"], row["interactive_path"], row.get("host_lookup_url")
+
+
+    @staticmethod
     def _public_view(row: dict) -> dict:
+        origin, interactive_path, host_lookup_url = BrokerAccountService._row_urls(row)
         sess = {
             "logged_in": bool(row.get("interactive_token_enc")) and row.get("expires_at") is not None
                          and row["expires_at"] > to_naive_ist(now_ist()),
@@ -90,9 +112,9 @@ class BrokerAccountService:
             "broker_account_id": row["broker_account_id"],
             "broker": row["broker"],
             "connection_name": row["connection_name"],
-            "connection_url": row["connection_url"],
-            "interactive_path": row["interactive_path"],
-            "host_lookup_url": row.get("host_lookup_url"),
+            "connection_url": origin,
+            "interactive_path": interactive_path,
+            "host_lookup_url": host_lookup_url,
             "interactive_key_masked": crypto.mask(crypto.decrypt(row["interactive_key_enc"])),
             "has_marketdata_keys": bool(row.get("marketdata_key_enc")),
             "dealer_client_id": row.get("dealer_client_id"),
@@ -171,18 +193,20 @@ class BrokerAccountService:
         row = BrokerAccountService._row(broker_account_id, user_id)
         if not row:
             return None
+        origin, interactive_path, host_lookup_url = BrokerAccountService._row_urls(row)
         return {
             "broker_account_id": row["broker_account_id"],
             "user_id": row["user_id"],
+            "broker": row["broker"],
             "connection_name": row["connection_name"],
-            "origin": row["connection_url"],
-            "interactive_path": row["interactive_path"],
+            "origin": origin,
+            "interactive_path": interactive_path,
             "marketdata_path": row["marketdata_path"],
             "interactive_key": crypto.decrypt(row["interactive_key_enc"]),
             "interactive_secret": crypto.decrypt(row["interactive_secret_enc"]),
             "marketdata_key": crypto.decrypt(row.get("marketdata_key_enc")),
             "marketdata_secret": crypto.decrypt(row.get("marketdata_secret_enc")),
-            "host_lookup_url": row.get("host_lookup_url"),
+            "host_lookup_url": host_lookup_url,
             "host_lookup_password": crypto.decrypt(row.get("host_lookup_password_enc")),
             "dealer_client_id": row.get("dealer_client_id"),
         }

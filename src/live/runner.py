@@ -1321,7 +1321,7 @@ class DeploymentRunner:
         else:
             upd = await self.broker.wait_terminal(app_id, self.settings.order_timeout_sec)
         if (upd is None or upd.status != "Filled") and self.settings.exit_fallback_market:
-            self._event(f"Leg {leg.leg_number}: exit limit not filled -- re-pricing as MPP", "warn")
+            self._event(f"Leg {leg.leg_number}: exit limit {_order_outcome(upd)} -- re-pricing as MPP", "warn")
             try:
                 if upd is None:
                     await self._modify_to_mpp(leg, app_id, payload)
@@ -1346,8 +1346,8 @@ class DeploymentRunner:
                            price=price, status=upd.status, filled_qty=upd.filled_qty, avg_price=upd.avg_price,
                            reason=upd.reason, payload=upd.raw)
         if upd is None or upd.status != "Filled":
-            leg.status, leg.error = "open", "exit not filled"
-            self._event(f"Leg {leg.leg_number}: EXIT NOT FILLED -- position still open, square off manually", "error")
+            leg.status, leg.error = "open", f"exit {_order_outcome(upd)}"
+            self._event(f"Leg {leg.leg_number}: EXIT {_order_outcome(upd).upper()} -- position still open, square off manually", "error")
             self._exit_failed(leg)
             self._persist_leg(leg)
             return
@@ -1932,6 +1932,10 @@ class DeploymentRunner:
         self.engine.notify(self)
 
     def _finish(self, status: str, reason: str | None):
+        # a square-off that left a position at the broker is not "squared off"
+        stuck = [l.leg_number for l in self.legs if l.status in ("open", "exiting")]
+        if status == "squared_off" and stuck:
+            status, reason = "error", f"{reason}: leg(s) {', '.join(map(str, stuck))} still open at the {self.venue}"
         self._disarm()
         self._set_status(status, reason)
         self.db.submit(store.set_realised_pnl, self.id, self.realised)
@@ -2015,6 +2019,13 @@ def _order_failure(what: str, e: XTSError) -> str:
             return f"{what} order not sent -- could not reach the broker ({e.kind})"
         return f"{what} order status unknown -- no reply from the broker ({e.kind}) and not in the order book"
     return f"{what} order rejected by broker -- {e}"
+
+
+def _order_outcome(upd) -> str:
+    """'not filled' for a timeout, else the broker's terminal status and its reason."""
+    if upd is None or upd.status == "Filled":
+        return "not filled"
+    return f"{upd.status.lower()} by broker -- {upd.reason or 'no reason given'}"
 
 
 def positional_cycle(master, strategy: dict, exit_secs: int, entry_date: date | None = None,

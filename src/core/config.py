@@ -65,6 +65,9 @@ LIVE_FEED_APP_KEY: str | None = os.getenv("LIVE_FEED_APP_KEY") or None
 LIVE_FEED_SECRET: str | None = os.getenv("LIVE_FEED_SECRET") or None
 LIVE_FEED_PUBLISH_FORMAT: str = (os.getenv("LIVE_FEED_PUBLISH_FORMAT") or "JSON").strip()   # JSON | Binary
 
+LIVE_COLO_CONNECTION_URL: str | None = os.getenv("LIVE_COLO_CONNECTION_URL") or None
+LIVE_COLO_HOST_LOOKUP_URL: str | None = os.getenv("LIVE_COLO_HOST_LOOKUP_URL") or None
+
 LIVE_SENSEX_INDEX_ID: int = _int("LIVE_SENSEX_INDEX_ID", 0)
 
 LIVE_ORDER_QTY_IN_LOTS: bool = _bool("LIVE_ORDER_QTY_IN_LOTS", False)
