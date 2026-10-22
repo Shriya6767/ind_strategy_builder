@@ -14,6 +14,13 @@ from src.live.timeutil import now_ist, to_naive_ist
 logger = get_logger(__name__)
 
 ACTIVE_STATUSES = ("scheduled", "running", "paused")
+# status_reason suffix of a RECOVERABLE error (AlgoTest's Error state): the worker keeps the
+# runner, the open legs stay monitored and Resume retries the failed leg(s)
+RESUME_HINT = "-- click Resume to retry"
+
+
+def is_resumable(dep: dict) -> bool:
+    return dep.get("status") == "error" and str(dep.get("status_reason") or "").endswith(RESUME_HINT)
 
 
 def _run(fn):
@@ -154,7 +161,9 @@ def active_deployments_of(user_id: int, strategy_id: int) -> list[dict]:
 def list_active_deployments() -> list[dict]:
     """Everything the worker must (re)start: today's + BTST holds exiting today."""
     def q(cur):
-        cur.execute("SELECT * FROM live_deployment WHERE status IN %s ORDER BY deployment_id", (ACTIVE_STATUSES,))
+        cur.execute("""SELECT * FROM live_deployment WHERE status IN %s
+                       OR (status = 'error' AND status_reason LIKE %s) ORDER BY deployment_id""",
+                    (ACTIVE_STATUSES, "%" + RESUME_HINT))
         return cur.fetchall()
     return _run(q)
 

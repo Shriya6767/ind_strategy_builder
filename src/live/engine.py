@@ -168,7 +168,7 @@ class LiveEngine:
             dep = store.get_deployment(deployment_id)
             if not dep:
                 raise LookupError("Deployment not found")
-            if dep["status"] in TERMINAL_STATUSES:
+            if dep["status"] in TERMINAL_STATUSES and not store.is_resumable(dep):
                 raise ValueError(f"Deployment is {dep['status']}")
             try:
                 feed = await self.feed_for(dep.get("broker_account_id"))
@@ -200,7 +200,7 @@ class LiveEngine:
             dep = store.get_deployment(deployment_id)
             if not dep:
                 raise LookupError("Deployment not found")
-            if dep["status"] in ("scheduled", "running", "paused"):
+            if dep["status"] in ("scheduled", "running", "paused") or store.is_resumable(dep):
                 runner = self.runners.get((await self.activate(deployment_id, restore=True))["deployment_id"])
             else:
                 raise ValueError(f"Deployment is {dep['status']}")

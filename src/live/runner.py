@@ -33,6 +33,7 @@ from src.core import config
 from src.core.constant import QUANTITY, COST_BUFFER_PCT
 from src.core.logger import get_logger
 from src.live import deployment_store as store
+from src.live.deployment_store import RESUME_HINT, is_resumable
 from src.live.execution import (
     ExecutionSettings, LegExecution, limit_price, order_limit_price, mpp_price, round_tick, stop_limit_prices,
 )
@@ -53,6 +54,7 @@ OVERNIGHT_REASON = "market closed -- restart before 09:15"
 RESTART_REASON = "restart scheduled at "
 RESTART_EARLIEST_SECS = MARKET_OPEN_SECS + 5 
 TERMINAL_STATUSES = ("squared_off", "completed", "error", "cancelled", "manual")
+MARGIN_ERROR_MARKERS = ("margin", "insufficient", "fund")     # broker rejection texts that mean a margin shortfall
 PREMIUM_TYPES = ("POINTS", "PERCENT")
 UNDERLYING_TYPES = ("UNDERLYING_POINTS", "UNDERLYING_PERCENT")
 OPEN_STATUSES = ("open", "exiting")
@@ -215,6 +217,10 @@ class DeploymentRunner:
         self.overnight_paused = (self.status == "paused" and reason.startswith(OVERNIGHT_REASON)) \
             or (self.status == "scheduled" and reason.startswith(RESTART_REASON))
         self.paused = self.status == "paused" or self.overnight_paused
+        # recoverable error (AlgoTest's Error state): a later attempt (re-entry / lazy leg /
+        # a wait that fired) failed; the open legs keep running, Resume retries the failed ones
+        self.halted = is_resumable(dep)
+        self.failed_legs: list[LegState] = []
         self.last_unpaused: datetime | None = None
         self.legs: list[LegState] = []
         self._by_key: dict[Key, list[LegState]] = {}      # open legs by contract key
@@ -249,6 +255,9 @@ class DeploymentRunner:
         self._event("Paused: no new entries or exits until resumed")
 
     async def resume(self, restart_at: int | None = None):
+        if self.halted:
+            await self._resume_failed()
+            return
         if self.status not in ("paused", "scheduled") or not self.paused:
             return
         if not self.overnight_paused:
@@ -319,14 +328,14 @@ class DeploymentRunner:
 
     async def squareoff(self, reason: str = "manual"):
         await self._squareoff_all(reason)
-        if self.status not in TERMINAL_STATUSES:
+        if self.active:
             self._finish("squared_off", reason)
 
     async def switch_to_manual(self, reason: str = "manual", status: str = "manual"):
         """AlgoTest 'Switch to Manual': disconnect the strategy. Open positions stay at the
         broker for the user to manage; our resting / pending orders are cancelled and no
         further orders are generated."""
-        if self.status in TERMINAL_STATUSES:
+        if not self.active:
             return
         self._squaring = True
         for leg in self.legs:
@@ -376,7 +385,7 @@ class DeploymentRunner:
 
     @property
     def active(self) -> bool:
-        return self.status not in TERMINAL_STATUSES
+        return self.status not in TERMINAL_STATUSES or self.halted
 
     def unrealised(self) -> float:
         return sum(leg.unrealised(self.store.ltp(leg.key)) for leg in self.legs if leg.key and leg.is_open)
@@ -402,6 +411,7 @@ class DeploymentRunner:
             "deployment_id": self.id, "user_id": self.user_id, "strategy_id": self.dep["strategy_id"],
             "strategy_name": self.dep.get("strategy_name"), "version": self.dep["version"], "mode": self.mode,
             "strategy_type": self.strategy_type, "status": self.status, "status_reason": self.status_reason,
+            "resumable": self.halted,
             "trade_date": str(self.trade_date), "exit_date": str(self.exit_date),
             "cycle_expiry": str(self.cycle_expiry) if self.cycle_expiry else None,
             "entry_time": hms(self.entry_secs), "exit_time": hms(self.exit_secs),
@@ -659,17 +669,61 @@ class DeploymentRunner:
     async def _after_entries(self, batch: list[LegState]):
         failed = [l for l in batch if l.status == "error"]
         filled = [l for l in batch if l.is_open]
-        if failed and self.settings.squareoff_on_entry_error and (filled or self._any_open()):
-            self._event(f"{len(failed)} leg(s) failed to enter -- squaring off the filled leg(s)", "error")
-            await self._squareoff_all("entry_error")
-            self._finish("error", f"leg(s) {', '.join(str(l.leg_number) for l in failed)} failed to enter")
+        if not failed:
+            self._recompute_overall()
             return
-        if failed and not filled and not self._any_open() and not self._waiting:
+        margin = [l for l in failed if any(m in str(l.error or "").lower() for m in MARGIN_ERROR_MARKERS)]
+        initial = [l for l in failed if l.entry_mode in ("ENTRY", "SEQUENTIAL") or l.entry_mode.startswith("OVERALL_")]
+        nums = ", ".join(str(l.leg_number) for l in failed)
+        # the whole strategy is squared off only for a MARGIN error, or when the strategy's own
+        # entry (not a later re-entry) failed and "square off on entry error" is on
+        if (margin or (initial and self.settings.squareoff_on_entry_error)) and (filled or self._any_open()):
+            why = "margin error" if margin else "failed to enter"
+            self._event(f"Leg(s) {nums} {why} -- squaring off the filled leg(s)", "error")
+            await self._squareoff_all("entry_error")
+            self._finish("error", f"leg(s) {nums} {why}: {failed[0].error}")
+            return
+        if initial and not filled and not self._any_open() and not self._waiting:
             self._finish("error", f"no leg could enter: {failed[0].error}")
             return
-        if failed:
-            self._set_status("running", f"{len(failed)} leg(s) failed to enter")
+        self._halt(failed)
         self._recompute_overall()
+
+    def _halt(self, failed: list[LegState]):
+        """AlgoTest's Error state for a failed later attempt (re-entry, lazy leg, a wait that
+        fired while in error): the open legs keep their stop / target / trailing monitoring, no
+        new entry is fired, and Resume retries exactly these legs."""
+        for l in failed:
+            if l not in self.failed_legs:
+                self.failed_legs.append(l)
+        self.halted = True
+        nums = ", ".join(str(l.leg_number) for l in self.failed_legs)
+        self._set_status("error", f"leg(s) {nums} entry failed: {failed[-1].error} {RESUME_HINT}")
+        self._event(f"Leg(s) {nums} entry failed -- the other legs continue; Resume retries the failed leg(s)", "error")
+
+    async def _resume_failed(self):
+        """Resume on a strategy in error (AlgoTest): the failed legs are retried at the
+        price available now -- their condition was already met when they failed -- and
+        monitoring continues; after the exit time Resume acts as Square Off."""
+        if now_ist() >= self.exit_dt:
+            await self.squareoff("resume after exit time")
+            return
+        retry, self.failed_legs, self.halted = self.failed_legs, [], False
+        self._set_status("running", None)
+        self._event(f"Resumed -- retrying leg(s) {', '.join(str(l.leg_number) for l in retry)}")
+        legs = []
+        for old in retry:
+            new = LegState(old.leg_number, old.meta, self._next_attempt(old.leg_number), old.side, entry_mode="RESUME")
+            new.trade_id, new.reentry_sl_left, new.reentry_tgt_left = old.trade_id, old.reentry_sl_left, old.reentry_tgt_left
+            self.legs.append(new)
+            legs.append(new)
+            try:
+                await self._resolve_contract(new)
+            except Exception as e:
+                new.status, new.error = "error", str(e)
+                self._event(f"Leg {new.leg_number}: cannot resolve contract -- {e}", "error")
+        await self._place_entries([l for l in legs if l.status != "error"])
+        await self._after_entries(legs)
 
     def _any_open(self) -> bool:
         return any(l.is_open for l in self.legs)
@@ -686,6 +740,11 @@ class DeploymentRunner:
             await asyncio.sleep(ls.delay_entry_sec)       # "Delay entry by", per leg
         if self._squaring or now_ist() >= self.exit_dt:
             leg.status, leg.error = "skipped", "exit time reached before entry"
+            return
+        if self.halted and leg.entry_mode != "RESUME":          # AlgoTest: no leg is fired while in error
+            leg.status, leg.error = "error", "strategy in error -- not fired; Resume retries it"
+            leg.live_leg_id = await asyncio.to_thread(store.insert_leg, self._leg_row(leg))
+            self._event(f"Leg {leg.leg_number}: {leg.error}", "warn")
             return
         ltp = self.store.ltp(leg.key)
         if not ltp:
@@ -1496,7 +1555,7 @@ class DeploymentRunner:
         m = leg.meta
         mode = str(m.get("reentry_sl_type" if reason == "stoploss" else "reentry_target_type") or "").upper()
         left = leg.reentry_sl_left if reason == "stoploss" else leg.reentry_tgt_left
-        if left <= 0 or not mode or self.paused or self._squaring \
+        if left <= 0 or not mode or self.paused or self._squaring or self.halted \
                 or now_ist() >= self.exit_dt - timedelta(seconds=self.REENTRY_CUTOFF_SECS):
             return
         sl_left = leg.reentry_sl_left - (1 if reason == "stoploss" else 0)
@@ -1555,7 +1614,7 @@ class DeploymentRunner:
                 if leg.status == "open":
                     self._warn_if_stale(leg, "monitoring")
             pending = any(l.status in PENDING_STATUSES or l.is_open for l in self.legs)
-            if not pending and not self._entering and self.legs and self._overall_reentry_left == 0:
+            if not pending and not self._entering and not self.halted and self.legs and self._overall_reentry_left == 0:
                 self._finish("completed", "all legs closed")
                 break
             await asyncio.sleep(min(1.0, max(0.05, (self.exit_dt - now).total_seconds())))
@@ -1690,7 +1749,12 @@ class DeploymentRunner:
             await self._spot()
         await self._reconcile_with_broker("restore")   # the broker's book is the truth after a restart
         await self._restore_waits()
-        if self.status == "paused":
+        if self.halted:                                   # error state survives a worker restart
+            latest = {l.leg_number: l for l in self.legs if l.kind == "trade"}
+            self.failed_legs = [l for l in latest.values() if l.status == "error"]
+            self._event(f"Restored in error state -- leg(s) {', '.join(str(l.leg_number) for l in self.failed_legs)} "
+                        f"await Resume; the open legs are monitored", "warn")
+        elif self.status == "paused":
             self.paused = True
         elif self.status == "scheduled" and self.overnight_paused:      # a restart scheduled before the worker died
             when = datetime.strptime(self.status_reason[len(RESTART_REASON):], "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
@@ -1916,8 +1980,9 @@ class DeploymentRunner:
         warned[leg.key] = now
         index_age = self.store.age(self.engine.index_key) if self.engine.index_key else float("inf")
         symbol = getattr(leg.contract, "symbol", leg.key)
-        self._event(f"Leg {leg.leg_number}: LTP {self.store.ltp(leg.key)} of {symbol} is {age:.0f}s old and not updated "
-                    f"({where}); SENSEX tick is {index_age:.0f}s old", "warn")
+        # log only -- never an event for the frontend (a quiet strike is normal; the index age tells a dead feed apart)
+        logger.warning(f"[RUN {self.id}] Leg {leg.leg_number}: LTP {self.store.ltp(leg.key)} of {symbol} is {age:.0f}s old "
+                       f"and not updated ({where}); SENSEX tick is {index_age:.0f}s old")
 
     def _spawn(self, coro):
         t = asyncio.get_running_loop().create_task(coro)
@@ -1936,6 +2001,7 @@ class DeploymentRunner:
         stuck = [l.leg_number for l in self.legs if l.status in ("open", "exiting")]
         if status == "squared_off" and stuck:
             status, reason = "error", f"{reason}: leg(s) {', '.join(map(str, stuck))} still open at the {self.venue}"
+        self.halted = False
         self._disarm()
         self._set_status(status, reason)
         self.db.submit(store.set_realised_pnl, self.id, self.realised)

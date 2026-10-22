@@ -35,7 +35,7 @@ class LegExecution:
     product: str = "NRML"                    # NRML | MIS
     tgt_sl_ref_price: str = "TRADED"         # TRADED | TRIGGER
     delay_entry_sec: int = 0
-    entry_order_type: str = "LIMIT"          # LIMIT | MPP
+    entry_order_type: str = "MPP"            # LIMIT | MPP (AlgoTest's default entry is Market = our MPP)
     exit_order_type: str = "LIMIT"
     entry_buffer_type: str = "POINTS"        # POINTS | PERCENT
     exit_buffer_type: str = "POINTS"

@@ -314,7 +314,8 @@ class LiveTradeService:
         dep = store.get_deployment(deployment_id, user_id)
         if not dep:
             raise LookupError("Deployment not found")
-        if dep["status"] in ("squared_off", "completed", "error", "cancelled", "manual") and cmd != "activate":
+        if dep["status"] in ("squared_off", "completed", "error", "cancelled", "manual") and cmd != "activate" \
+                and not store.is_resumable(dep):
             raise LiveValidationError(f"Deployment is already {dep['status']}")
         if cmd == "cancel" and dep["status"] not in ("scheduled", "paused"):
             raise LiveValidationError("Cancel Deployment is only available while scheduled or paused -- use Square Off or Switch to Manual")
@@ -404,6 +405,7 @@ def _row_public(r: dict) -> dict:
         "deployment_id": r["deployment_id"], "strategy_id": r["strategy_id"], "strategy_name": r.get("strategy_name"),
         "version": r["version"], "broker_account_id": r.get("broker_account_id"), "mode": r["mode"],
         "trade_date": str(r["trade_date"]), "exit_date": str(r["exit_date"]), "status": r["status"],
-        "status_reason": r.get("status_reason"), "realised_pnl": float(r.get("realised_pnl") or 0),
+        "status_reason": r.get("status_reason"), "resumable": store.is_resumable(r),
+        "realised_pnl": float(r.get("realised_pnl") or 0),
         "is_archived": r.get("is_archived", False), "created_at": str(r["created_at"]), "updated_at": str(r["updated_at"]),
     }
