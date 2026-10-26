@@ -1586,6 +1586,7 @@ class DeploymentRunner:
         except Exception as e:
             new.status, new.error = "error", str(e)
             self._event(f"Leg {leg.leg_number}: re-entry cannot resolve contract -- {e}", "error")
+            await self._after_entries([new])                # a failed re-entry = error state with Resume
             return
         if mode.startswith("RE_MOMENTUM") or mode == "LAZY_LEG":
             if self._arm_condition(new, new.meta, momentum_only=True):
