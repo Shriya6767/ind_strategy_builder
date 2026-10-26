@@ -598,6 +598,11 @@ class DeploymentRunner:
         if len(keys) > 1:
             await self.feed.subscribe([leg.key])
         self._subscribed.add(leg.key)
+        # the binary market data API's subscription ack carries no quote: fetch the LTP once
+        # over REST so momentum / range legs have their base price (entries fall back to it too)
+        if self.store.ltp(leg.key) is None:
+            await self.feed.snapshot([leg.key])
+        quotes[strike] = self.store.ltp(leg.key)
         lot_units = contract.lot_size or self.master.lot_size or QUANTITY
         leg.qty = leg.lots * self.settings.qty_multiplier * (1 if config.LIVE_ORDER_QTY_IN_LOTS else lot_units)
         if contract.freeze_qty and not config.LIVE_ORDER_QTY_IN_LOTS and leg.qty > contract.freeze_qty:
