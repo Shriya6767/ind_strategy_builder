@@ -1,6 +1,7 @@
 from psycopg2.extras import Json
 from src.core.config import Database
 from src.core.logger import get_logger
+from src.services.backtesting.portfolio_risk import normalize_portfolio_risk, RISK_FIELDS
 
 logger = get_logger(__name__)
 
@@ -24,6 +25,10 @@ class SavePortfolioService:
             qty_multiplier = SavePortfolioService._int(request.get("qty_multiplier"), 1, "qty_multiplier")
             period_selection = SavePortfolioService._normalize_period_selection(request.get("period_selection"), "portfolio")
             slippage = SavePortfolioService._float(request.get("slippage"), 0.0, "slippage")
+            # Portfolio-level overall SL/target (validated the same way the
+            # run request is -- see portfolio_risk.normalize_portfolio_risk).
+            risk = normalize_portfolio_risk(request)
+            risk_values = tuple(risk[f] for f in RISK_FIELDS)
 
             normalized_strategies = SavePortfolioService._normalize_strategies(strategies)
 
@@ -53,12 +58,17 @@ class SavePortfolioService:
                 cursor.execute(
                     """
                     INSERT INTO portfolio (portfolio_id, portfolio_name, strategies, user_id,
-                                           index_name, qty_multiplier, period_selection, slippage)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                           index_name, qty_multiplier, period_selection, slippage,
+                                           is_portfolio_sl, portfolio_sl_type,
+                                           portfolio_sl_mtm_value, portfolio_sl_percent_value,
+                                           is_portfolio_target, portfolio_target_type,
+                                           portfolio_target_mtm_value, portfolio_target_percent_value)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id;
                     """,
                     (portfolio_id, portfolio_name, Json(normalized_strategies), user_id,
-                     index_name, qty_multiplier, Json(period_selection) if period_selection is not None else None, slippage),
+                     index_name, qty_multiplier, Json(period_selection) if period_selection is not None else None, slippage,
+                     *risk_values),
                 )
                 message = f"Portfolio created successfully."
             else:
@@ -71,12 +81,21 @@ class SavePortfolioService:
                         qty_multiplier = %s,
                         period_selection = %s,
                         slippage = %s,
+                        is_portfolio_sl = %s,
+                        portfolio_sl_type = %s,
+                        portfolio_sl_mtm_value = %s,
+                        portfolio_sl_percent_value = %s,
+                        is_portfolio_target = %s,
+                        portfolio_target_type = %s,
+                        portfolio_target_mtm_value = %s,
+                        portfolio_target_percent_value = %s,
                         updated_at = NOW()
                     WHERE portfolio_id = %s AND user_id = %s
                     RETURNING id;
                     """,
                     (portfolio_name, Json(normalized_strategies), index_name, qty_multiplier,
                      Json(period_selection) if period_selection is not None else None, slippage,
+                     *risk_values,
                      portfolio_id, user_id),
                 )
                 message = f"Portfolio updated."

@@ -9,6 +9,7 @@ from src.services.backtesting.backtest_engine import BacktestEngine
 from src.services.backtesting.load_data import DataLoader
 from src.services.backtesting.report_builder import BacktestReportBuilder
 from src.services.backtesting.portfolio_report_builder import PortfolioReportBuilder
+from src.services.backtesting.portfolio_risk import PortfolioRisk, normalize_portfolio_risk
 from src.services.backtesting.slippage_service import SlippageService
 from src.services.get_strategy import GetStrategyService
 
@@ -73,6 +74,9 @@ class PortfolioBacktestService:
 
         overrides = request.get("strategy_overrides")
         self._validate(overrides)
+        # Portfolio-level overall SL/target, validated before any strategy
+        # runs so a bad request fails fast (same fields the save API stores).
+        risk = PortfolioRisk(normalize_portfolio_risk(request))
 
         strategies = self._expand_strategies(overrides, start_date, end_date, user_id)
 
@@ -83,6 +87,19 @@ class PortfolioBacktestService:
         if failures:
             raise RuntimeError(f"Portfolio backtest failed for strategies: {failures}")
 
+        # Judged on the combined MTM of EVERY strategy, day by day, after the
+        # strategies have run on their own; squares the whole portfolio off
+        # at the breach candle. Per-strategy summaries are rebuilt from the
+        # same executed-leg rows only when it actually fired (the report
+        # builder skips days with no executed leg, so a rebuild on an
+        # untouched strategy reproduces its original numbers anyway).
+        portfolio_exits = risk.apply(reduced_by_id, df) if risk.enabled else []
+        if portfolio_exits:
+            for sid, blocks in reduced_by_id.items():
+                payloads_by_id[sid].update(
+                    BacktestReportBuilder(blocks, period=(start_date, end_date)).build()
+                )
+
         merged_trade_results = PortfolioReportBuilder.merge_trade_results(reduced_by_id)
         aggregate_report = BacktestReportBuilder(merged_trade_results).build()
         # Response order follows the request's strategy_overrides order.
@@ -92,6 +109,7 @@ class PortfolioBacktestService:
             "aggregate": aggregate_report,
             "trade_results": merged_trade_results,
             "strategies": strategy_payloads,
+            "portfolio_exits": portfolio_exits,
         }
 
 
