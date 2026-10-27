@@ -63,6 +63,9 @@ class BacktestEngine:
     # premium-based strike criteria. See _recently_priced.
     PREMIUM_MAX_PRICE_AGE_MINUTES = 15
 
+    PREMIUM_MATCH_TOLERANCE = 0.30
+    PREMIUM_MATCH_WAIT_MINUTES = 60
+
     # Sensex options quote in 5-paisa ticks.
     TICK_SIZE = 0.05
 
@@ -139,6 +142,7 @@ class BacktestEngine:
         self._next_day = None            # (date, frame) of the day after the one being processed
         self._day_expiry_map = {}  # expiry_type label -> expiry date, rebuilt per trading day
         self._snapshot_day_df = None     # frame the current chain snapshot was built from
+        self._strike_miss_status = "STRIKE_NOT_FOUND"  # why select_strike last returned None
         self._current_cycle = None       # active positional expiry cycle
 
 
@@ -1166,7 +1170,7 @@ class BacktestEngine:
                 "leg": leg_meta["leg_number"],
                 "position": leg_meta["position_type"],
                 "option": leg_meta["option_type"],
-                "status": "STRIKE_NOT_FOUND",
+                "status": self._strike_miss_status,
             }
 
         if leg_meta.get("is_simple_momentum"):
@@ -1270,7 +1274,7 @@ class BacktestEngine:
                 "leg": observation_meta["leg_number"],
                 "position": observation_meta["position_type"],
                 "option": observation_meta["option_type"],
-                "status": "STRIKE_NOT_FOUND",
+                "status": self._strike_miss_status,
             }
 
         trigger_row = self._resolve_observation_trigger(observation_meta, day_df, obs_strike_row)
@@ -1989,7 +1993,9 @@ class BacktestEngine:
    
     def select_strike(self, leg_meta: dict, leg_chain: pd.DataFrame):
         """Dispatches to the strike-selection function matching
-        strike_criteria."""
+        strike_criteria. A None result means no contract; the reason is left
+        in _strike_miss_status for the caller's status field."""
+        self._strike_miss_status = "STRIKE_NOT_FOUND"
         strike_criteria = leg_meta.get("strike_criteria")
 
         if strike_criteria == "based on points":
@@ -2151,10 +2157,74 @@ class BacktestEngine:
         if leg_chain.empty:
             return None
 
+        premium_value = float(premium_value)
+        tolerance = premium_value * self.PREMIUM_MATCH_TOLERANCE
+
         leg_chain = self._recently_priced(leg_chain, leg_meta)
         premium_distance = (leg_chain["close"] - premium_value).abs()
         closest_index = premium_distance.idxmin()
-        return leg_chain.loc[closest_index]
+        if premium_distance.loc[closest_index] <= tolerance:
+            return leg_chain.loc[closest_index]
+
+        # Nothing priced near the request has printed yet. This is the thin
+        # morning chain: on an expiry day BTST trades NEXT week's series, and
+        # at 09:20 that series may have one or two deep-ITM prints -- on
+        # 2024-05-31 "closest to 40" among {865} bought the 865 contract.
+        # Rather than take whatever exists, wait for a contract within
+        # tolerance to print and enter at that minute (no look-ahead: the
+        # entry is stamped when the price became available).
+        return self._wait_for_premium_match(leg_meta, leg_chain, premium_value, tolerance)
+
+
+    def _wait_for_premium_match(self, leg_meta: dict, leg_chain: pd.DataFrame,
+                                premium_value: float, tolerance: float):
+        """First bar, within PREMIUM_MATCH_WAIT_MINUTES of the entry minute and
+        before the entry-day cutoff, on which a contract of the leg's expiry
+        and type printed within `tolerance` of `premium_value`. Returns that
+        bar as the strike row (its datetime is the entry time), or None with
+        _strike_miss_status = NO_PREMIUM_MATCH.
+
+        One vectorised pass over the day frame, and only on the rare miss
+        path -- the common case returns from the snapshot above untouched.
+        """
+        day_df = self._snapshot_day_df
+        reference = leg_chain.iloc[0]
+        snapshot_time = reference["datetime_utc"]
+        if day_df is None:
+            self._strike_miss_status = "NO_PREMIUM_MATCH"
+            return None
+
+        window_end = snapshot_time + pd.Timedelta(minutes=self.PREMIUM_MATCH_WAIT_MINUTES)
+        candidates = day_df.loc[
+            (day_df["option_type"] == reference["option_type"])
+            & (day_df["expiration_date"] == reference["expiration_date"])
+            & (day_df["datetime_utc"] > snapshot_time)
+            & (day_df["datetime_utc"] <= window_end)
+            & (day_df["trade_time"] <= self.entry_day_cutoff)
+            & ((day_df["close"] - premium_value).abs() <= tolerance)
+        ]
+        if candidates.empty:
+            logger.warning(
+                f"Leg {leg_meta['leg_number']}: no {reference['option_type']} on "
+                f"{pd.Timestamp(reference['expiration_date']).date()} printed within "
+                f"{self.PREMIUM_MATCH_TOLERANCE:.0%} of premium {premium_value:g} in the "
+                f"{self.PREMIUM_MATCH_WAIT_MINUTES} min after {_hms(_secs(snapshot_time))} "
+                f"-- NO_PREMIUM_MATCH"
+            )
+            self._strike_miss_status = "NO_PREMIUM_MATCH"
+            return None
+
+        # Earliest qualifying minute; if several contracts qualify on that
+        # minute, the one nearest the request.
+        first_time = candidates["datetime_utc"].min()
+        at_first = candidates.loc[candidates["datetime_utc"] == first_time]
+        row = at_first.loc[(at_first["close"] - premium_value).abs().idxmin()].copy()
+        logger.info(
+            f"Leg {leg_meta['leg_number']}: premium {premium_value:g} not available at "
+            f"{_hms(_secs(snapshot_time))} (nearest {float(leg_chain['close'].loc[(leg_chain['close'] - premium_value).abs().idxmin()]):.2f}); "
+            f"entered {row['ticker']} @ {float(row['close']):.2f} at {_hms(_secs(first_time))}"
+        )
+        return row
 
 
     def _select_strike_premium_range(self, leg_meta: dict, leg_chain: pd.DataFrame):
@@ -2243,9 +2313,6 @@ class BacktestEngine:
 
         return leg_chain.loc[closest_index]
 
-    # ======================================================================
-    # Momentum & Range Breakout
-    # ======================================================================
 
     def _resolve_momentum_fill(self, leg_meta, day_df, strike_row):
         """Strike is already fixed (strike_row, picked at entry_time). Scans
