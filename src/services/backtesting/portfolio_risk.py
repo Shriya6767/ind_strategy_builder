@@ -229,7 +229,11 @@ class PortfolioRisk:
 
             price = pivot[ticker]
             if leg.get("exit_price") is not None:
-                price = price.where(index <= exit_dt, float(leg["exit_price"]))   # frozen after exit
+                # Realised from the exit candle ON: a leg filled at its stop or
+                # target inside that candle is worth its fill, not the candle's
+                # close (an ATM call once showed +2,248 at 09:21 on a trade that
+                # had closed at +200 one minute after entry).
+                price = price.where(index < exit_dt, float(leg["exit_price"]))
             contribution = (direction * (price - entry_price) * qty).where(index > entry_dt, 0.0)
             parts.append((contribution.to_numpy(), entry_dt, exit_dt, entry_price * qty))
             open_count += np.asarray((index >= entry_dt) & (index <= exit_dt), dtype=int)
