@@ -8,6 +8,7 @@ an expiry calendar that resolves the strategy's `weekly` / `next_weekly` /
 """
 from src.core.modules import os, np, dataclasses, date, datetime, timedelta
 from src.core.logger import get_logger
+from src.core import constant
 from src.live.xts_client import XTSMarketDataClient, SEG_BSECM, SEG_BSEFO
 
 logger = get_logger(__name__)
@@ -27,8 +28,8 @@ class Contract:
 
 
 class InstrumentMaster:
-    UNDERLYING = "SENSEX"
-    STRIKE_STEP = 100          # BSE lists Sensex strikes every 100 points
+    UNDERLYING = constant.SENSEX_UNDERLYING
+    STRIKE_STEP = constant.STRIKE_STEP
 
     def __init__(self, contracts: list[Contract], index_instrument_id: int | None, as_of: date):
         self.as_of = as_of

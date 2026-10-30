@@ -10,6 +10,7 @@ back to polling the order book at the documented 1 request/second.
 """
 from src.core.modules import asyncio, time, dataclasses, Optional, Callable, Any
 from src.core.logger import get_logger
+from src.core import constant
 from src.live.xts_client import (
     XTSInteractiveClient, XTSInteractiveStream, XTSError, ORDER_TERMINAL_STATES,
 )
@@ -133,7 +134,7 @@ class Broker:
 class XTSBroker(Broker):
     name = "open_xts"
     mode = "live"
-    POLL_AFTER_SECONDS = 3.0        # socket silent this long -> poll the order book
+    POLL_AFTER_SECONDS = constant.POLL_AFTER_SECONDS
 
     def __init__(self, origin: str, path: str, token: str, user_id: str, client_id: str | None):
         super().__init__()
@@ -146,8 +147,7 @@ class XTSBroker(Broker):
         self.session_lost = False
         self.on_session_lost: Callable[[], Any] | None = None   # engine hook: invalidate the stored session
 
-    SESSION_DEAD_MARKERS = ("session has been expired", "session expired", "invalid token", "token/authorization",
-                            "wrong instance", "not logged in")
+    SESSION_DEAD_MARKERS = constant.SESSION_DEAD_MARKERS
 
     def _check_session(self, e: Exception):
         if any(m in str(e).lower() for m in self.SESSION_DEAD_MARKERS):

@@ -30,7 +30,11 @@ goes through the engine's ordered `DbWriter`.
 """
 from src.core.modules import asyncio, time, math, datetime, date, timedelta, Optional, Any
 from src.core import config
-from src.core.constant import QUANTITY, COST_BUFFER_PCT
+from src.core import constant
+from src.core.constant import (
+    QUANTITY, COST_BUFFER_PCT, OVERNIGHT_PAUSE_SECS, OVERNIGHT_REASON, RESTART_REASON, TERMINAL_STATUSES,
+    MARGIN_ERROR_MARKERS, PREMIUM_TYPES, UNDERLYING_TYPES, OPEN_STATUSES, PENDING_STATUSES, MULTIDAY_TYPES,
+)
 from src.core.logger import get_logger
 from src.live import deployment_store as store
 from src.live.deployment_store import RESUME_HINT, is_resumable
@@ -49,17 +53,7 @@ from src.live.timeutil import (
 logger = get_logger(__name__)
 
 LAST_EXIT_SECS = MARKET_CLOSE_SECS - 30           # never plan an exit after 15:29:30
-OVERNIGHT_PAUSE_SECS = 15 * 3600 + 45 * 60        # BTST / positional holds pause at 15:45
-OVERNIGHT_REASON = "market closed -- restart before 09:15"
-RESTART_REASON = "restart scheduled at "
-RESTART_EARLIEST_SECS = MARKET_OPEN_SECS + 5 
-TERMINAL_STATUSES = ("squared_off", "completed", "error", "cancelled", "manual")
-MARGIN_ERROR_MARKERS = ("margin", "insufficient", "fund")     # broker rejection texts that mean a margin shortfall
-PREMIUM_TYPES = ("POINTS", "PERCENT")
-UNDERLYING_TYPES = ("UNDERLYING_POINTS", "UNDERLYING_PERCENT")
-OPEN_STATUSES = ("open", "exiting")
-PENDING_STATUSES = ("pending", "entering", "waiting")
-MULTIDAY_TYPES = ("btst", "positional")
+RESTART_EARLIEST_SECS = MARKET_OPEN_SECS + 5
 
 
 def _prepare_meta(raw: dict, leg_number: int) -> dict:
@@ -154,14 +148,11 @@ class LegState:
 
 
 class DeploymentRunner:
-    # No fresh entry (re-entry / overall re-entry / conditional fill) inside this window before exit_time.
-    REENTRY_CUTOFF_SECS = 60
-    # Warn when a leg's LTP is older than this; repeat at most every STALE_WARN_EVERY_SECS per leg.
-    STALE_LTP_SECS = 5
-    STALE_WARN_EVERY_SECS = 30
-    # Live mode: compare our open legs with the broker's positions this often (and on restore).
-    RECONCILE_EVERY_SECS = 60
-    RECONCILE_GRACE_SECS = 20     # a leg filled less than this long ago is not judged against the position book
+    REENTRY_CUTOFF_SECS = constant.REENTRY_CUTOFF_SECS
+    STALE_LTP_SECS = constant.STALE_LTP_SECS
+    STALE_WARN_EVERY_SECS = constant.STALE_WARN_EVERY_SECS
+    RECONCILE_EVERY_SECS = constant.RECONCILE_EVERY_SECS
+    RECONCILE_GRACE_SECS = constant.RECONCILE_GRACE_SECS
 
     def __init__(self, engine, dep: dict, feed, broker: Broker, restore: bool = False):
         self.engine = engine
@@ -516,7 +507,7 @@ class DeploymentRunner:
             self._event(f"Activated after entry time {hms(self.entry_secs)} -- entering now", "warn")
         return True
 
-    PREDECESSOR_POLL_SECS = 5
+    PREDECESSOR_POLL_SECS = constant.PREDECESSOR_POLL_SECS
 
     async def _wait_for_predecessor(self) -> bool:
         """The same strategy may still hold an older multi-day deployment that
@@ -800,7 +791,7 @@ class DeploymentRunner:
             leg.qty = upd.filled_qty
         self._on_entry_filled(leg, upd.avg_price or ltp)
 
-    CHASE_STEP_SECS = 2      # how often an unfilled limit is re-priced while chasing
+    CHASE_STEP_SECS = constant.CHASE_STEP_SECS
 
     def _mpp(self, leg: LegState, side: str, fallback: float) -> float:
         ltp, bid, ask = self.store.quote(leg.key)
@@ -959,7 +950,7 @@ class DeploymentRunner:
         self._event(f"Leg {leg.leg_number}: {what}")
         self._persist_wait(leg, "waiting")
 
-    WAIT_SAVE_EVERY_SECS = 5      # range high/low progress is written at most this often per leg
+    WAIT_SAVE_EVERY_SECS = constant.WAIT_SAVE_EVERY_SECS
 
     def _persist_wait(self, leg: LegState, status: str):
         """Write the pending wait so a restart can re-arm it exactly (contract,
@@ -1043,7 +1034,6 @@ class DeploymentRunner:
             return
         await self._enter_conditional(leg)
 
-    # ------------------------------------------------------------------ levels
     def _level(self, leg: LegState, kind: str) -> float | None:
         m = leg.meta
         if not m.get(f"is_{kind}"):
@@ -1437,7 +1427,6 @@ class DeploymentRunner:
         if reason in ("stoploss", "target") and not self._squaring:
             self._spawn(self._maybe_reenter(leg, reason))
 
-    # ------------------------------------------------------------------ stop-loss resting at the broker (SL-L)
     def _ls(self, leg_number: int) -> LegExecution:
         """The leg-level execution settings this leg runs with."""
         ls = self._leg_settings.get(leg_number)
@@ -1490,7 +1479,7 @@ class DeploymentRunner:
         self._persist_leg(leg)
         self._spawn(self._watch_sl_order(leg, app_id))
 
-    SL_REFRESH_EVERY_SECS = 30       # safety-net poll of a resting SL-L order when the order socket is quiet
+    SL_REFRESH_EVERY_SECS = constant.SL_REFRESH_EVERY_SECS
 
     async def _watch_sl_order(self, leg: LegState, app_id: str):
         quiet = 0.0

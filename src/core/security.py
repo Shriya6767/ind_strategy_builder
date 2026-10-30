@@ -23,14 +23,10 @@ from src.core.modules import (
 )
 from src.core import config
 from src.core.logger import get_logger
+from src.core.constant import OTP_TTL_MINUTES, OTP_RESEND_SECONDS, OTP_MAX_ATTEMPTS, PASSWORD_MIN_LENGTH, JWT_ALGORITHM
 
 logger = get_logger(__name__)
 
-OTP_TTL_MINUTES = 5          # a code is valid for this long
-OTP_RESEND_SECONDS = 30      # minimum gap between two codes to one number
-OTP_MAX_ATTEMPTS = 5         # wrong guesses before the code is burnt
-PASSWORD_MIN_LENGTH = 8
-JWT_ALGORITHM = "HS256"
 JWT_EXPIRES_HOURS = config.JWT_EXPIRES_HOURS
 
 # The key that signs every login token. Losing it means every token is

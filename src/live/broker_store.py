@@ -12,10 +12,9 @@ from src.core.logger import get_logger
 from src.live import crypto
 from src.live.xts_client import XTSInteractiveClient, XTSError, MARKETDATA_PATH
 from src.live.timeutil import now_ist, to_naive_ist, parse_hms
+from src.core.constant import HOST_LOOKUP_DEFAULT_PASSWORD
 
 logger = get_logger(__name__)
-
-HOST_LOOKUP_DEFAULT_PASSWORD = "2021HostLookUpAccess"   # Symphony's documented default
 
 
 def session_expiry(now: datetime) -> datetime:

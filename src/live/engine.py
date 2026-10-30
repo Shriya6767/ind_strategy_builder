@@ -14,6 +14,7 @@ running / paused in the DB, then run three background loops:
 from src.core.modules import asyncio, time, orjson, datetime, date, timedelta, WebSocket, Optional
 from src.core import config
 from src.core.logger import get_logger
+from src.core.constant import AUTO_RESTART_SCAN_SECS
 from src.live import deployment_store as store
 from src.live.deployment_store import DbWriter
 from src.live.feed import TickStore, XTSMarketFeed, Key
@@ -28,7 +29,6 @@ from src.live.timeutil import today_ist, now_ist, parse_hms, secs_now, weekday_c
 logger = get_logger(__name__)
 
 AUTO_RESTART_FROM_SECS = parse_hms(config.LIVE_SESSION_RESET_TIME)   # a login before the broker's reset is dead on arrival
-AUTO_RESTART_SCAN_SECS = 8 * 3600 + 45 * 60
 
 
 def _restart_at(body: dict | None) -> int | None:

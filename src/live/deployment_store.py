@@ -10,13 +10,9 @@ from src.core.modules import RealDictCursor, Json, threading, queue, orjson, dat
 from src.core.config import Database
 from src.core.logger import get_logger
 from src.live.timeutil import now_ist, to_naive_ist
+from src.core.constant import ACTIVE_STATUSES, RESUME_HINT
 
 logger = get_logger(__name__)
-
-ACTIVE_STATUSES = ("scheduled", "running", "paused")
-# status_reason suffix of a RECOVERABLE error (AlgoTest's Error state): the worker keeps the
-# runner, the open legs stay monitored and Resume retries the failed leg(s)
-RESUME_HINT = "-- click Resume to retry"
 
 
 def is_resumable(dep: dict) -> bool:

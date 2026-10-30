@@ -6,15 +6,17 @@ from src.core.modules import RealDictCursor, httpx, orjson, date, datetime
 from src.core import config
 from src.core.config import Database
 from src.core.logger import get_logger
-from src.core.constant import REENTRY_MODES
+from src.core.constant import (
+    REENTRY_MODES, OVERALL_REENTRY_MODES, SUPPORTED_STRATEGY_TYPES, MOMENTUM_TYPES, ENTRY_TIME_WINDOW, EXIT_TIME_WINDOW,
+)
 from src.services.get_strategy import GetStrategyService
 from src.live import deployment_store as store
 from src.live.broker_store import BrokerAccountService
 from src.live.execution import ExecutionSettings, STRATEGY_KEYS
 from src.live.timeutil import today_ist, next_trading_day, is_trading_day, weekday_code, now_ist, parse_hms, hms, secs_now
 
-ENTRY_TIME_RANGE = (parse_hms("09:15:15"), parse_hms("15:29:00"))
-EXIT_TIME_RANGE = (parse_hms("09:15:05"), parse_hms("15:29:30"))
+ENTRY_TIME_RANGE = (parse_hms(ENTRY_TIME_WINDOW[0]), parse_hms(ENTRY_TIME_WINDOW[1]))
+EXIT_TIME_RANGE = (parse_hms(EXIT_TIME_WINDOW[0]), parse_hms(EXIT_TIME_WINDOW[1]))
 
 
 def _secs(strategy: dict, key: str) -> int:
@@ -25,12 +27,8 @@ logger = get_logger(__name__)
 
 # "sequential" is timed like intraday (same-day entry/exit); its legs carry
 # observation -> sequential_leg hand-offs, exactly as in the backtest engine.
-SUPPORTED_STRATEGY_TYPES = ("intraday", "sequential", "btst", "positional")
-SUPPORTED_REENTRY = ("RE_ASAP", "RE_ASAP_REVERSE", "RE_COST", "RE_COST_REVERSE",
-                     "RE_MOMENTUM", "RE_MOMENTUM_REVERSE", "LAZY_LEG")
-SUPPORTED_OVERALL_REENTRY = ("RE_ASAP", "RE_ASAP_REVERSE", "RE_MOMENTUM", "RE_MOMENTUM_REVERSE")
-MOMENTUM_TYPES = ("POINTS_UP", "POINTS_DOWN", "PERCENT_UP", "PERCENT_DOWN",
-                  "UNDERLYING_POINTS_UP", "UNDERLYING_POINTS_DOWN", "UNDERLYING_PERCENT_UP", "UNDERLYING_PERCENT_DOWN")
+SUPPORTED_REENTRY = REENTRY_MODES
+SUPPORTED_OVERALL_REENTRY = OVERALL_REENTRY_MODES
 
 
 class LiveValidationError(ValueError):

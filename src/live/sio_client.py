@@ -20,14 +20,15 @@ from src.core.modules import asyncio, orjson, time, Callable, Any, Optional
 from urllib.parse import urlencode
 import websockets
 from src.core.logger import get_logger
+from src.core import constant
 
 logger = get_logger(__name__)
 
 
 class SocketIOClient:
-    RECONNECT_MIN, RECONNECT_MAX = 1.0, 15.0
-    KICK_MIN, KICK_MAX = 30.0, 300.0              # the server keeps closing the namespace (dead token)
-    OPEN_TIMEOUT = 15.0
+    RECONNECT_MIN, RECONNECT_MAX = constant.SIO_RECONNECT_MIN, constant.SIO_RECONNECT_MAX
+    KICK_MIN, KICK_MAX = constant.SIO_KICK_MIN, constant.SIO_KICK_MAX
+    OPEN_TIMEOUT = constant.SIO_OPEN_TIMEOUT
 
     def __init__(self, origin: str, candidates: list[tuple[str, int]], query: dict, name: str = "sio",
                  log_frames: int = 0):

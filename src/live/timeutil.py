@@ -2,11 +2,9 @@
 expressed -- like the backtest engine -- as seconds since midnight."""
 from src.core.modules import datetime, date, timedelta, ZoneInfo, time
 from src.core import config
+from src.core.constant import MARKET_OPEN_SECS, MARKET_CLOSE_SECS
 
 IST = ZoneInfo("Asia/Kolkata")
-
-MARKET_OPEN_SECS = 9 * 3600 + 15 * 60      # 09:15:00
-MARKET_CLOSE_SECS = 15 * 3600 + 30 * 60    # 15:30:00
 
 _HOLIDAYS: set[date] = set()
 for _raw in config.LIVE_HOLIDAYS:

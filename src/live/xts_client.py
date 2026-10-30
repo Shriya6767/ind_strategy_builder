@@ -19,20 +19,18 @@ from src.core.modules import (
     httpx, orjson, asyncio, time, json, Optional, Callable, Any,
 )
 from src.core.logger import get_logger
+from src.core import constant
+from src.core.constant import SEG_NAME, ORDER_OPEN_STATES, ORDER_TERMINAL_STATES, MARKETDATA_PATH
 from src.live.sio_client import SocketIOClient
 
 logger = get_logger(__name__)
 
 # exchangeSegment numeric codes (market data API) and string codes (interactive).
 SEG_BSECM, SEG_BSEFO, SEG_NSECM, SEG_NSEFO = 11, 12, 1, 2
-SEG_NAME = {11: "BSECM", 12: "BSEFO", 1: "NSECM", 2: "NSEFO", 3: "NSECD", 13: "BSECD"}
 SEG_CODE = {v: k for k, v in SEG_NAME.items()}
 
 # xtsMessageCode
 MSG_TOUCHLINE, MSG_DEPTH, MSG_CANDLE, MSG_OI = 1501, 1502, 1505, 1510
-
-ORDER_OPEN_STATES = ("New", "Open", "PendingNew", "Replaced", "PartiallyFilled", "PendingReplace", "PendingCancel")
-ORDER_TERMINAL_STATES = ("Filled", "Cancelled", "Rejected")
 
 
 class XTSError(Exception):
@@ -145,15 +143,12 @@ class _BaseClient:
 
 # Interactive (orders) API
 class XTSInteractiveClient(_BaseClient):
-    # Order-call throttle (calls/second). The XTS doc's rate-limit table says
-    # 10/s for place+modify+cancel combined, but this is OFF (0) until a real
-    # rate-limit rejection (HTTP 429) is observed from the broker.
-    ORDER_THROTTLE_RATE = 0
-    MAX_IN_FLIGHT = 8          # order calls in flight at once (a 50-leg strategy streams, it does not burst)
-    CONNECT_RETRIES = 3        # attempts when the TCP connect fails (nothing was sent yet)
-    RETRY_DELAY = 0.2
-    WARM_CONNECTIONS = 4       # connections opened at login and kept alive for order bursts
-    KEEPALIVE_EVERY = 20.0     # seconds between keep-alive pings (servers drop idle connections after ~60 s)
+    ORDER_THROTTLE_RATE = constant.ORDER_THROTTLE_RATE
+    MAX_IN_FLIGHT = constant.MAX_IN_FLIGHT
+    CONNECT_RETRIES = constant.CONNECT_RETRIES
+    RETRY_DELAY = constant.RETRY_DELAY
+    WARM_CONNECTIONS = constant.WARM_CONNECTIONS
+    KEEPALIVE_EVERY = constant.KEEPALIVE_EVERY
 
     def __init__(self, origin: str, path: str = "/interactive", timeout: float = 10.0):
         super().__init__(origin, path, timeout)
@@ -454,11 +449,6 @@ class XTSInteractiveStream:
 
 
 # Market data API
-# The binary market data API is the only one we use (both XTS servers): REST replies are
-# JSON, the socket streams `xts-binary-packet` frames whatever publishFormat is requested.
-MARKETDATA_PATH = "/apibinarymarketdata"
-
-
 class XTSMarketDataClient(_BaseClient):
     def __init__(self, origin: str, path: str = MARKETDATA_PATH, timeout: float = 20.0):
         super().__init__(origin, path, timeout)

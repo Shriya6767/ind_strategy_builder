@@ -15,6 +15,7 @@ from src.core.modules import (
 )
 from src.live.sio_client import SocketIOClient
 from src.core.logger import get_logger
+from src.core import constant
 from src.live.xts_client import XTSMarketDataClient, XTSError, MSG_TOUCHLINE, MSG_CANDLE
 from src.live.timeutil import minute_label
 
@@ -195,7 +196,7 @@ class XTSMarketFeed:
         self._relogin_at = 0.0
         self._sub_batch = 50
 
-    RELOGIN_EVERY_SECS = 60
+    RELOGIN_EVERY_SECS = constant.FEED_RELOGIN_EVERY_SECS
 
     async def _sub(self, chunk: list[Key], code: int) -> tuple[list[dict], int | None]:
         """client.subscribe honoring the server's per-request instrument limit

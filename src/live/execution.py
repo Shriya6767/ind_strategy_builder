@@ -2,9 +2,8 @@
 price arithmetic shared by every broker adapter."""
 from src.core.modules import dataclasses, math
 from src.core import config
+from src.core.constant import TICK, VALID_DAYS, MPP_SLABS
 
-TICK = 0.05
-VALID_DAYS = ("M", "T", "W", "Th", "F", "Sa", "Su")
 STRATEGY_KEYS = frozenset({
     "mode", "qty_multiplier", "trade_monitoring", "monitoring_frequency_sec", "strategy_execution_time",
     "order_timeout_sec", "exit_fallback_market", "execution_days_mode", "execution_days", "execution_dte",
@@ -178,9 +177,6 @@ def limit_price(ltp: float, side: str, buffer: float, buffer_type: str, tick: fl
     pts = ltp * buffer / 100.0 if buffer_type == "PERCENT" else buffer
     raw = ltp + pts if side == "BUY" else ltp - pts
     return max(round_tick(raw, tick), tick)
-
-
-MPP_SLABS = ((10, 5.0), (100, 3.0), (500, 2.0), (float("inf"), 1.0))   # option premium upper bound -> protection %
 
 
 def mpp_pct(price: float) -> float:
