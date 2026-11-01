@@ -55,9 +55,11 @@ class BacktestEngine:
     # Sensex session is 09:15-15:30 IST. Bars are labeled by their
     # COMPLETION minute (the 09:15:00-09:15:59 candle is stamped 09:16:00),
     # so labels run 09:16:00-15:30:00. BTST Day-1 monitoring runs until the
-    # close; Day-2 carryover handling starts from the first completed bar.
+    # close; Day-2 carryover handling starts from the SECOND candle of the day
+    # (label 09:17 = 09:16:00-09:16:59, AlgoTest's "9:16"): the opening candle's
+    # prints are never judged (decided 2026-11-01).
     _DEFAULT_DAY1_MARKET_CLOSE = "15:30:00"
-    _DEFAULT_DAY2_MARKET_OPEN = "09:16:00"
+    _DEFAULT_DAY2_MARKET_OPEN = "09:17:00"
 
     # How old a last traded price may be and still be matched by the
     # premium-based strike criteria. See _recently_priced.
@@ -109,8 +111,8 @@ class BacktestEngine:
             self.day1_market_close = self._parse_day1_market_close()
             self.day2_market_open = self._parse_day2_market_open()
             # Delay-restart: when enabled, carry-day monitoring of overnight
-            # positions resumes at delay_restart_time instead of the market
-            # open. Like every other clock time in the engine it is a
+            # positions resumes at delay_restart_time instead of the second
+            # candle. Like every other clock time in the engine it is a
             # completion label: 09:16 means the first candle judged is the
             # one completed at 09:16 (09:15:00-09:15:59). AlgoTest reads its
             # "9:16" as the candle STARTING at 09:16, i.e. our 09:17 -- a
@@ -1939,11 +1941,13 @@ class BacktestEngine:
         #   * an intraday gap bar fills at the bar's open, the first print --
         #     matches AlgoTest (verified 47/47 on 2026 underlying stops).
         #   * a BTST position held overnight whose FIRST monitored Day-2
-        #     candle (the market open, or delay_restart_time when
-        #     is_delay_restart is on) opens through its stop or target:
+        #     candle (the second candle of the day, label 09:17, or
+        #     delay_restart_time when is_delay_restart is on) opens through
+        #     its stop or target:
         #       - delay-restart ON : fill at that candle's adverse extreme --
         #         a BUY sells at the low, a SELL buys back at the high.
-        #       - delay-restart OFF: fill at that candle's CLOSE.
+        #       - delay-restart OFF: fill at that candle's OPEN, its first
+        #         print (the 09:16 opening candle is never judged).
         gap_fill = candle_open
         # A carry-day's FIRST monitored candle: BTST identifies it as the
         # first bar of its single Day-2 series; positional monitors many days
@@ -1957,11 +1961,8 @@ class BacktestEngine:
                 and exit_idx == 0
                 and pd.Timestamp(leg_result["entry_datetime"]).date() < exit_row["datetime_utc"].date()
             )
-        if overnight_gap_candle:
-            if self.is_delay_restart:
-                gap_fill = float(low[exit_idx]) if position_type == "BUY" else float(high[exit_idx])
-            else:
-                gap_fill = float(close[exit_idx])
+        if overnight_gap_candle and self.is_delay_restart:
+            gap_fill = float(low[exit_idx]) if position_type == "BUY" else float(high[exit_idx])
 
         if target_hit_mask[exit_idx] and (target_gapped_open or not stoploss_hit_mask[exit_idx]):
             exit_reason = "TARGET_HIT"
