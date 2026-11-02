@@ -297,7 +297,9 @@ class LiveEngine:
         for acct, b in list(self.brokers.items()):
             sess = BrokerAccountService.get_session(acct)
             if sess is None:
-                # logged out (or expired): drop the adapter so no socket or order uses the dead token
+                # logged out (or expired): drop the adapter so no socket or order uses the dead token;
+                # runners still holding it skip their periodic position check until the next login
+                b.session_lost = True
                 self.brokers.pop(acct, None)
                 await b.close()
                 logger.info(f"[ENGINE] broker account {acct}: session gone -- adapter dropped until the next login")

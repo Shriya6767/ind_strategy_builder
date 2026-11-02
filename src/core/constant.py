@@ -43,6 +43,10 @@ PREDECESSOR_POLL_SECS = 5       # how often a successor deployment checks whethe
 CHASE_STEP_SECS = 2             # how often an unfilled limit is re-priced while chasing
 WAIT_SAVE_EVERY_SECS = 5        # range high/low progress is written at most this often per leg
 SL_REFRESH_EVERY_SECS = 30      # safety-net poll of a resting SL-L order when the order socket is quiet
+EXIT_RETRY_BASE_SECS = 5        # first automatic retry after a rejected / unfilled exit; doubles each time ...
+EXIT_RETRY_MAX_SECS = 60        # ... up to this cap
+EXIT_RETRY_TRANSIENT_SECS = 5   # fixed cadence while the broker rejects for a connectivity fault (see below)
+TRANSIENT_BROKER_MARKERS = ("not connected", "adapter", "could not reach", "no reply")
 
 TICK = 0.05
 VALID_DAYS = ("M", "T", "W", "Th", "F", "Sa", "Su")

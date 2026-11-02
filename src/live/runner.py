@@ -34,6 +34,7 @@ from src.core import constant
 from src.core.constant import (
     QUANTITY, COST_BUFFER_PCT, OVERNIGHT_PAUSE_SECS, OVERNIGHT_REASON, RESTART_REASON, TERMINAL_STATUSES,
     MARGIN_ERROR_MARKERS, PREMIUM_TYPES, UNDERLYING_TYPES, OPEN_STATUSES, PENDING_STATUSES, MULTIDAY_TYPES,
+    EXIT_RETRY_BASE_SECS, EXIT_RETRY_MAX_SECS, EXIT_RETRY_TRANSIENT_SECS, TRANSIENT_BROKER_MARKERS,
 )
 from src.core.logger import get_logger
 from src.live import deployment_store as store
@@ -75,7 +76,8 @@ class LegState:
         "live_leg_id", "error", "reentry_sl_left", "reentry_tgt_left", "entry_payload", "last_check",
         "option_type", "entry_mode", "wait", "watch_key", "trigger", "trigger_up", "range_hi", "range_lo",
         "range_end_dt", "range_high_side", "wait_deadline", "seq_meta", "trade_id",
-        "exit_fails", "next_exit_try", "wait_saved_at", "reconcile_miss",
+        "exit_fails", "next_exit_try", "last_exit_error", "wait_saved_at", "reconcile_miss",
+        "exit_at_close", "enter_at_close", "exited_at_close",
         "ref_price", "sl_order_id", "sl_payload", "sl_busy", "next_trail_at",
     )
 
@@ -118,6 +120,10 @@ class LegState:
         self.trade_id = 0                         # overall "trade" index (bumps on overall re-entry)
         self.exit_fails = 0                       # failed exit attempts (rejected / not filled)
         self.next_exit_try = 0.0                  # epoch before which SL/target must not re-fire an exit
+        self.last_exit_error = None               # reason of the last failed exit (repeats are logged, not evented)
+        self.exit_at_close: str | None = None     # "stoploss" | "target" triggered by the spot, exit pending at the close
+        self.enter_at_close = False               # underlying momentum met, entry pending at the close
+        self.exited_at_close = False              # the exit was sent at a candle close (its re-entry is immediate)
         self.wait_saved_at = 0.0                  # last time the pending wait (range hi/lo) was written to the DB
         self.reconcile_miss = 0                   # consecutive broker position checks that did not show this leg
         self.ref_price = None                     # intended entry price (tgt_sl_ref_price = TRIGGER)
@@ -216,6 +222,7 @@ class DeploymentRunner:
         self.legs: list[LegState] = []
         self._by_key: dict[Key, list[LegState]] = {}      # open legs by contract key
         self._waiting: list[LegState] = []                # legs with a pending conditional entry
+        self._pending_reentries: list[tuple[LegState, str]] = []   # CANDLE_CLOSE: re-entries deferred to the candle close
         self._listening: set[Key] = set()
         self._subscribed: set[Key] = set()
         self.realised = float(dep.get("realised_pnl") or 0)
@@ -1002,14 +1009,15 @@ class DeploymentRunner:
             if hit:
                 self._waiting.remove(leg)
                 self._persist_wait(leg, "done")
-                leg.wait = None
+                kind, leg.wait = leg.wait, None
+                leg.status = "done" if leg.kind == "observation" else "pending"
+                if self.settings.trade_monitoring == "CANDLE_CLOSE" and kind == "momentum" and key == self.engine.index_key \
+                        and (leg.kind == "observation" or leg.entry_mode in ("ENTRY", "SEQUENTIAL")):
+                    leg.enter_at_close = True
+                    self._event(f"Leg {leg.leg_number}: condition met at {price} -- entry at the candle close")
+                    continue
                 self._event(f"Leg {leg.leg_number}: condition met at {price}")
-                if leg.kind == "observation":
-                    leg.status = "done"
-                    self._spawn(self._enter_sequential(leg))
-                else:
-                    leg.status = "pending"
-                    self._spawn(self._enter_conditional(leg))
+                self._spawn(self._enter_sequential(leg) if leg.kind == "observation" else self._enter_conditional(leg))
 
     async def _enter_conditional(self, leg: LegState):
         await self._place_entry(leg)
@@ -1178,28 +1186,42 @@ class DeploymentRunner:
         if self.paused or not self._gate_open():
             return
         freq = self.settings.monitoring_frequency_sec
-        if self.settings.trade_monitoring == "LTP":
-            for leg in self._by_key.get(key, ()):
-                if freq and ts - leg.last_check < freq:
-                    continue
-                leg.last_check = ts
-                self._check_leg(leg, price)
+        for leg in self._by_key.get(key, ()):
+            if freq and ts - leg.last_check < freq:
+                continue
+            leg.last_check = ts
+            self._check_leg(leg, price)
         if key == self.engine.index_key:
             for legs in self._by_key.values():
                 for leg in legs:
                     if leg.status == "open" and (str(leg.meta.get("stoploss_type", "")).upper() in UNDERLYING_TYPES
                                                  or str(leg.meta.get("target_type", "")).upper() in UNDERLYING_TYPES):
                         self._check_leg(leg, self.store.ltp(leg.key) or leg.entry_price, price)
-        # candle-close monitoring judges the overall SL/target at the candle close too
-        # (a loss that recovers inside the minute does not exit); the daily-loss kill
-        # switch stays tick-driven in both modes
+        
         self._check_overall(only_kill=self.settings.trade_monitoring != "LTP")
 
     def _on_candle(self, key: Key, candle: Candle):
+        """CANDLE_CLOSE monitoring, AlgoTest's rules: the SENSEX candle (it ticks every
+        second) is the minute clock. At its close: exits whose underlying condition fired
+        during the minute go out, underlying-momentum entries that fired go in, deferred
+        re-entries (Re-ASAP / Re-Momentum / Re-Cost) start, and the overall SL / target /
+        trailing stop is judged. In LTP mode everything is judged on ticks."""
         if self.paused or self._squaring or not self._gate_open():
             return
-        for leg in self._by_key.get(key, ()):
-            self._check_leg(leg, candle.close)
+        if self.settings.trade_monitoring == "LTP" or key != self.engine.index_key:
+            return
+        for leg in [l for l in self.legs if l.exit_at_close and l.status == "open"]:
+            reason, leg.exit_at_close, leg.exited_at_close = leg.exit_at_close, None, True
+            leg.status = "exiting"
+            self._event(f"Leg {leg.leg_number}: candle close -- exiting on the underlying {reason}")
+            self._spawn(self._exit_leg(leg, reason))
+        for leg in [l for l in self.legs if l.enter_at_close]:
+            leg.enter_at_close = False
+            self._event(f"Leg {leg.leg_number}: candle close -- entering on the underlying momentum")
+            self._spawn(self._enter_sequential(leg) if leg.kind == "observation" else self._enter_conditional(leg))
+        pending, self._pending_reentries = self._pending_reentries, []
+        for leg, reason in pending:
+            self._spawn(self._maybe_reenter(leg, reason))
         self._check_overall()
 
     def _check_leg(self, leg: LegState, price: float, spot: float | None = None):
@@ -1233,7 +1255,7 @@ class DeploymentRunner:
         tgt_type = str(m.get("target_type") or "POINTS").upper()
         if spot is None and (sl_type in UNDERLYING_TYPES or tgt_type in UNDERLYING_TYPES):
             spot = self.store.ltp(self.engine.index_key) if self.engine.index_key else None
-        hit = None
+        hit, via_spot = None, False
         if leg.sl is not None and leg.sl_order_id:
             # the stop rests at the broker as an SL-L order: the exchange triggers it.
             # Only step in if the price has run THROUGH its limit (triggered but unfilled).
@@ -1246,17 +1268,28 @@ class DeploymentRunner:
                     hit = "stoploss"
             elif spot is not None:
                 if (leg.spot_bullish and spot <= leg.sl) or (not leg.spot_bullish and spot >= leg.sl):
-                    hit = "stoploss"
+                    hit, via_spot = "stoploss", True
         if hit is None and leg.tgt is not None:
             if tgt_type in PREMIUM_TYPES:
                 if (leg.direction > 0 and price >= leg.tgt) or (leg.direction < 0 and price <= leg.tgt):
                     hit = "target"
             elif spot is not None:
                 if (leg.spot_bullish and spot >= leg.tgt) or (not leg.spot_bullish and spot <= leg.tgt):
-                    hit = "target"
+                    hit, via_spot = "target", True
+        if hit and via_spot and self.settings.trade_monitoring == "CANDLE_CLOSE":
+            # AlgoTest: an underlying SL / target is checked on LTP, the trade is taken at the candle close
+            if leg.exit_at_close is None:
+                leg.exit_at_close = hit
+                self._event(f"Leg {leg.leg_number}: underlying {hit} triggered at spot {spot} "
+                            f"(level {leg.sl if hit == 'stoploss' else leg.tgt}) -- exit at the candle close")
+            return
         if hit:
             leg.status = "exiting"
-            self._event(f"Leg {leg.leg_number}: {hit} hit at {price} (level {leg.sl if hit == 'stoploss' else leg.tgt})")
+            msg = f"Leg {leg.leg_number}: {hit} hit at {price} (level {leg.sl if hit == 'stoploss' else leg.tgt})"
+            if leg.exit_fails:                     # a retry of an already-breached stop: log only
+                logger.info(f"[RUN {self.id}] {msg} -- exit attempt {leg.exit_fails + 1}")
+            else:
+                self._event(msg)
             self._spawn(self._exit_leg(leg, hit))
 
     def _trade_realised(self) -> float:
@@ -1272,13 +1305,15 @@ class DeploymentRunner:
             self._spawn(self._finish_after_squareoff("max_daily_loss"))
             return
         ov = self._overall
-        if not ov or only_kill:
+        if not ov:
             return
         mtm = self._trade_realised() + unreal
         sl = ov["sl"]
+        if sl is not None and ov["trail_step"] and mtm > ov["best"]:
+            ov["best"] = mtm                       # the trailing high-water mark updates on every tick in both modes
+        if only_kill:
+            return                                 # CANDLE_CLOSE: the stop / target / trail are judged at the candle close
         if sl is not None and ov["trail_step"]:
-            if mtm > ov["best"]:
-                ov["best"] = mtm
             steps = math.floor(max(ov["best"], 0) / ov["trail_step"])
             # engine rule: every `trail_step` of best profit tightens the stop by
             # `trail_gain`, never past break-even (threshold clipped at 0)
@@ -1364,7 +1399,7 @@ class DeploymentRunner:
                 app_id = await self.broker.place(payload)
             except XTSError as e:
                 leg.status, leg.error = "open", _order_failure("exit", e)
-                self._event(f"Leg {leg.leg_number}: {leg.error.upper() if not isinstance(e, XTSTransportError) else leg.error}. Position still open!", "error")
+                self._exit_problem(leg, f"Leg {leg.leg_number}: {leg.error.upper() if not isinstance(e, XTSTransportError) else leg.error}. Position still open!")
                 self._exit_failed(leg)
                 self._persist_leg(leg)
                 return
@@ -1375,7 +1410,8 @@ class DeploymentRunner:
         else:
             upd = await self.broker.wait_terminal(app_id, self.settings.order_timeout_sec)
         if (upd is None or upd.status != "Filled") and self.settings.exit_fallback_market:
-            self._event(f"Leg {leg.leg_number}: exit limit {_order_outcome(upd)} -- re-pricing as MPP", "warn")
+            self._exit_problem(leg, f"Leg {leg.leg_number}: exit limit {_order_outcome(upd)} -- re-pricing as MPP", "warn",
+                               reason=_order_outcome(upd))
             try:
                 if upd is None:
                     await self._modify_to_mpp(leg, app_id, payload)
@@ -1393,7 +1429,7 @@ class DeploymentRunner:
                     leg.exit_order_id = app_id
                     upd = await self.broker.wait_terminal(app_id, 15.0)
             except XTSError as e:
-                self._event(f"Leg {leg.leg_number}: market exit failed -- {e}", "error")
+                self._exit_problem(leg, f"Leg {leg.leg_number}: market exit failed -- {e}", reason=str(e))
         if upd is not None:
             self.db.submit(store.log_order, deployment_id=self.id, live_leg_id=leg.live_leg_id, app_order_id=app_id,
                            unique_tag=tag, action="update", side=side, order_type=order_type, quantity=leg.qty,
@@ -1401,7 +1437,7 @@ class DeploymentRunner:
                            reason=upd.reason, payload=upd.raw)
         if upd is None or upd.status != "Filled":
             leg.status, leg.error = "open", f"exit {_order_outcome(upd)}"
-            self._event(f"Leg {leg.leg_number}: EXIT {_order_outcome(upd).upper()} -- position still open, square off manually", "error")
+            self._exit_problem(leg, f"Leg {leg.leg_number}: EXIT {_order_outcome(upd).upper()} -- position still open, square off manually")
             self._exit_failed(leg)
             self._persist_leg(leg)
             return
@@ -1419,13 +1455,20 @@ class DeploymentRunner:
         leg.status = "closed"
         leg.sl_order_id = None
         self.realised += leg.pnl
-        self._event(f"Leg {leg.leg_number}: exit {_flip(leg.side)} @ {leg.exit_price} ({reason}) PnL {leg.pnl:+.2f}")
+        self._event(f"Leg {leg.leg_number}: exit {_flip(leg.side)} @ {leg.exit_price} ({reason}) PnL {leg.pnl:+.2f}"
+                    + (f" -- filled after {leg.exit_fails} failed attempt(s)" if leg.exit_fails else ""))
         self._persist_leg(leg)
         self.db.submit(store.set_realised_pnl, self.id, self.realised)
         if leg.key in self._by_key and leg in self._by_key[leg.key]:
             self._by_key[leg.key].remove(leg)
         if reason in ("stoploss", "target") and not self._squaring:
-            self._spawn(self._maybe_reenter(leg, reason))
+            # AlgoTest CANDLE_CLOSE: Re-ASAP / Re-Momentum / Re-Cost start at the candle close after the
+            # exit; an exit that itself went out at the close re-enters immediately after it
+            if self.settings.trade_monitoring == "CANDLE_CLOSE" and not leg.exited_at_close:
+                self._pending_reentries.append((leg, reason))
+                self._event(f"Leg {leg.leg_number}: re-entry waits for the candle close")
+            else:
+                self._spawn(self._maybe_reenter(leg, reason))
 
     def _ls(self, leg_number: int) -> LegExecution:
         """The leg-level execution settings this leg runs with."""
@@ -1443,8 +1486,7 @@ class DeploymentRunner:
         return (leg.sl is not None and leg.status == "open" and not leg.sl_order_id
                 and str(leg.meta.get("stoploss_type") or "POINTS").upper() in PREMIUM_TYPES
                 and ls.exit_order_type == "LIMIT"            # MPP exits: AlgoTest keeps the stop in software, no SL-L / buffers
-                and ls.sl_order_at_broker
-                and self.settings.trade_monitoring == "LTP"
+                and ls.sl_order_at_broker                    # premium stops are tick-judged in BOTH monitoring modes
                 and getattr(self.broker, "supports_stop_limit", None) is not False)
 
     def _sl_prices(self, leg: LegState) -> tuple[float, float]:
@@ -1602,7 +1644,8 @@ class DeploymentRunner:
             if self.is_multiday and not self.paused and now.date() < self.exit_date and secs_now() >= OVERNIGHT_PAUSE_SECS:
                 await self._pause_overnight()
             if self.mode == "live" and time.time() - self._last_reconcile >= self.RECONCILE_EVERY_SECS \
-                    and MARKET_OPEN_SECS <= secs_now() <= MARKET_CLOSE_SECS:
+                    and is_trading_day(now.date()) and MARKET_OPEN_SECS <= secs_now() <= MARKET_CLOSE_SECS \
+                    and not getattr(self.broker, "session_lost", False):
                 self._last_reconcile = time.time()
                 await self._reconcile_with_broker("periodic")
             for leg in self.legs:                      # once a second: open legs priced on old ticks
@@ -1948,22 +1991,40 @@ class DeploymentRunner:
                 best = (round(price, 2), ts or now_ist(), str(r.get("AppOrderID")))
         return best
 
+    def _exit_problem(self, leg: LegState, message: str, level: str = "error", reason: str | None = None):
+        """The first failure of an exit (or a failure with a NEW reason) is an event the
+        user sees; identical repeats while retrying go to the log file only."""
+        reason = reason if reason is not None else str(leg.error or "")
+        if leg.exit_fails == 0 or reason != leg.last_exit_error:
+            self._event(message, level)
+        else:
+            logger.warning(f"[RUN {self.id}] {message} (attempt {leg.exit_fails + 1}, same reason)")
+        leg.last_exit_error = reason
+
     def _exit_failed(self, leg: LegState):
         """A rejected / unfilled exit leaves the leg open with its stop still
         breached, so the very next tick would send another order. Back off
-        5 s, 10 s, 20 s ... capped at 60 s between automatic retries; a manual
-        square-off is never blocked by this."""
+        5 s, 10 s, 20 s ... capped at 60 s between automatic retries -- except
+        for a broker connectivity fault ("exchange adapter is not connected"),
+        which is retried every few seconds so the exit goes out the moment
+        the link is back; a manual square-off is never blocked by this."""
         leg.exit_fails += 1
-        delay = min(5 * 2 ** (leg.exit_fails - 1), 60)
+        transient = any(m in str(leg.error or "").lower() for m in TRANSIENT_BROKER_MARKERS)
+        delay = EXIT_RETRY_TRANSIENT_SECS if transient \
+            else min(EXIT_RETRY_BASE_SECS * 2 ** (leg.exit_fails - 1), EXIT_RETRY_MAX_SECS)
         leg.next_exit_try = time.time() + delay
-        self._event(f"Leg {leg.leg_number}: exit attempt {leg.exit_fails} failed -- next automatic retry in {delay}s", "warn")
+        msg = f"Leg {leg.leg_number}: exit attempt {leg.exit_fails} failed -- next automatic retry in {delay}s"
+        if leg.exit_fails == 1:
+            self._event(msg, "warn")
+        else:
+            logger.warning(f"[RUN {self.id}] {msg}")
 
     def _warn_if_stale(self, leg: LegState, where: str):
         """Warn when the leg's LTP has not updated for STALE_LTP_SECS. One
         warning per leg per STALE_WARN_EVERY_SECS, so a dead feed does not
         flood the log. The index age is printed too: a quiet option with a
         ticking index is just an illiquid strike, both quiet = feed problem."""
-        if leg.key is None or not (MARKET_OPEN_SECS <= secs_now() <= MARKET_CLOSE_SECS):
+        if leg.key is None or not is_trading_day(today_ist()) or not (MARKET_OPEN_SECS <= secs_now() <= MARKET_CLOSE_SECS):
             return
         age = self.store.age(leg.key)
         if age <= self.STALE_LTP_SECS:
