@@ -1902,6 +1902,8 @@ class DeploymentRunner:
             # a fill needs a moment to reach the position book: never judge a fresh leg
             if leg.entry_ts and (now - leg.entry_ts).total_seconds() < self.RECONCILE_GRACE_SECS:
                 continue
+            if leg.status != "open" or leg.exit_at_close or leg.exit_fails:
+                continue
             iid = leg.contract.instrument_id
             if iid not in net:
                 # ABSENCE IS NOT PROOF. The book does not list this contract at all (a query
