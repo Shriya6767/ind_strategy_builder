@@ -39,6 +39,27 @@ class DailyFileHandler(logging.FileHandler):
         super().emit(record)
 
 
+class OncePerRunFilter(logging.Filter):
+    """Each call site logs once per run (reset() starts a run); errors always pass."""
+
+    def __init__(self):
+        super().__init__()
+        self.counts = {}
+
+    def reset(self):
+        self.counts = {}
+
+    def repeats(self) -> int:
+        return sum(n - 1 for n in self.counts.values())
+
+    def filter(self, record):
+        if record.levelno >= logging.ERROR:
+            return True
+        seen = self.counts.get(record.lineno, 0)
+        self.counts[record.lineno] = seen + 1
+        return seen == 0
+
+
 def get_logger(name: str) -> logging.Logger:
 
     logger = logging.getLogger(name)

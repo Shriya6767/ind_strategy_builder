@@ -155,8 +155,6 @@ class PortfolioRisk:
                     "legs_squared_off": squared,
                     "legs_cancelled": len(cancelled_now),
                 })
-                logger.info(f"Portfolio {reason} on {day} at {breach_dt.strftime('%H:%M')}: "
-                            f"MTM {mtm[idx]:,.0f}, {squared} leg(s) squared off, {len(cancelled_now)} cancelled")
                 carry_pnl = carry_capital = 0.0          # squared off: flat, next cycle starts at zero
                 continue
 
@@ -165,6 +163,10 @@ class PortfolioRisk:
         # drop day blocks emptied by cancellations
         for sid, blocks in reduced_by_id.items():
             reduced_by_id[sid] = [b for b in blocks if b["legs"]]
+        if exits:
+            sl_days = sum(1 for e in exits if e["exit_reason"] == "PORTFOLIO_STOPLOSS")
+            logger.info(f"Portfolio SL/target fired on {len(exits)} day(s): {sl_days} stoploss, "
+                        f"{len(exits) - sl_days} target ({exits[0]['trade_date']} to {exits[-1]['trade_date']})")
         return exits
 
     @staticmethod

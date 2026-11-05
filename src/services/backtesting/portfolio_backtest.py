@@ -67,8 +67,6 @@ class PortfolioBacktestService:
         start_date = request.get("start_date")
         end_date = request.get("end_date")
 
-        if portfolio_id is None:
-            raise ValueError("portfolio_id is required.")
         if not start_date or not end_date:
             raise ValueError("start_date and end_date are required.")
 

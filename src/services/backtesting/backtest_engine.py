@@ -1,10 +1,12 @@
 from src.core.modules import pd, np, datetime, date, timedelta
 from src.core.constant import REENTRY_MODES, OVERALL_REENTRY_MODES, QUANTITY, COST_BUFFER_PCT
-from src.core.logger import get_logger
+from src.core.logger import get_logger, OncePerRunFilter
 from src.services.backtesting.report_builder import BacktestReportBuilder
 from enum import Enum
 
 logger = get_logger(__name__)
+_once_per_run = OncePerRunFilter()
+logger.addFilter(_once_per_run)
 
 def _sanitize(obj):
     """Recursively replaces NaN/NaT/np.nan floats with None and formats
@@ -75,6 +77,7 @@ class BacktestEngine:
     _FALLBACK_STRIKE_STEP = 100
 
     def __init__(self, df: pd.DataFrame, request: dict):
+        _once_per_run.reset()
         # Shallow: the engine only replaces datetime_utc and appends
         # trade_date / trade_time (see prepare_dataframe), and pandas'
         # copy-on-write gives those writes their own storage without
@@ -328,7 +331,8 @@ class BacktestEngine:
         if self.strategy_type == "btst":
             self._flush_unclosed_final_holds()
             self._regroup_btst_by_entry_date()
-        logger.info("Backtest Completed.")
+        repeats = _once_per_run.repeats()
+        logger.info("Backtest Completed." + (f" {repeats} repeated message(s) not printed." if repeats else ""))
         return _sanitize({
             "trade_results": self.trade_results,
             **BacktestReportBuilder(
@@ -384,13 +388,11 @@ class BacktestEngine:
         # day, and nothing that grows with the years loaded.
         days = iter(grouped)
         current = self._as_day(next(days, None))
-        day_no = 0
         try:
             while current is not None:
                 upcoming = self._as_day(next(days, None))
                 self._next_day = upcoming
                 trade_date, day_df = current
-                day_no += 1
                 self._day_expiry_map = self._build_day_expiry_map(trade_date, day_df)
                 self._snapshot_cache = {}
                 self._reentry_frame_cache = {}
@@ -398,8 +400,6 @@ class BacktestEngine:
                     self.process_day_btst(trade_date, day_df)
                 else:
                     self.process_day_intraday(trade_date, day_df)
-                if day_no % 50 == 0 or day_no == total_days:
-                    logger.info(f"Processed {day_no}/{total_days} trading days (up to {trade_date})")
                 current = upcoming
         finally:
             self._next_day = None
@@ -1550,7 +1550,6 @@ class BacktestEngine:
         REMOVED from trade_results entirely, instead of shown as UNCLOSED.
         """
         if not self.held_from_previous_day:
-            logger.info("No unclosed overnight positions at end of backtest")
             return
 
         unresolved_leg_ids = {
