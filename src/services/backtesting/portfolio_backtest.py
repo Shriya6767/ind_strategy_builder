@@ -119,8 +119,6 @@ class PortfolioBacktestService:
         for s in overrides:
             if not s.get("strategy_id"):
                 raise ValueError("Each entry in strategy_overrides must include strategy_id.")
-            if not s.get("strategy_name"):
-                raise ValueError(f"strategy_id {s['strategy_id']}: strategy_name is required in strategy_overrides.")
             if not s.get("version"):
                 raise ValueError(f"strategy_id {s['strategy_id']}: version is required in strategy_overrides.")
 
@@ -163,7 +161,7 @@ class PortfolioBacktestService:
     def _expand_strategies(overrides: list, start_date: str, end_date: str, user_id: int) -> list:
         expanded = []
         for s in overrides:
-            result = GetStrategyService.get_strategy(s["strategy_id"], s["strategy_name"], s["version"], user_id)
+            result = GetStrategyService.get_strategy(s["strategy_id"], None, s["version"], user_id)
             if not result.get("success"):
                 raise ValueError(
                     f"Could not load strategy {s['strategy_id']} (v{s['version']}): {result.get('error')}"

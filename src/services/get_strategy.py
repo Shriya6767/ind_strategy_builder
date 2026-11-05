@@ -14,7 +14,7 @@ class GetStrategyService:
         Fetch complete strategy data from database by ID and name.
         Args:
             strategy_id: Unique identifier for the strategy
-            strategy_name: Strategy name (used for verification)
+            strategy_name: Strategy name (used for verification; None = match by id + version only)
             version: Strategy version
             user_id: owner; when given, another user's strategy is "not found"
         Returns:
@@ -68,9 +68,12 @@ class GetStrategyService:
                 leg_count,
                 version
             FROM strategy
-            WHERE strategy_id = %s AND strategy_name = %s AND version = %s
+            WHERE strategy_id = %s AND version = %s
             """
-            params = [strategy_id, strategy_name, version]
+            params = [strategy_id, version]
+            if strategy_name is not None:
+                strategy_query += " AND strategy_name = %s"
+                params.append(strategy_name)
             if user_id is not None:
                 strategy_query += " AND user_id = %s"
                 params.append(user_id)
@@ -151,7 +154,7 @@ class GetStrategyService:
                 "success": True,
                 "data": {
                     "strategy_id": strategy_id,
-                    "strategy_name": strategy_name,
+                    "strategy_name": row["strategy_name"],
                     "strategy": strategy_data,
                     "legs": selected_legs,
                     "unselected_legs": unselected_legs
