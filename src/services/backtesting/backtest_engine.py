@@ -3056,18 +3056,19 @@ class BacktestEngine:
             step_move = instrument_moves
             step_gain = stoploss_moves
         elif trail_sl_type == "PERCENT":
-            step_move = round(sl_threshold * instrument_moves / 100, 2)
-            step_gain = round(sl_threshold * stoploss_moves / 100, 2)
+            step_move = np.round(sl_threshold * instrument_moves / 100, 2)
+            step_gain = np.round(sl_threshold * stoploss_moves / 100, 2)
         else:
             logger.warning(f"Unsupported overall_trail_sl_type '{trail_sl_type}'")
             return sl_threshold
 
-        if not step_move or step_move <= 0:
+        step_move = np.asarray(step_move, dtype=float)
+        if not (step_move > 0).any():
             return sl_threshold
 
         best_so_far = np.maximum.accumulate(combined_mtm)
         favorable_move = np.clip(best_so_far, a_min=0, a_max=None)
-        steps = np.floor(favorable_move / step_move)
+        steps = np.floor(np.divide(favorable_move, step_move, out=np.zeros(len(favorable_move)), where=step_move > 0))
 
         return np.clip(sl_threshold - steps * step_gain, a_min=0, a_max=None)
 
