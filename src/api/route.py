@@ -378,6 +378,8 @@ def run_portfolio_backtest(request: dict, user=Depends(get_current_user)):
     try:
         portfolio_service = PortfolioBacktestService()
         return ORJSONResponse(portfolio_service.run_portfolio(request, user["user_id"]))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
