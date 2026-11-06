@@ -42,7 +42,7 @@ from src.live.deployment_store import RESUME_HINT, is_resumable
 from src.live.execution import (
     ExecutionSettings, LegExecution, limit_price, order_limit_price, mpp_price, round_tick, stop_limit_prices,
 )
-from src.live.strike_resolver import map_option_type, normalize_expiry_type, candidate_strikes, select_strike
+from src.live.strike_resolver import map_option_type, normalize_expiry_type, candidate_strikes, select_strike, PremiumNotMatched
 from src.live.xts_client import SEG_BSEFO, SEG_BSECM, XTSError, XTSTransportError
 from src.live.feed import Key, Candle
 from src.live.brokers import Broker, OrderUpdate
@@ -609,6 +609,13 @@ class DeploymentRunner:
         self._event(f"Leg {leg.leg_number}: {what} {leg.lots}x {contract.symbol} ({money}, spot {spot:.0f}, LTP {quotes.get(strike)})")
         return spot
 
+    def _resolve_failed(self, leg: LegState, e: Exception, what: str):
+        """No strike near the requested premium = the leg is simply not entered (skipped);
+        anything else is an entry error."""
+        skipped = isinstance(e, PremiumNotMatched)
+        leg.status, leg.error = ("skipped" if skipped else "error"), str(e)
+        self._event(f"Leg {leg.leg_number}: {what} -- {e}", "warn" if skipped else "error")
+
     def _next_attempt(self, leg_number: int) -> int:
         return 1 + sum(1 for l in self.legs if l.leg_number == leg_number and l.kind == "trade")
 
@@ -636,8 +643,7 @@ class DeploymentRunner:
                         if not self._arm_condition(leg, meta):
                             raise ValueError("observation leg needs simple momentum or range breakout as trigger")
                     except Exception as e:
-                        leg.status, leg.error = "error", str(e)
-                        self._event(f"Leg {leg.leg_number}: observation cannot start -- {e}", "error")
+                        self._resolve_failed(leg, e, "observation cannot start")
                     continue
                 base = _prepare_meta(seq_cfg, meta["leg_number"]) if seq_cfg else meta   
                 side = str(base.get("position_type", "BUY")).upper()
@@ -651,8 +657,7 @@ class DeploymentRunner:
                 try:
                     await self._resolve_contract(leg)
                 except Exception as e:
-                    leg.status, leg.error = "error", str(e)
-                    self._event(f"Leg {leg.leg_number}: cannot resolve contract -- {e}", "error")
+                    self._resolve_failed(leg, e, "cannot resolve contract")
                     continue
                 use_momentum = base.get("is_simple_momentum") and (mode == "ENTRY" or mode.startswith("OVERALL_RE_MOMENTUM"))
                 if use_momentum and self._arm_condition(leg, base, momentum_only=True):
@@ -1034,8 +1039,7 @@ class DeploymentRunner:
         try:
             await self._resolve_contract(leg)
         except Exception as e:
-            leg.status, leg.error = "error", str(e)
-            self._event(f"Leg {leg.leg_number}: sequential leg cannot resolve -- {e}", "error")
+            self._resolve_failed(leg, e, "sequential leg cannot resolve")
             await self._after_entries([leg])
             return
         if self._arm_condition(leg, meta):
@@ -1620,8 +1624,7 @@ class DeploymentRunner:
         try:
             await self._resolve_contract(new)          # RE_ASAP / RE_MOMENTUM / LAZY_LEG: fresh strike now
         except Exception as e:
-            new.status, new.error = "error", str(e)
-            self._event(f"Leg {leg.leg_number}: re-entry cannot resolve contract -- {e}", "error")
+            self._resolve_failed(new, e, "re-entry cannot resolve contract")
             await self._after_entries([new])                # a failed re-entry = error state with Resume
             return
         if mode.startswith("RE_MOMENTUM") or mode == "LAZY_LEG":

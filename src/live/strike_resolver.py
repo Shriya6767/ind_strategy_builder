@@ -3,14 +3,22 @@ so a strategy trades the same contract live that it traded in the backtest:
 
 * based on points  -> ATM = spot rounded to the ladder step; ITM/OTM-n walk
                       n steps inward/outward (CE inward = lower strike)
-* closest premium  -> the strike whose LTP is nearest premium_value
+* closest premium  -> the strike whose LTP is nearest premium_value, when it
+                      is within PREMIUM_MATCH_TOLERANCE of it
 * premium range    -> a strike whose LTP lies in [lower, upper]; SELL takes
-                      the richest, BUY the cheapest; none -> nearest to the band
+                      the richest, BUY the cheapest; none -> nearest to the
+                      band, when within PREMIUM_MATCH_TOLERANCE of that bound
+  (no such strike -> PremiumNotMatched: the leg is not entered)
 * atm percentage   -> ATM +/- pct% of ATM, snapped to the nearest listed strike
 """
 from src.core.modules import np
+from src.core.constant import PREMIUM_MATCH_TOLERANCE
 
 VALID_EXPIRY_TYPES = ("weekly", "next_weekly", "monthly", "next_monthly")
+
+
+class PremiumNotMatched(ValueError):
+    """No strike is priced near the requested premium: the leg is not entered."""
 
 
 def map_option_type(raw) -> str:
@@ -104,6 +112,9 @@ def select_strike(leg: dict, option_type: str, spot: float, strikes: np.ndarray,
         if want is None:
             raise ValueError("closest premium needs premium_value")
         strike = min(priced, key=lambda s: (abs(priced[s] - float(want)), abs(s - atm)))
+        if abs(priced[strike] - float(want)) > float(want) * PREMIUM_MATCH_TOLERANCE:
+            raise PremiumNotMatched(f"no {option_type} strike within {PREMIUM_MATCH_TOLERANCE:.0%} of premium "
+                                    f"{float(want):g} (nearest {strike} @ {priced[strike]:g}) -- leg not entered")
         return strike, _label_for(strike, atm, option_type)
 
     if criteria == "premium range":
@@ -114,6 +125,10 @@ def select_strike(leg: dict, option_type: str, spot: float, strikes: np.ndarray,
         in_range = {s: p for s, p in priced.items() if lower <= p <= upper}
         if not in_range:
             strike = min(priced, key=lambda s: (abs(priced[s] - min(max(priced[s], lower), upper)), abs(s - atm)))
+            bound = min(max(priced[strike], lower), upper)
+            if abs(priced[strike] - bound) > bound * PREMIUM_MATCH_TOLERANCE:
+                raise PremiumNotMatched(f"no {option_type} strike within {PREMIUM_MATCH_TOLERANCE:.0%} of premium range "
+                                        f"{lower:g}-{upper:g} (nearest {strike} @ {priced[strike]:g}) -- leg not entered")
         elif str(leg.get("position_type", "BUY")).upper() == "SELL":
             strike = max(in_range, key=in_range.get)
         else:

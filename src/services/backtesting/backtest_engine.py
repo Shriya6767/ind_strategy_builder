@@ -1,4 +1,5 @@
 from src.core.modules import pd, np, datetime, date, timedelta
+from src.core import constant
 from src.core.constant import REENTRY_MODES, OVERALL_REENTRY_MODES, QUANTITY, COST_BUFFER_PCT
 from src.core.logger import get_logger, OncePerRunFilter
 from src.services.backtesting.report_builder import BacktestReportBuilder
@@ -67,7 +68,7 @@ class BacktestEngine:
     # premium-based strike criteria. See _recently_priced.
     PREMIUM_MAX_PRICE_AGE_MINUTES = 15
 
-    PREMIUM_MATCH_TOLERANCE = 0.30
+    PREMIUM_MATCH_TOLERANCE = constant.PREMIUM_MATCH_TOLERANCE
     PREMIUM_MATCH_WAIT_MINUTES = 60
 
     # Sensex options quote in 5-paisa ticks.
