@@ -43,6 +43,9 @@ LEG_INSERT_QUERY = """
         range_end_day,
         range_end_time,
         range_on,
+        is_premium_diff,
+        premium_diff_mode,
+        premium_diff_operator,
         version,
         is_lazy_leg,
         is_sequential,
@@ -54,7 +57,7 @@ LEG_INSERT_QUERY = """
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-        %s, %s
+        %s, %s, %s, %s, %s
     )
     RETURNING leg_id;
 """
@@ -113,6 +116,9 @@ def insert_legs(cursor, strategy_id, version, request) -> int:
                 str(leg.get("range_end_day")) if leg.get("range_end_day") is not None else None,
                 leg.get("range_end_time"),
                 leg.get("range_on"),
+                bool(leg.get("is_premium_diff")),
+                leg.get("premium_diff_mode"),
+                leg.get("premium_diff_operator"),
                 version,
                 is_lazy_leg,
                 is_sequential,

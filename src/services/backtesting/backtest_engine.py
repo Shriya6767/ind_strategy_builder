@@ -150,6 +150,8 @@ class BacktestEngine:
         self._snapshot_day_df = None     # frame the current chain snapshot was built from
         self._strike_miss_status = "STRIKE_NOT_FOUND"  # why select_strike last returned None
         self._current_cycle = None       # active positional expiry cycle
+        self._prev_trade_date = {}       # trading date -> the previous one (premium diff)
+        self._premium_diff_cache = {}    # (date, strike, expiry) -> straddle values
 
 
     def _parse_entry_time(self) -> int:
@@ -190,6 +192,16 @@ class BacktestEngine:
             meta["option_type"] = self._map_option_type(leg)
             if leg.get("is_range_breakout"):
                 meta["_range_end_parsed"] = _parse_hms(leg.get("range_end_time"))
+            if leg.get("is_premium_diff"):
+                mode = str(leg.get("premium_diff_mode") or "").strip().lower()
+                operator = str(leg.get("premium_diff_operator") or "").strip()
+                if mode not in ("open", "close") or operator not in (">=", "<="):
+                    raise ValueError(
+                        f"Leg {index}: premium_diff_mode must be 'open'/'close' and "
+                        f"premium_diff_operator '>='/'<=' (got {mode!r}, {operator!r})."
+                    )
+                meta["premium_diff_mode"] = mode
+                meta["premium_diff_operator"] = operator
 
             sequential_leg_config = leg.get("sequential_leg")
             if sequential_leg_config:
@@ -1176,6 +1188,17 @@ class BacktestEngine:
                 "status": self._strike_miss_status,
             }
 
+        if leg_meta.get("is_premium_diff") and self._premium_diff_blocks(leg_meta, strike_row):
+            return {
+                "leg": leg_meta["leg_number"],
+                "position": leg_meta["position_type"],
+                "option": leg_meta["option_type"],
+                "ticker": strike_row["ticker"],
+                "strike": strike_row["strike"],
+                "moneyness": strike_row["moneyness"],
+                "status": "PREMIUM_DIFF_SKIPPED",
+            }
+
         if leg_meta.get("is_simple_momentum"):
             fill_row = self._resolve_momentum_fill(leg_meta, day_df, strike_row)
             if fill_row is None:
@@ -1208,6 +1231,58 @@ class BacktestEngine:
         )
         entry_result["status"] = "ENTRY_DONE"
         return entry_result
+
+
+    def _premium_diff_blocks(self, leg_meta, strike_row) -> bool:
+        """Premium-diff filter: the selected strike's straddle (CE + PE) on
+        today's FIRST candle (open or close) compared with its value at
+        yesterday's LAST candle close. The leg is skipped when
+        `today <op> yesterday` holds. No data on either day -> enter."""
+        today = pd.Timestamp(strike_row["datetime_utc"]).date()
+        if not self._prev_trade_date:
+            dates = self._trading_dates()
+            self._prev_trade_date = dict(zip(dates[1:], dates))
+        yesterday = self._prev_trade_date.get(today)
+        if yesterday is None:
+            return False
+        strike, expiry = strike_row["strike"], strike_row["expiration_date"]
+        key = (today, strike, expiry)
+        values = self._premium_diff_cache.get(key)
+        if values is None:
+            values = self._premium_diff_values(yesterday, today, strike, expiry)
+            self._premium_diff_cache[key] = values
+        prev_close, first_open, first_close = values
+        if prev_close is None:
+            logger.warning(
+                f"Leg {leg_meta['leg_number']}: premium diff -- no CE+PE bars for strike {strike} "
+                f"on {yesterday}/{today}, entering normally"
+            )
+            return False
+        mode = str(leg_meta.get("premium_diff_mode") or "close").strip().lower()
+        current = first_open if mode == "open" else first_close
+        operator = str(leg_meta.get("premium_diff_operator") or ">=").strip()
+        return current >= prev_close if operator == ">=" else current <= prev_close
+
+
+    def _premium_diff_values(self, yesterday, today, strike, expiry):
+        def straddle(date, pick):
+            frame = self._cycle_frame(date, date)
+            rows = frame.loc[(frame["strike"] == strike) & (frame["expiration_date"] == expiry)]
+            total_open = total_close = 0.0
+            for option_type in ("CE", "PE"):
+                side = rows.loc[rows["option_type"] == option_type]
+                if side.empty:
+                    return None
+                bar = side.iloc[pick]
+                total_open += float(bar["open"])
+                total_close += float(bar["close"])
+            return total_open, total_close
+
+        prev = straddle(yesterday, -1)
+        first = straddle(today, 0)
+        if prev is None or first is None:
+            return (None, None, None)
+        return (prev[1], first[0], first[1])
 
 
     @staticmethod
