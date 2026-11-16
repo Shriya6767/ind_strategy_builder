@@ -14,7 +14,7 @@ class GetStrategyService:
         Fetch complete strategy data from database by ID and name.
         Args:
             strategy_id: Unique identifier for the strategy
-            strategy_name: Strategy name (used for verification)
+            strategy_name: Strategy name (used for verification; None = match by id + version only)
             version: Strategy version
             user_id: owner; when given, another user's strategy is "not found"
         Returns:
@@ -68,9 +68,12 @@ class GetStrategyService:
                 leg_count,
                 version
             FROM strategy
-            WHERE strategy_id = %s AND strategy_name = %s AND version = %s
+            WHERE strategy_id = %s AND version = %s
             """
-            params = [strategy_id, strategy_name, version]
+            params = [strategy_id, version]
+            if strategy_name is not None:
+                strategy_query += " AND strategy_name = %s"
+                params.append(strategy_name)
             if user_id is not None:
                 strategy_query += " AND user_id = %s"
                 params.append(user_id)
@@ -126,6 +129,9 @@ class GetStrategyService:
                 range_end_day,
                 range_end_time,
                 range_on,
+                is_premium_diff,
+                premium_diff_mode,
+                premium_diff_operator,
                 is_lazy_leg,
                 is_sequential,
                 leg_name,
@@ -151,7 +157,7 @@ class GetStrategyService:
                 "success": True,
                 "data": {
                     "strategy_id": strategy_id,
-                    "strategy_name": strategy_name,
+                    "strategy_name": row["strategy_name"],
                     "strategy": strategy_data,
                     "legs": selected_legs,
                     "unselected_legs": unselected_legs
@@ -311,7 +317,9 @@ class GetStrategyService:
             "premium_value": v(row, "premium_value", int, 0),
             "lower_range": v(row, "lower_range", int, 0),
             "upper_range": v(row, "upper_range", int, 0),
-            "multiplier_percentage": v(row, "multiplier_percentage", int, 0),
+            # NUMERIC(10,2) in the DB: int() here truncated 0.5 to 0, so
+            # "ATM + 0.5%" silently resolved to the ATM strike itself.
+            "multiplier_percentage": v(row, "multiplier_percentage", float, 0.0),
 
             "is_target": v(row, "is_target", bool, False),
             "target_type": v(row, "target_type", str, "POINTS"),
@@ -343,6 +351,9 @@ class GetStrategyService:
             "range_end_day": v(row, "range_end_day", str),
             "range_end_time": v(row, "range_end_time", str),
             "range_on": v(row, "range_on"),
+            "is_premium_diff": v(row, "is_premium_diff", bool, False),
+            "premium_diff_mode": v(row, "premium_diff_mode", str, "close"),
+            "premium_diff_operator": v(row, "premium_diff_operator", str, ">="),
             "is_lazy_leg": v(row, "is_lazy_leg", bool, False),
             "is_sequential": v(row, "is_sequential", bool, False),
             "leg_name": v(row, "leg_name", str, ""),

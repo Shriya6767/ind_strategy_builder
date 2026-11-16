@@ -138,6 +138,39 @@ class UpdateStrategyService:
 
             legs_saved = insert_legs(cursor, strategy_id, version, request)
 
+            # A rename applies to the whole strategy: its other versions, its
+            # compare results and the copy held in the caller's saved portfolios.
+            new_name = strategy["strategy_name"]
+            cursor.execute(
+                "UPDATE strategy SET strategy_name = %s "
+                "WHERE strategy_id = %s AND user_id = %s AND strategy_name IS DISTINCT FROM %s;",
+                (new_name, strategy_id, user_id, new_name)
+            )
+            cursor.execute(
+                "UPDATE version_result SET strategy_name = %s "
+                "WHERE strategy_id = %s AND strategy_name IS DISTINCT FROM %s;",
+                (new_name, strategy_id, new_name)
+            )
+            cursor.execute(
+                """
+                UPDATE portfolio p
+                SET strategies = (
+                    SELECT jsonb_agg(
+                        CASE WHEN e->>'strategy_id' = %s
+                             THEN jsonb_set(e, '{strategy_name}', to_jsonb(%s::text))
+                             ELSE e END
+                        ORDER BY ord)
+                    FROM jsonb_array_elements(p.strategies) WITH ORDINALITY AS t(e, ord)
+                )
+                WHERE p.user_id = %s
+                  AND EXISTS (
+                        SELECT 1 FROM jsonb_array_elements(p.strategies) e
+                        WHERE e->>'strategy_id' = %s AND e->>'strategy_name' IS DISTINCT FROM %s
+                  );
+                """,
+                (str(strategy_id), new_name, user_id, str(strategy_id), new_name)
+            )
+
             conn.commit()
 
             logger.info(

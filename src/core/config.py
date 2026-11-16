@@ -32,15 +32,7 @@ DATABASE_PORT = os.getenv("DATABASE_PORT")
 DATABASE_NAME = os.getenv("DATABASE_NAME")
 DATABASE_USER = os.getenv("DATABASE_USER")
 DATABASE_PASSWORD = os.getenv("DATABASE_PASSWORD")
-# Connection pool: connections kept open and handed out per request instead
-# of a fresh TCP + password handshake (~20-50 ms) on every call.
-#   MIN  = connections kept WARM. psycopg2's pool closes any connection
-#          returned while MIN are already idle, so MIN is the real "pool
-#          size" for steady traffic; set it to the normal number of
-#          simultaneous DB requests (10 is plenty for 50 users).
-#   MAX  = hard cap under bursts (extra ones are opened and closed again).
-#          Must stay below PostgreSQL's max_connections (default 100).
-#   WAIT = seconds a request waits for a free connection before failing.
+
 DB_POOL_MIN: int = _int("DB_POOL_MIN", 5)
 DB_POOL_MAX: int = _int("DB_POOL_MAX", 20)
 DB_POOL_WAIT_SECONDS: int = _int("DB_POOL_WAIT_SECONDS", 10)
@@ -61,6 +53,29 @@ SMTP_FROM_NAME: str = os.getenv("SMTP_FROM_NAME") or "Strategy Builder"
 CORS_ORIGINS: list[str] = [
     o.strip() for o in (os.getenv("CORS_ORIGINS") or "*").split(",") if o.strip()
 ]
+
+BROKER_SECRET_KEY: str | None = os.getenv("BROKER_SECRET_KEY") or None
+
+LIVE_WORKER_URL: str = (os.getenv("LIVE_WORKER_URL") or "http://127.0.0.1:8001").rstrip("/")
+LIVE_WORKER_PORT: int = _int("LIVE_WORKER_PORT", 8001)
+LIVE_INTERNAL_TOKEN: str | None = os.getenv("LIVE_INTERNAL_TOKEN") or None
+
+LIVE_FEED_ROOT: str | None = os.getenv("LIVE_FEED_ROOT") or None          # e.g. https://xts.broker.com/apimarketdata
+LIVE_FEED_APP_KEY: str | None = os.getenv("LIVE_FEED_APP_KEY") or None
+LIVE_FEED_SECRET: str | None = os.getenv("LIVE_FEED_SECRET") or None
+LIVE_FEED_PUBLISH_FORMAT: str = (os.getenv("LIVE_FEED_PUBLISH_FORMAT") or "JSON").strip()   # JSON | Binary
+
+LIVE_COLO_CONNECTION_URL: str | None = os.getenv("LIVE_COLO_CONNECTION_URL") or None
+LIVE_COLO_HOST_LOOKUP_URL: str | None = os.getenv("LIVE_COLO_HOST_LOOKUP_URL") or None
+
+LIVE_SENSEX_INDEX_ID: int = _int("LIVE_SENSEX_INDEX_ID", 0)
+
+LIVE_ORDER_QTY_IN_LOTS: bool = _bool("LIVE_ORDER_QTY_IN_LOTS", False)
+LIVE_ORDER_TIMEOUT_SECONDS: int = _int("LIVE_ORDER_TIMEOUT_SECONDS", 50)# Where the daily contract master is cached (one text file per day).
+LIVE_MASTER_CACHE_DIR: str = os.getenv("LIVE_MASTER_CACHE_DIR") or "cache"
+LIVE_HOLIDAYS: list[str] = [d.strip() for d in (os.getenv("LIVE_HOLIDAYS") or "").split(",") if d.strip()]
+LIVE_AUTO_ACTIVATE_TIME: str = os.getenv("LIVE_AUTO_ACTIVATE_TIME") or "09:05:00"
+LIVE_SESSION_RESET_TIME: str = os.getenv("LIVE_SESSION_RESET_TIME") or "08:30:00"
 
 
 class _PooledConnection:

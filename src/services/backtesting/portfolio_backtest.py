@@ -6,8 +6,10 @@ from src.core.config import PORTFOLIO_MAX_WORKERS
 from src.core.data_store import DataStore
 from src.core.logger import get_logger
 from src.services.backtesting.backtest_engine import BacktestEngine
+from src.services.backtesting.load_data import DataLoader
 from src.services.backtesting.report_builder import BacktestReportBuilder
 from src.services.backtesting.portfolio_report_builder import PortfolioReportBuilder
+from src.services.backtesting.portfolio_risk import PortfolioRisk, normalize_portfolio_risk
 from src.services.backtesting.slippage_service import SlippageService
 from src.services.get_strategy import GetStrategyService
 
@@ -65,13 +67,14 @@ class PortfolioBacktestService:
         start_date = request.get("start_date")
         end_date = request.get("end_date")
 
-        if portfolio_id is None:
-            raise ValueError("portfolio_id is required.")
         if not start_date or not end_date:
             raise ValueError("start_date and end_date are required.")
 
         overrides = request.get("strategy_overrides")
         self._validate(overrides)
+        # Portfolio-level overall SL/target, validated before any strategy
+        # runs so a bad request fails fast (same fields the save API stores).
+        risk = PortfolioRisk(normalize_portfolio_risk(request))
 
         strategies = self._expand_strategies(overrides, start_date, end_date, user_id)
 
@@ -82,6 +85,19 @@ class PortfolioBacktestService:
         if failures:
             raise RuntimeError(f"Portfolio backtest failed for strategies: {failures}")
 
+        # Judged on the combined MTM of EVERY strategy, day by day, after the
+        # strategies have run on their own; squares the whole portfolio off
+        # at the breach candle. Per-strategy summaries are rebuilt from the
+        # same executed-leg rows only when it actually fired (the report
+        # builder skips days with no executed leg, so a rebuild on an
+        # untouched strategy reproduces its original numbers anyway).
+        portfolio_exits = risk.apply(reduced_by_id, df) if risk.enabled else []
+        if portfolio_exits:
+            for sid, blocks in reduced_by_id.items():
+                payloads_by_id[sid].update(
+                    BacktestReportBuilder(blocks, period=(start_date, end_date)).build()
+                )
+
         merged_trade_results = PortfolioReportBuilder.merge_trade_results(reduced_by_id)
         aggregate_report = BacktestReportBuilder(merged_trade_results).build()
         # Response order follows the request's strategy_overrides order.
@@ -91,6 +107,7 @@ class PortfolioBacktestService:
             "aggregate": aggregate_report,
             "trade_results": merged_trade_results,
             "strategies": strategy_payloads,
+            "portfolio_exits": portfolio_exits,
         }
 
 
@@ -102,8 +119,6 @@ class PortfolioBacktestService:
         for s in overrides:
             if not s.get("strategy_id"):
                 raise ValueError("Each entry in strategy_overrides must include strategy_id.")
-            if not s.get("strategy_name"):
-                raise ValueError(f"strategy_id {s['strategy_id']}: strategy_name is required in strategy_overrides.")
             if not s.get("version"):
                 raise ValueError(f"strategy_id {s['strategy_id']}: version is required in strategy_overrides.")
 
@@ -129,6 +144,7 @@ class PortfolioBacktestService:
         concurrent portfolios from different users share the same
         read-only frame; each Sensex daily file carries every live expiry,
         so one frame serves every strategy."""
+        DataLoader.ensure_range(start_date, end_date)
         lo, hi = DataStore.bounds(start_date, end_date)
         if lo >= hi:
             avail = DataStore.loaded_range
@@ -145,7 +161,7 @@ class PortfolioBacktestService:
     def _expand_strategies(overrides: list, start_date: str, end_date: str, user_id: int) -> list:
         expanded = []
         for s in overrides:
-            result = GetStrategyService.get_strategy(s["strategy_id"], s["strategy_name"], s["version"], user_id)
+            result = GetStrategyService.get_strategy(s["strategy_id"], None, s["version"], user_id)
             if not result.get("success"):
                 raise ValueError(
                     f"Could not load strategy {s['strategy_id']} (v{s['version']}): {result.get('error')}"

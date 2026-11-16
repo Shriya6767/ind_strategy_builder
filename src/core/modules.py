@@ -53,5 +53,23 @@ import psycopg2
 from psycopg2 import pool as psycopg2_pool
 from pydantic import BaseModel
 import pyarrow.dataset as ds
+import pyarrow as pa
+import pyarrow.csv as pcsv
+import pyarrow.parquet as pq
 from calendar import month_name
 from datetime import datetime, date, timedelta, time as dt_time
+
+# --- live trading -----------------------------------------------------------
+import asyncio
+import base64
+import dataclasses
+import math
+import queue
+import struct
+import time
+import zlib
+from typing import Optional, Callable, Awaitable, Any
+from zoneinfo import ZoneInfo
+from fastapi import WebSocket, WebSocketDisconnect, Request
+import httpx
+from cryptography.fernet import Fernet, InvalidToken
