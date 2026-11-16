@@ -1,3 +1,5 @@
+#venv/bin/python scripts/preprocess_sensex.py
+
 """One-time batch preprocessor for Sensex 1-min data.
 
 Reads the raw daily spot + F&O parquet files, derives every column the
@@ -246,12 +248,16 @@ def main():
             converted += 1
         except Exception as exc:
             failed += 1
+            print(f"  !! {date.date()}: {exc}")
             continue
 
         if converted % 50 == 0:
             rate = converted / (time.perf_counter() - t0)
+            print(f"  ... {converted} days merged ({rate:.1f} days/s)")
 
     elapsed = time.perf_counter() - t0
+    print(f"merged {converted} days in {elapsed:.0f}s; skipped {skipped} already built, "
+          f"{missing_spot} without a spot file, {failed} failed")
     if failed:
         sys.exit(1)
 
