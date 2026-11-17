@@ -16,7 +16,10 @@ logger = get_logger(__name__)
 
 
 def is_resumable(dep: dict) -> bool:
-    return dep.get("status") == "error" and str(dep.get("status_reason") or "").endswith(RESUME_HINT)
+    """The deployment carries legs that never entered and await a Resume retry: an
+    `error` row, or a BTST / positional hold that went into its overnight pause (or a
+    scheduled morning restart) while in that state -- the failed legs survive the night."""
+    return dep.get("status") in ("error", "paused", "scheduled") and str(dep.get("status_reason") or "").endswith(RESUME_HINT)
 
 
 def _run(fn):
@@ -44,16 +47,16 @@ def _jsonable(obj):
     return orjson.loads(orjson.dumps(obj, default=str))
 
 
-def upsert_execution_setting(user_id: int, strategy_id: int, version: int, broker_account_id, settings: dict,
-                             auto_activate: bool) -> None:
+def upsert_execution_setting(user_id: int, strategy_id: int, version: int, broker_account_id, settings: dict) -> None:
+    # the table's auto_activate column is unused since 2026-11-17 (left at its default)
     def q(cur):
         cur.execute("""
-            INSERT INTO live_execution_setting (user_id, strategy_id, version, broker_account_id, settings, auto_activate, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            INSERT INTO live_execution_setting (user_id, strategy_id, version, broker_account_id, settings, updated_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
             ON CONFLICT (user_id, strategy_id) DO UPDATE SET
                 version = EXCLUDED.version, broker_account_id = EXCLUDED.broker_account_id,
-                settings = EXCLUDED.settings, auto_activate = EXCLUDED.auto_activate, updated_at = NOW()
-        """, (user_id, strategy_id, version, broker_account_id, Json(_jsonable(settings)), auto_activate))
+                settings = EXCLUDED.settings, updated_at = NOW()
+        """, (user_id, strategy_id, version, broker_account_id, Json(_jsonable(settings))))
     _run(q)
 
 
@@ -70,12 +73,6 @@ def list_execution_settings(user_id: int) -> list[dict]:
         return cur.fetchall()
     return _run(q)
 
-
-def list_auto_activate() -> list[dict]:
-    def q(cur):
-        cur.execute("SELECT * FROM live_execution_setting WHERE auto_activate = TRUE AND broker_account_id IS NOT NULL")
-        return cur.fetchall()
-    return _run(q)
 
 
 def create_deployment(*, user_id: int, strategy_id: int, strategy_name: str, version: int, broker_account_id,

@@ -12,7 +12,6 @@ PREMIUM_MATCH_TOLERANCE = 0.30
 MARKET_OPEN_SECS = 9 * 3600 + 15 * 60        # 09:15:00
 MARKET_CLOSE_SECS = 15 * 3600 + 30 * 60      # 15:30:00
 OVERNIGHT_PAUSE_SECS = 15 * 3600 + 45 * 60   # BTST / positional holds pause at 15:45
-AUTO_RESTART_SCAN_SECS = 8 * 3600 + 45 * 60  # the worker scan auto-restarts overnight holds from 08:45
 ENTRY_TIME_WINDOW = ("09:15:15", "15:29:00")   # AlgoTest's activation dialog limits
 EXIT_TIME_WINDOW = ("09:15:05", "15:29:30")
 
@@ -32,6 +31,8 @@ PENDING_STATUSES = ("pending", "entering", "waiting")
 # status_reason suffix of a RECOVERABLE error (AlgoTest's Error state): the worker keeps the
 # runner, the open legs stay monitored and Resume retries the failed leg(s)
 RESUME_HINT = "-- click Resume to retry"
+RESUME_RETRY_SECS = 60          # Resume: the failed legs are retried for this long, then Resume is offered again
+RESUME_RETRY_GAP_SECS = 5       # pause between two placements of the same leg inside the Resume window
 OVERNIGHT_REASON = "market closed -- restart before 09:15"
 RESTART_REASON = "restart scheduled at "
 MARGIN_ERROR_MARKERS = ("margin", "insufficient", "fund")     # broker rejection texts that mean a margin shortfall

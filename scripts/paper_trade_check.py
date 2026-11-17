@@ -58,7 +58,7 @@ settings = call("PUT", "/live/execution-settings", json={
     "strategy_id": strategy_id,
     "settings": {"mode": "paper", "entry_order_type": "LIMIT", "exit_order_type": "LIMIT",
                  "entry_limit_buffer": 3, "exit_limit_buffer": 3, "trade_monitoring": "LTP",
-                 "order_timeout_sec": 50, "execution_days": ["M", "T", "W", "Th", "F"]},
+                 "execution_days": ["M", "T", "W", "Th", "F"]},
 })
 print("execution settings saved:", settings["data"]["settings"]["mode"])
 

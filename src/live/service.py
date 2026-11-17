@@ -54,10 +54,9 @@ class LiveTradeService:
         else:
             broker_account_id = None
         version = int(body.get("version") or 0)
-        auto = bool(body.get("auto_activate", False))
-        store.upsert_execution_setting(user_id, strategy_id, version, broker_account_id, settings.to_dict(), auto)
+        store.upsert_execution_setting(user_id, strategy_id, version, broker_account_id, settings.to_dict())
         return {"strategy_id": strategy_id, "version": version, "broker_account_id": broker_account_id,
-                "settings": settings.to_dict(), "auto_activate": auto, "status": "ready"}
+                "settings": settings.to_dict(), "status": "ready"}
 
 
     @staticmethod
@@ -65,7 +64,7 @@ class LiveTradeService:
         today = today_ist()
         settings = [{
             "strategy_id": r["strategy_id"], "version": r["version"], "broker_account_id": r["broker_account_id"],
-            "settings": r["settings"], "auto_activate": r["auto_activate"], "updated_at": str(r["updated_at"]),
+            "settings": r["settings"], "updated_at": str(r["updated_at"]),
         } for r in store.list_execution_settings(user_id)]
         deployments = [_row_public(r) for r in store.list_deployments(user_id, today, with_active=True)]
         return {"trade_date": str(today), "execution_settings": settings, "deployments": deployments}
@@ -403,7 +402,7 @@ def _row_public(r: dict) -> dict:
         "deployment_id": r["deployment_id"], "strategy_id": r["strategy_id"], "strategy_name": r.get("strategy_name"),
         "version": r["version"], "broker_account_id": r.get("broker_account_id"), "mode": r["mode"],
         "trade_date": str(r["trade_date"]), "exit_date": str(r["exit_date"]), "status": r["status"],
-        "status_reason": r.get("status_reason"), "resumable": store.is_resumable(r),
+        "status_reason": r.get("status_reason"), "resumable": r["status"] == "error" and store.is_resumable(r),
         "realised_pnl": float(r.get("realised_pnl") or 0),
         "is_archived": r.get("is_archived", False), "created_at": str(r["created_at"]), "updated_at": str(r["updated_at"]),
     }
