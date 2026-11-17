@@ -73,7 +73,7 @@ class LegState:
         "leg_number", "meta", "attempt", "contract", "key", "side", "lots", "qty", "status", "kind",
         "entry_order_id", "entry_price", "entry_ts", "spot_at_entry", "sl", "tgt", "base_sl", "best_move",
         "trail_step", "trail_gain", "exit_order_id", "exit_price", "exit_ts", "exit_reason", "pnl",
-        "live_leg_id", "error", "reentry_sl_left", "reentry_tgt_left", "entry_payload", "last_check",
+        "live_leg_id", "error", "reentry_sl_left", "reentry_tgt_left", "entry_payload",
         "option_type", "entry_mode", "wait", "watch_key", "trigger", "trigger_up", "range_hi", "range_lo",
         "range_end_dt", "range_high_side", "wait_deadline", "seq_meta", "trade_id",
         "exit_fails", "next_exit_try", "last_exit_error", "wait_saved_at", "reconcile_miss",
@@ -106,7 +106,6 @@ class LegState:
         self.reentry_sl_left = int(meta.get("reentry_sl_value") or 0) if meta.get("is_reentry_sl") else 0
         self.reentry_tgt_left = int(meta.get("reentry_target_value") or 0) if meta.get("is_reentry_target") else 0
         self.entry_payload = None
-        self.last_check = 0.0
         # conditional-entry state
         self.wait: str | None = None              # momentum | range | cost
         self.watch_key: Key | None = None
@@ -218,6 +217,8 @@ class DeploymentRunner:
         # a wait that fired) failed; the open legs keep running, Resume retries the failed ones
         self.halted = is_resumable(dep)
         self.failed_legs: list[LegState] = []
+        self._resuming = False                    # a Resume retry window is running
+        self._resume_until: datetime | None = None
         self.last_unpaused: datetime | None = None
         self.legs: list[LegState] = []
         self._by_key: dict[Key, list[LegState]] = {}      # open legs by contract key
@@ -253,21 +254,32 @@ class DeploymentRunner:
         self._event("Paused: no new entries or exits until resumed")
 
     async def resume(self, restart_at: int | None = None):
+        if self.overnight_paused:
+            # Restart of a BTST / positional hold (the morning dialog): monitoring comes
+            # back and, if legs never entered yesterday, their Resume retry starts too
+            if self.status not in ("paused", "scheduled"):
+                return
+            when = self._restart_when(restart_at)
+            if when is None:
+                self._go_live()
+            else:
+                self._spawn(self._scheduled_restart(when))
+            return
         if self.halted:
             await self._resume_failed()
             return
         if self.status not in ("paused", "scheduled") or not self.paused:
             return
-        if not self.overnight_paused:
-            self.paused = False
-            self._set_status("running", None)
-            self._event("Resumed")
-            return
-        when = self._restart_when(restart_at)
-        if when is None:
-            self._go_live()
-        else:
-            self._spawn(self._scheduled_restart(when))
+        self.paused = False
+        self._set_status("running", None)
+        self._event("Resumed")
+
+    def _failed_nums(self) -> str:
+        return ", ".join(str(l.leg_number) for l in self.failed_legs)
+
+    def _hint(self) -> str:
+        """Suffix that marks a status reason as 'legs await Resume' (is_resumable)."""
+        return f"; leg(s) {self._failed_nums()} not entered {RESUME_HINT}" if self.halted else ""
 
     def _restart_when(self, restart_at: int | None) -> datetime | None:
         """'Restart Strategy' dialog: a restart time of day. Already past ->
@@ -287,7 +299,7 @@ class DeploymentRunner:
         return when
 
     async def _scheduled_restart(self, when: datetime):
-        self._set_status("scheduled", f"{RESTART_REASON}{when:%Y-%m-%d %H:%M:%S}")
+        self._set_status("scheduled", f"{RESTART_REASON}{when:%Y-%m-%d %H:%M:%S}{self._hint()}")
         self._event(f"Restart scheduled at {when:%Y-%m-%d %H:%M:%S}")
         await asyncio.sleep(max(0.0, (when - now_ist()).total_seconds()))
         if self.active and self.status == "scheduled" and self.overnight_paused:
@@ -295,14 +307,27 @@ class DeploymentRunner:
 
     def _go_live(self):
         """The restart moment: monitoring on, status running, the day-1 SL-L
-        orders (DAY validity, gone overnight) put back at the broker."""
+        orders (DAY validity, gone overnight) put back at the broker. Legs that
+        never entered before the pause get their Resume retry right away."""
         self.paused = self.overnight_paused = False
         self.last_unpaused = now_ist()
-        self._set_status("running", "restarted")
-        self._event("Restarted")
+        if self.halted:
+            self._set_status("error", f"restarted{self._hint()}")
+            self._event(f"Restarted -- open legs monitored; retrying leg(s) {self._failed_nums()} that never entered", "warn")
+        else:
+            self._set_status("running", "restarted")
+            self._event("Restarted")
         for leg in self.legs:
             if self._broker_sl_ok(leg):
                 self._spawn(self._place_sl_order(leg))
+        if self.halted:
+            self._spawn(self._resume_after_restart())
+
+    async def _resume_after_restart(self):
+        try:
+            await self._resume_failed()
+        except ValueError as e:
+            self._event(f"Retry of leg(s) {self._failed_nums()} not started: {e}", "warn")
 
     async def _pause_overnight(self):
         """15:45 on a carry day: monitoring stops, resting stops are
@@ -316,8 +341,9 @@ class DeploymentRunner:
                 leg.sl_order_id = leg.sl_payload = None
                 self._persist_leg(leg)
         self.paused = self.overnight_paused = True
-        self._set_status("paused", f"{OVERNIGHT_REASON} on {next_trading_day(today_ist())}")
-        self._event("Strategy has been paused -- market closed; restart it before the open to continue monitoring", "warn")
+        self._set_status("paused", f"{OVERNIGHT_REASON} on {next_trading_day(today_ist())}{self._hint()}")
+        self._event("Strategy has been paused -- market closed; restart it before the open to continue monitoring"
+                    + (f" (leg(s) {self._failed_nums()} never entered: the restart retries them)" if self.halted else ""), "warn")
 
     async def cancel_deployment(self):
         """AlgoTest 'Cancel Deployment' on a scheduled / paused strategy: no further
@@ -409,7 +435,8 @@ class DeploymentRunner:
             "deployment_id": self.id, "user_id": self.user_id, "strategy_id": self.dep["strategy_id"],
             "strategy_name": self.dep.get("strategy_name"), "version": self.dep["version"], "mode": self.mode,
             "strategy_type": self.strategy_type, "status": self.status, "status_reason": self.status_reason,
-            "resumable": self.halted,
+            "resumable": self.halted and self.status == "error" and not self._resuming,
+            "resume_until": self._resume_until.strftime("%H:%M:%S") if self._resuming and self._resume_until else None,
             "trade_date": str(self.trade_date), "exit_date": str(self.exit_date),
             "cycle_expiry": str(self.cycle_expiry) if self.cycle_expiry else None,
             "entry_time": hms(self.entry_secs), "exit_time": hms(self.exit_secs),
@@ -683,13 +710,13 @@ class DeploymentRunner:
         margin = [l for l in failed if any(m in str(l.error or "").lower() for m in MARGIN_ERROR_MARKERS)]
         initial = [l for l in failed if l.entry_mode in ("ENTRY", "SEQUENTIAL") or l.entry_mode.startswith("OVERALL_")]
         nums = ", ".join(str(l.leg_number) for l in failed)
-        # the whole strategy is squared off only for a MARGIN error, or when the strategy's own
-        # entry (not a later re-entry) failed and "square off on entry error" is on
-        if (margin or (initial and self.settings.squareoff_on_entry_error)) and (filled or self._any_open()):
-            why = "margin error" if margin else "failed to enter"
-            self._event(f"Leg(s) {nums} {why} -- squaring off the filled leg(s)", "error")
-            await self._squareoff_all("entry_error")
-            self._finish("error", f"leg(s) {nums} {why}: {failed[0].error}")
+        # AlgoTest "Auto Sq Off on Margin Error": a leg the broker rejected for margin squares
+        # off every filled / open leg and ends the strategy. Any other failure -- and a margin
+        # failure with the toggle off -- halts: the open legs keep running, Resume retries.
+        if margin and self.settings.squareoff_on_margin_error and (filled or self._any_open()):
+            self._event(f"Leg(s) {nums} margin error -- squaring off the filled leg(s)", "error")
+            await self._squareoff_all("margin_error")
+            self._finish("error", f"leg(s) {nums} margin error: {failed[0].error}")
             return
         if initial and not filled and not self._any_open() and not self._waiting:
             self._finish("error", f"no leg could enter: {failed[0].error}")
@@ -709,29 +736,71 @@ class DeploymentRunner:
         self._set_status("error", f"leg(s) {nums} entry failed: {failed[-1].error} {RESUME_HINT}")
         self._event(f"Leg(s) {nums} entry failed -- the other legs continue; Resume retries the failed leg(s)", "error")
 
+    RESUME_RETRY_SECS = constant.RESUME_RETRY_SECS
+    RESUME_RETRY_GAP_SECS = constant.RESUME_RETRY_GAP_SECS
+
     async def _resume_failed(self):
-        """Resume on a strategy in error (AlgoTest): the failed legs are retried at the
-        price available now -- their condition was already met when they failed -- and
-        monitoring continues; after the exit time Resume acts as Square Off."""
-        if now_ist() >= self.exit_dt:
+        """Resume on a strategy in error: for RESUME_RETRY_SECS (one minute) the legs
+        that never entered are placed again and again at the price available now --
+        their condition was already met when they failed -- while the open legs keep
+        running; an order still unfilled when the window ends is cancelled. Then the
+        strategy is either running (all entered) or in error again with Resume offered
+        once more. The window is capped at the market close and the exit time; after
+        the exit time Resume acts as Square Off."""
+        if self._resuming:
+            raise ValueError(f"retry in progress until {self._resume_until:%H:%M:%S}")
+        now = now_ist()
+        if now >= self.exit_dt:
             await self.squareoff("resume after exit time")
             return
-        retry, self.failed_legs, self.halted = self.failed_legs, [], False
-        self._set_status("running", None)
-        self._event(f"Resumed -- retrying leg(s) {', '.join(str(l.leg_number) for l in retry)}")
-        legs = []
-        for old in retry:
-            new = LegState(old.leg_number, old.meta, self._next_attempt(old.leg_number), old.side, entry_mode="RESUME")
-            new.trade_id, new.reentry_sl_left, new.reentry_tgt_left = old.trade_id, old.reentry_sl_left, old.reentry_tgt_left
-            self.legs.append(new)
-            legs.append(new)
+        if not is_trading_day(now.date()) or not (MARKET_OPEN_SECS <= secs_now() < MARKET_CLOSE_SECS):
+            raise ValueError("market is closed -- Resume between 09:15 and 15:30 on a trading day")
+        deadline = min(now + timedelta(seconds=self.RESUME_RETRY_SECS), at(now.date(), MARKET_CLOSE_SECS), self.exit_dt)
+        retry, self.failed_legs = self.failed_legs, []
+        self._resuming, self._resume_until = True, deadline
+        nums = ", ".join(str(l.leg_number) for l in retry)
+        self._set_status("error", f"retrying leg(s) {nums} until {deadline:%H:%M:%S} {RESUME_HINT}")
+        self._event(f"Resumed -- retrying leg(s) {nums} until {deadline:%H:%M:%S}")
+        try:
+            results = await asyncio.gather(*(self._retry_until(old, deadline) for old in retry))
+        finally:
+            self._resuming, self._resume_until = False, None
+        # back to running first: _after_entries re-halts (error + Resume) if any leg still failed
+        self.halted = False
+        self._set_status("running", f"resumed -- retried leg(s) {nums}")
+        await self._after_entries(list(results))
+
+    async def _retry_until(self, old: LegState, deadline: datetime) -> LegState:
+        """One failed leg inside the Resume window: place it, and on a failure place it
+        again after RESUME_RETRY_GAP_SECS until the deadline. Each placement is a new
+        attempt row. A MARGIN rejection ends the retry at once (the toggle decides the
+        rest in _after_entries); an order unfilled at the deadline is cancelled."""
+        while True:
+            leg = LegState(old.leg_number, old.meta, self._next_attempt(old.leg_number), old.side, entry_mode="RESUME")
+            leg.trade_id, leg.reentry_sl_left, leg.reentry_tgt_left = old.trade_id, old.reentry_sl_left, old.reentry_tgt_left
+            self.legs.append(leg)
             try:
-                await self._resolve_contract(new)
+                await self._resolve_contract(leg)
             except Exception as e:
-                new.status, new.error = "error", str(e)
-                self._event(f"Leg {new.leg_number}: cannot resolve contract -- {e}", "error")
-        await self._place_entries([l for l in legs if l.status != "error"])
-        await self._after_entries(legs)
+                self._resolve_failed(leg, e, "cannot resolve contract")
+            if leg.status == "waiting":
+                return leg                                  # armed as a condition again
+            if leg.status != "error" and leg.status != "skipped":
+                remaining = (deadline - now_ist()).total_seconds()
+                if remaining <= 1:
+                    leg.status, leg.error = "error", "retry window ended before the order could be placed"
+                    return leg
+                await self._place_entry(leg, timeout=remaining)
+            if leg.status != "error":
+                return leg
+            if any(m in str(leg.error or "").lower() for m in MARGIN_ERROR_MARKERS):
+                return leg
+            remaining = (deadline - now_ist()).total_seconds()
+            if remaining <= self.RESUME_RETRY_GAP_SECS + 1:
+                return leg
+            self._event(f"Leg {leg.leg_number}: retry failed ({leg.error}) -- trying again in {self.RESUME_RETRY_GAP_SECS}s", "warn")
+            await asyncio.sleep(self.RESUME_RETRY_GAP_SECS)
+            old = leg
 
     def _any_open(self) -> bool:
         return any(l.is_open for l in self.legs)
@@ -742,7 +811,8 @@ class DeploymentRunner:
         # every leg is sent at the same moment, no buy-before-sell ordering
         await asyncio.gather(*(self._place_entry(l) for l in legs))
 
-    async def _place_entry(self, leg: LegState):
+    async def _place_entry(self, leg: LegState, timeout: float | None = None):
+        """`timeout` overrides the 50 s fill wait (a Resume retry waits only until its window ends)."""
         ls = self._ls(leg.leg_number)
         if ls.delay_entry_sec and leg.entry_mode == "ENTRY":
             await asyncio.sleep(ls.delay_entry_sec)       # "Delay entry by", per leg
@@ -789,10 +859,13 @@ class DeploymentRunner:
             return
         leg.entry_order_id = app_id
         self._persist_leg(leg)
-        upd = await self._await_fill(leg, app_id, payload, ls.entry_convert_to_market_sec,
-                                     ls.entry_limit_buffer, ls.buffer_kind("entry"), order_type)
+        convert = ls.entry_convert_to_market_sec
+        if timeout and convert:
+            convert = max(1, min(convert, int(timeout)))
+        upd = await self._await_fill(leg, app_id, payload, convert,
+                                     ls.entry_limit_buffer, ls.buffer_kind("entry"), order_type, timeout=timeout)
         if upd is None or upd.status != "Filled" or upd.filled_qty <= 0:
-            reason = (upd.reason if upd else "") or (f"not filled within {self.settings.order_timeout_sec}s" if upd is None
+            reason = (upd.reason if upd else "") or (f"not filled within {int(timeout or self.ORDER_TIMEOUT_SECS)}s" if upd is None
                                                     else upd.status.lower())
             leg.status, leg.error = "error", f"entry {reason}"
             self._event(f"Leg {leg.leg_number}: entry failed -- {reason}", "error")
@@ -804,6 +877,9 @@ class DeploymentRunner:
         self._on_entry_filled(leg, upd.avg_price or ltp)
 
     CHASE_STEP_SECS = constant.CHASE_STEP_SECS
+    # AlgoTest's rule (the banner in the execution dialog): a limit / SL-L order still open
+    # after this long is cancelled and the leg is an entry error. LIVE_ORDER_TIMEOUT_SECONDS in .env.
+    ORDER_TIMEOUT_SECS = config.LIVE_ORDER_TIMEOUT_SECONDS
 
     def _mpp(self, leg: LegState, side: str, fallback: float) -> float:
         ltp, bid, ask = self.store.quote(leg.key)
@@ -844,13 +920,15 @@ class DeploymentRunner:
                     return await self.broker.wait_terminal(app_id, 5.0)
 
     async def _await_fill(self, leg: LegState, app_id: str, payload: dict, convert_sec: int = 0,
-                          buffer: float = 0.0, buffer_type: str = "POINTS", order_type: str = "LIMIT") -> OrderUpdate | None:
+                          buffer: float = 0.0, buffer_type: str = "POINTS", order_type: str = "LIMIT",
+                          timeout: float | None = None) -> OrderUpdate | None:
+        timeout = timeout or self.ORDER_TIMEOUT_SECS
         if convert_sec > 0:
             upd = await self._chase(leg, app_id, payload, convert_sec, buffer, buffer_type, order_type)
         else:
-            upd = await self.broker.wait_terminal(app_id, self.settings.order_timeout_sec)
+            upd = await self.broker.wait_terminal(app_id, timeout)
         if upd is None:
-            self._event(f"Leg {leg.leg_number}: order {app_id} open after {self.settings.order_timeout_sec}s -- cancelling", "warn")
+            self._event(f"Leg {leg.leg_number}: order {app_id} open after {int(timeout)}s -- cancelling", "warn")
             try:
                 await self.broker.cancel(app_id, payload.get("orderUniqueIdentifier", ""))
             except XTSError as e:
@@ -1189,11 +1267,7 @@ class DeploymentRunner:
         self._check_waits(key, price, ts)
         if self.paused or not self._gate_open():
             return
-        freq = self.settings.monitoring_frequency_sec
         for leg in self._by_key.get(key, ()):
-            if freq and ts - leg.last_check < freq:
-                continue
-            leg.last_check = ts
             self._check_leg(leg, price)
         if key == self.engine.index_key:
             for legs in self._by_key.values():
@@ -1202,7 +1276,7 @@ class DeploymentRunner:
                                                  or str(leg.meta.get("target_type", "")).upper() in UNDERLYING_TYPES):
                         self._check_leg(leg, self.store.ltp(leg.key) or leg.entry_price, price)
         
-        self._check_overall(only_kill=self.settings.trade_monitoring != "LTP")
+        self._check_overall(hwm_only=self.settings.trade_monitoring != "LTP")
 
     def _on_candle(self, key: Key, candle: Candle):
         """CANDLE_CLOSE monitoring, AlgoTest's rules: the SENSEX candle (it ticks every
@@ -1299,23 +1373,17 @@ class DeploymentRunner:
     def _trade_realised(self) -> float:
         return sum(l.pnl for l in self.legs if l.trade_id == self._trade_id and l.status == "closed")
 
-    def _check_overall(self, only_kill: bool = False):
+    def _check_overall(self, hwm_only: bool = False):
         if self._squaring:
-            return
-        unreal = self.unrealised()
-        if self.settings.max_daily_loss and (self.realised + unreal) <= -self.settings.max_daily_loss:
-            self._event(f"Max daily loss {self.settings.max_daily_loss:.0f} breached (MTM {self.realised + unreal:.0f}) -- squaring off", "error")
-            self._squaring = True          # claim the breach NOW: the next tick must not fire it again
-            self._spawn(self._finish_after_squareoff("max_daily_loss"))
             return
         ov = self._overall
         if not ov:
             return
-        mtm = self._trade_realised() + unreal
+        mtm = self._trade_realised() + self.unrealised()
         sl = ov["sl"]
         if sl is not None and ov["trail_step"] and mtm > ov["best"]:
             ov["best"] = mtm                       # the trailing high-water mark updates on every tick in both modes
-        if only_kill:
+        if hwm_only:
             return                                 # CANDLE_CLOSE: the stop / target / trail are judged at the candle close
         if sl is not None and ov["trail_step"]:
             steps = math.floor(max(ov["best"], 0) / ov["trail_step"])
@@ -1412,8 +1480,9 @@ class DeploymentRunner:
             upd = await self._chase(leg, app_id, payload, ls.exit_convert_to_market_sec,
                                     ls.exit_limit_buffer, ls.buffer_kind("exit"), order_type)
         else:
-            upd = await self.broker.wait_terminal(app_id, self.settings.order_timeout_sec)
-        if (upd is None or upd.status != "Filled") and self.settings.exit_fallback_market:
+            upd = await self.broker.wait_terminal(app_id, self.ORDER_TIMEOUT_SECS)
+        if upd is None or upd.status != "Filled":
+            # an exit must never be left resting: re-price it to MPP, then cancel + fresh MPP order
             self._exit_problem(leg, f"Leg {leg.leg_number}: exit limit {_order_outcome(upd)} -- re-pricing as MPP", "warn",
                                reason=_order_outcome(upd))
             try:
@@ -1790,20 +1859,21 @@ class DeploymentRunner:
             await self._spot()
         await self._reconcile_with_broker("restore")   # the broker's book is the truth after a restart
         await self._restore_waits()
-        if self.halted:                                   # error state survives a worker restart
+        if self.halted:                                   # legs awaiting Resume survive a worker restart
             latest = {l.leg_number: l for l in self.legs if l.kind == "trade"}
             self.failed_legs = [l for l in latest.values() if l.status == "error"]
-            self._event(f"Restored in error state -- leg(s) {', '.join(str(l.leg_number) for l in self.failed_legs)} "
-                        f"await Resume; the open legs are monitored", "warn")
-        elif self.status == "paused":
+            self._event(f"Restored with leg(s) {self._failed_nums()} never entered -- they await Resume; "
+                        f"the open legs are monitored", "warn")
+        if self.status == "paused":
             self.paused = True
         elif self.status == "scheduled" and self.overnight_paused:      # a restart scheduled before the worker died
-            when = datetime.strptime(self.status_reason[len(RESTART_REASON):], "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
+            stamp = self.status_reason[len(RESTART_REASON):len(RESTART_REASON) + 19]
+            when = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
             self._spawn(self._scheduled_restart(when))
         elif self.is_multiday and secs_now() < MARKET_OPEN_SECS:
             self.paused = self.overnight_paused = True
             self._spawn(self._scheduled_restart(at(today_ist(), RESTART_EARLIEST_SECS)))
-        else:
+        elif not self.halted:
             self._set_status("running", "restored after restart")
         self._arm()
         for key in list(self._by_key):

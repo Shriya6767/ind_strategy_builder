@@ -74,7 +74,6 @@ LIVE_ORDER_QTY_IN_LOTS: bool = _bool("LIVE_ORDER_QTY_IN_LOTS", False)
 LIVE_ORDER_TIMEOUT_SECONDS: int = _int("LIVE_ORDER_TIMEOUT_SECONDS", 50)# Where the daily contract master is cached (one text file per day).
 LIVE_MASTER_CACHE_DIR: str = os.getenv("LIVE_MASTER_CACHE_DIR") or "cache"
 LIVE_HOLIDAYS: list[str] = [d.strip() for d in (os.getenv("LIVE_HOLIDAYS") or "").split(",") if d.strip()]
-LIVE_AUTO_ACTIVATE_TIME: str = os.getenv("LIVE_AUTO_ACTIVATE_TIME") or "09:05:00"
 LIVE_SESSION_RESET_TIME: str = os.getenv("LIVE_SESSION_RESET_TIME") or "08:30:00"
 
 

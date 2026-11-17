@@ -453,10 +453,10 @@ async def live_broker_funds(broker_account_id: int, user=Depends(get_current_use
 
 @router.put("/live/execution-settings")
 def live_save_execution_settings(request: dict, user=Depends(get_current_user)):
-    """{strategy_id, version?, broker_account_id?, auto_activate?,
-        settings: {mode, qty_multiplier, trade_monitoring, monitoring_frequency_sec, strategy_execution_time,
-                   order_timeout_sec, exit_fallback_market, execution_days_mode, execution_days, execution_dte,
-                   squareoff_on_entry_error, max_daily_loss, paper_slippage_pct,
+    """{strategy_id, version?, broker_account_id?,
+        settings: {mode, qty_multiplier, trade_monitoring, strategy_execution_time,
+                   execution_days_mode, execution_days, execution_dte,
+                   squareoff_on_margin_error,
                    legs: {"<leg number>": {product, tgt_sl_ref_price, delay_entry_sec, entry_order_type,
                           exit_order_type, entry_buffer_type, exit_buffer_type, entry_trigger_buffer,
                           entry_limit_buffer, exit_trigger_buffer, exit_limit_buffer, sl_order_at_broker,

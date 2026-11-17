@@ -8,13 +8,12 @@ running / paused in the DB, then run three background loops:
   * broadcast -- every second, push a snapshot to the users whose runners
     changed (or whose legs have live quotes);
   * scan      -- every 30 s, start deployments the API created while the
-    worker was unreachable, and run daily auto-activation;
+    worker was unreachable;
   * housekeeping -- drop finished runners from memory after the session.
 """
 from src.core.modules import asyncio, time, orjson, datetime, date, timedelta, WebSocket, Optional
 from src.core import config
 from src.core.logger import get_logger
-from src.core.constant import AUTO_RESTART_SCAN_SECS
 from src.live import deployment_store as store
 from src.live.deployment_store import DbWriter
 from src.live.feed import TickStore, XTSMarketFeed, Key
@@ -24,11 +23,9 @@ from src.live.broker_store import BrokerAccountService
 from src.live.runner import DeploymentRunner, TERMINAL_STATUSES
 from src.live.execution import ExecutionSettings
 from src.live.xts_client import SEG_BSECM, XTSError, MARKETDATA_PATH
-from src.live.timeutil import today_ist, now_ist, parse_hms, secs_now, weekday_code, is_trading_day
+from src.live.timeutil import today_ist, now_ist, parse_hms, secs_now
 
 logger = get_logger(__name__)
-
-AUTO_RESTART_FROM_SECS = parse_hms(config.LIVE_SESSION_RESET_TIME)   # a login before the broker's reset is dead on arrival
 
 
 def _restart_at(body: dict | None) -> int | None:
@@ -48,7 +45,6 @@ class LiveEngine:
         self._ws: dict[int, set[WebSocket]] = {}           # user_id -> sockets
         self._dirty: set[int] = set()
         self._tasks: list[asyncio.Task] = []
-        self._auto_done_for: date | None = None
         self._feed_relogin_for: date | None = None
         self._waiting_broker: set[int] = set()            # restores blocked on a stale broker session (logged once)
         self._lock = asyncio.Lock()
@@ -116,7 +112,7 @@ class LiveEngine:
     async def broker_for(self, dep: dict) -> Broker:
         settings = ExecutionSettings.from_dict(dep["settings"])
         if dep["mode"] != "live":
-            return PaperBroker(self.store, settings.paper_slippage_pct)
+            return PaperBroker(self.store)
         acct = dep.get("broker_account_id")
         cached = self.brokers.get(acct)
         sess = BrokerAccountService.get_session(acct) if acct else None
@@ -142,22 +138,7 @@ class LiveEngine:
         for r in self.runners.values():
             if r.active and r.dep.get("broker_account_id") == acct and r.mode == "live":
                 r.broker = broker
-        await self.auto_restart(acct)
         return broker
-
-    async def auto_restart(self, broker_account_id: int | None = None):
-        """after the broker's session reset, a broker login (or the 08:45 scan) restarts the
-        overnight-paused BTST / positional deployments that opted in."""
-        if secs_now() < AUTO_RESTART_FROM_SECS or not is_trading_day(today_ist()):
-            return
-        for r in list(self.runners.values()):
-            if r.overnight_paused and r.settings.auto_restart \
-                    and (broker_account_id is None or r.dep.get("broker_account_id") == broker_account_id):
-                try:
-                    await r.resume()
-                    logger.info(f"[ENGINE] auto-restarted deployment {r.id}")
-                except Exception as e:
-                    logger.error(f"[ENGINE] auto-restart of deployment {r.id} failed: {e}")
 
 
     async def activate(self, deployment_id: int, restore: bool = False) -> dict:
@@ -332,9 +313,6 @@ class LiveEngine:
                         except Exception as e:
                             if dep["deployment_id"] not in self._waiting_broker:
                                 logger.error(f"[ENGINE] scan: deployment {dep['deployment_id']} failed to start: {e}")
-                await self._auto_activate()
-                if secs_now() >= AUTO_RESTART_SCAN_SECS:
-                    await self.auto_restart()
                 # forget finished runners after 16:00 so memory does not grow across days
                 if secs_now() > 16 * 3600:
                     for did, r in list(self.runners.items()):
@@ -344,30 +322,6 @@ class LiveEngine:
                 raise
             except Exception as e:
                 logger.exception(f"[ENGINE] scan loop error: {e}")
-
-
-    async def _auto_activate(self):
-        today = today_ist()
-        if self._auto_done_for == today or not is_trading_day(today):
-            return
-        if secs_now() < parse_hms(config.LIVE_AUTO_ACTIVATE_TIME):
-            return
-        self._auto_done_for = today
-        from src.live.service import LiveTradeService, LiveValidationError
-        for row in store.list_auto_activate():
-            try:
-                settings = ExecutionSettings.from_dict(row["settings"])
-                if weekday_code(today) not in settings.execution_days:
-                    continue
-                if store.has_active_deployment(row["user_id"], row["strategy_id"], today):
-                    continue
-                dep = LiveTradeService.create_deployment(row["user_id"], {"strategy_id": row["strategy_id"]})
-                await self.activate(dep["deployment_id"])
-                logger.info(f"[ENGINE] auto-activated strategy {row['strategy_id']} for user {row['user_id']}")
-            except LiveValidationError as e:
-                logger.warning(f"[ENGINE] auto-activate skipped strategy {row['strategy_id']} user {row['user_id']}: {e}")
-            except Exception as e:
-                logger.error(f"[ENGINE] auto-activate failed strategy {row['strategy_id']}: {e}")
 
 
     def notify(self, runner: DeploymentRunner):

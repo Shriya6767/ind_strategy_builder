@@ -1,13 +1,12 @@
 """Execution settings (the per-strategy "Select execution" dialog) and the
 price arithmetic shared by every broker adapter."""
 from src.core.modules import dataclasses, math
-from src.core import config
 from src.core.constant import TICK, VALID_DAYS, MPP_SLABS
 
 STRATEGY_KEYS = frozenset({
-    "mode", "qty_multiplier", "trade_monitoring", "monitoring_frequency_sec", "strategy_execution_time",
-    "order_timeout_sec", "exit_fallback_market", "execution_days_mode", "execution_days", "execution_dte",
-    "squareoff_on_entry_error", "max_daily_loss", "paper_slippage_pct", "auto_restart", "legs",
+    "mode", "qty_multiplier", "trade_monitoring", "strategy_execution_time",
+    "execution_days_mode", "execution_days", "execution_dte",
+    "squareoff_on_margin_error", "legs",
 })
 LEG_KEYS = frozenset({
     "product", "tgt_sl_ref_price", "delay_entry_sec", "entry_order_type", "exit_order_type",
@@ -91,17 +90,11 @@ class ExecutionSettings:
     mode: str = "paper"                      # paper | live
     qty_multiplier: int = 1
     trade_monitoring: str = "LTP"            # LTP | CANDLE_CLOSE
-    monitoring_frequency_sec: int = 0        # LTP mode: 0 = every tick, N = at most one check per N s
     strategy_execution_time: str | None = None
-    order_timeout_sec: int = config.LIVE_ORDER_TIMEOUT_SECONDS
-    exit_fallback_market: bool = True
     execution_days_mode: str = "weekdays"    # weekdays | dte
     execution_days: tuple = ("M", "T", "W", "Th", "F")
     execution_dte: tuple = ()
-    squareoff_on_entry_error: bool = True
-    max_daily_loss: float | None = None
-    paper_slippage_pct: float = 0.0
-    auto_restart: bool = False               # BTST / positional: restart the overnight pause on broker login / 08:45
+    squareoff_on_margin_error: bool = True   # AlgoTest "Auto Sq Off on Margin Error"
     legs: dict = dataclasses.field(default_factory=dict)   # {"1": LegExecution, ...}
 
     @classmethod
@@ -121,11 +114,8 @@ class ExecutionSettings:
         if tm not in ("LTP", "CANDLE_CLOSE"):
             raise ValueError("trade_monitoring must be LTP or CANDLE_CLOSE")
         s.trade_monitoring = tm
-        s.monitoring_frequency_sec = max(0, int(raw.get("monitoring_frequency_sec", 0) or 0))
         set_time = raw.get("strategy_execution_time")
         s.strategy_execution_time = str(set_time).strip() if set_time else None
-        s.order_timeout_sec = max(5, int(raw.get("order_timeout_sec", s.order_timeout_sec) or s.order_timeout_sec))
-        s.exit_fallback_market = bool(raw.get("exit_fallback_market", s.exit_fallback_market))
         s.execution_days_mode = _enum(raw, "execution_days_mode", s.execution_days_mode, ("weekdays", "dte"), upper=False)
         days = raw.get("execution_days")
         if days:
@@ -140,11 +130,7 @@ class ExecutionSettings:
             raise ValueError("execution_dte must be a list of integers")
         if s.execution_days_mode == "dte" and not s.execution_dte:
             raise ValueError("execution_days_mode 'dte' needs execution_dte, e.g. [0, 1]")
-        s.squareoff_on_entry_error = bool(raw.get("squareoff_on_entry_error", s.squareoff_on_entry_error))
-        mdl = raw.get("max_daily_loss")
-        s.max_daily_loss = abs(float(mdl)) if mdl not in (None, "", 0, "0") else None
-        s.paper_slippage_pct = float(raw.get("paper_slippage_pct", 0) or 0)
-        s.auto_restart = bool(raw.get("auto_restart", s.auto_restart))
+        s.squareoff_on_margin_error = bool(raw.get("squareoff_on_margin_error", s.squareoff_on_margin_error))
         legs = raw.get("legs") or {}
         if not isinstance(legs, dict):
             raise ValueError("legs must be an object keyed by leg number")
