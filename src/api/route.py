@@ -209,6 +209,8 @@ def save_strategy(request: dict, user=Depends(get_current_user)):
         result = SaveStrategyService.save_strategy(request, user["user_id"])
         if not result["status"] and result.get("not_found"):
             raise HTTPException(status_code=404, detail={"status": False, "message": result["message"]})
+        if not result["status"] and result.get("conflict"):
+            raise HTTPException(status_code=409, detail={"status": False, "message": result["message"]})
         return {
             "status": result["status"],
             "message": "Strategy saved successfully." if result["status"] else result["message"],
@@ -234,7 +236,7 @@ def update_strategy(request: dict, user=Depends(get_current_user)):
         result = UpdateStrategyService.update_strategy(request, user["user_id"])
         if not result["status"]:
             raise HTTPException(
-                status_code=404 if result.get("not_found") else 400,
+                status_code=404 if result.get("not_found") else 409 if result.get("conflict") else 400,
                 detail={"status": False, "message": result["message"]}
             )
         return {
@@ -336,12 +338,16 @@ def save_portfolio(request: dict, user=Depends(get_current_user)):
     try:
         save_portfolio_service = SavePortfolioService()
         result = save_portfolio_service.save_portfolio(request, user["user_id"])
+        if not result["status"] and result.get("conflict"):
+            raise HTTPException(status_code=409, detail={"status": False, "message": result["message"]})
         return {
             "status": result["status"],
             "message": result["message"],
             "portfolio_id": result.get("portfolio_id"),
             "portfolio_name": result.get("portfolio_name")
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Unexpected error in save_portfolio: {e}")
         raise HTTPException(
@@ -476,8 +482,10 @@ def live_overview(user=Depends(get_current_user)):
 
 @router.post("/live/deployments")
 def live_activate(request: dict, user=Depends(get_current_user)):
-    """Activate: {strategy_id, version?, broker_account_id?, settings?, entry_date?, entry_time?, exit_date?, exit_time?}
-    -> deployment (starts in the worker). Timings: intraday fixed; BTST entry time / exit date / exit time; positional all."""
+    """Activate: {strategy_id, broker_account_id?, qty_multiplier?, entry_date?, entry_time?, exit_date?, exit_time?}
+    -> deployment (starts in the worker). Version and settings always come from the SAVED execution settings;
+    qty_multiplier = the dialog's FINAL value (saved multiplier x user input), used by this deployment only.
+    Timings: intraday fixed; BTST entry time / exit date / exit time; positional all."""
     try:
         return {"status": True, "message": "Strategy activated.", "data": LiveTradeService.activate(user["user_id"], request)}
     except Exception as e:
@@ -541,7 +549,9 @@ def live_restart_all(request: dict, user=Depends(get_current_user)):
 
 @router.get("/live/activation-timings")
 def live_activation_timings(strategy_id: int, version: int = 0, user=Depends(get_current_user)):
-    """Defaults + editability of the activation dialog's Entry/Exit timings box."""
+    """Activation dialog data: saved version / broker_account_id / qty_multiplier (dialog shows
+    'saved x input = final', Activate receives the final value) + defaults and editability of the
+    Entry/Exit timings box. version=0 -> the saved execution settings' version, else the latest."""
     try:
         return ORJSONResponse({"status": True, "data": LiveTradeService.activation_timings(user["user_id"], strategy_id, version)})
     except Exception as e:

@@ -14,9 +14,11 @@ class SavePortfolioService:
         conn = None
         try:
             portfolio_id = request.get("portfolio_id")
-            portfolio_name = request["portfolio_name"]
+            portfolio_name = str(request.get("portfolio_name") or "").strip()
             strategies = request["strategies"]
 
+            if not portfolio_name:
+                return {"status": False, "message": "Portfolio name is required."}
             if not strategies:
                 return {"status": False, "message": "At least one strategy is required."}
 
@@ -45,6 +47,19 @@ class SavePortfolioService:
             foreign = [sid for sid in wanted if sid not in owned]
             if foreign:
                 return {"status": False, "message": f"Strategy id(s) not found: {foreign}."}
+
+            cursor.execute(
+                """
+                SELECT 1 FROM portfolio
+                WHERE user_id = %s AND lower(trim(portfolio_name)) = lower(trim(%s))
+                  AND (%s::int IS NULL OR portfolio_id <> %s)
+                LIMIT 1;
+                """,
+                (user_id, portfolio_name, portfolio_id, portfolio_id),
+            )
+            if cursor.fetchone() is not None:
+                return {"status": False, "conflict": True,
+                        "message": f"Portfolio name '{portfolio_name}' already exists. Enter a different name."}
 
             if portfolio_id is None:
                 cursor.execute(

@@ -175,15 +175,21 @@ class LiveTradeService:
 
     @staticmethod
     def activation_timings(user_id: int, strategy_id: int, version: int = 0) -> dict:
-        """Defaults for the 'Edit Entry/Exit Timings' box of the activation dialog."""
-        head = LiveTradeService._strategy_head(strategy_id, user_id, version)
+        """Everything the activation dialog needs: the saved execution settings' version, broker and
+        qty_multiplier (the dialog shows 'saved x input = final' and sends the final value to Activate),
+        plus the defaults/editability of the 'Edit Entry/Exit Timings' box."""
+        saved = store.get_execution_setting(user_id, strategy_id)
+        head = LiveTradeService._strategy_head(strategy_id, user_id, version or int((saved or {}).get("version") or 0))
         loaded = GetStrategyService.get_strategy(strategy_id, head["strategy_name"], head["version"], user_id)
         if not loaded.get("success"):
             raise LiveValidationError(loaded.get("error") or "Strategy could not be loaded")
         strategy = loaded["data"]["strategy"]
         stype = str(strategy.get("strategy_type", "intraday")).lower()
         today = today_ist()
+        saved_settings = (saved or {}).get("settings") or {}
         out = {"strategy_id": strategy_id, "version": head["version"], "strategy_type": stype,
+               "broker_account_id": (saved or {}).get("broker_account_id"),
+               "qty_multiplier": max(1, int(saved_settings.get("qty_multiplier") or 1)),
                "entry_date": str(today), "entry_time": hms(_secs(strategy, "entry")),
                "exit_date": str(today), "exit_time": hms(_secs(strategy, "exit")), "expiry": None,
                "editable": {"entry_date": False, "entry_time": False, "exit_date": False, "exit_time": False}}
@@ -207,11 +213,17 @@ class LiveTradeService:
         if not strategy_id:
             raise LiveValidationError("strategy_id is required")
         saved = store.get_execution_setting(user_id, strategy_id)
-        version = int(body.get("version") or (saved or {}).get("version") or 0)
-        head = LiveTradeService._strategy_head(strategy_id, user_id, version)
+        head = LiveTradeService._strategy_head(strategy_id, user_id, int((saved or {}).get("version") or 0))
         version = head["version"]
-        raw_settings = {k: v for k, v in ((saved or {}).get("settings") or {}).items() if k in STRATEGY_KEYS}
-        raw_settings.update(body.get("settings") or {})
+        raw_settings = {k: v for k, v in ((saved or {}).get("settings") or {}).items() if k in STRATEGY_KEYS}      
+        if body.get("qty_multiplier") not in (None, ""):
+            try:
+                final_mult = int(body["qty_multiplier"])
+            except (TypeError, ValueError):
+                raise LiveValidationError("qty_multiplier must be a whole number >= 1")
+            if final_mult < 1:
+                raise LiveValidationError("qty_multiplier must be a whole number >= 1")
+            raw_settings["qty_multiplier"] = final_mult
         settings = ExecutionSettings.from_dict(raw_settings)
         broker_account_id = body.get("broker_account_id") or (saved or {}).get("broker_account_id")
         broker_account_id = int(broker_account_id) if broker_account_id else None

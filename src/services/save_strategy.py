@@ -163,6 +163,30 @@ def insert_legs(cursor, strategy_id, version, request) -> int:
     return inserted
 
 
+def clean_name(raw) -> str:
+    """A strategy/portfolio name as stored: stripped, never empty."""
+    name = str(raw or "").strip()
+    if not name:
+        raise ValueError("Name is required.")
+    return name
+
+
+def strategy_name_taken(cursor, user_id: int, name: str, exclude_strategy_id=None) -> bool:
+    """True when the caller already has ANOTHER strategy (any version) with this
+    name, compared case-insensitively. A strategy's own id is excluded so saving
+    a new version or updating it under its current name passes."""
+    cursor.execute(
+        """
+        SELECT 1 FROM strategy
+        WHERE user_id = %s AND lower(trim(strategy_name)) = lower(trim(%s))
+          AND (%s::bigint IS NULL OR strategy_id <> %s)
+        LIMIT 1;
+        """,
+        (user_id, name, exclude_strategy_id, exclude_strategy_id)
+    )
+    return cursor.fetchone() is not None
+
+
 class SaveStrategyService:
     @staticmethod
     def save_strategy(request, user_id: int):
@@ -177,6 +201,13 @@ class SaveStrategyService:
             legs = request["legs"]
 
             strategy_id = strategy.get("strategy_id")
+            try:
+                strategy["strategy_name"] = clean_name(strategy.get("strategy_name"))
+            except ValueError:
+                return {"status": False, "message": "Strategy name is required."}
+            if strategy_name_taken(cursor, user_id, strategy["strategy_name"], strategy_id):
+                return {"status": False, "conflict": True,
+                        "message": f"Strategy name '{strategy['strategy_name']}' already exists. Enter a different name."}
 
             if strategy_id is None:
                 cursor.execute(
