@@ -1,6 +1,6 @@
 from src.core.config import Database
 from src.core.logger import get_logger
-from src.services.save_strategy import insert_legs
+from src.services.save_strategy import insert_legs, clean_name, strategy_name_taken
 
 logger = get_logger(__name__)
 
@@ -48,6 +48,15 @@ class UpdateStrategyService:
                     "message": f"Strategy not found for strategy_id={strategy_id}, version={version}.",
                     "not_found": True,
                 }
+
+            # A rename must not collide with another of the caller's strategies.
+            try:
+                strategy["strategy_name"] = clean_name(strategy.get("strategy_name"))
+            except ValueError:
+                return {"status": False, "message": "Strategy name is required.", "not_found": False}
+            if strategy_name_taken(cursor, user_id, strategy["strategy_name"], strategy_id):
+                return {"status": False, "conflict": True, "not_found": False,
+                        "message": f"Strategy name '{strategy['strategy_name']}' already exists. Enter a different name."}
 
             cursor.execute(
                 """
