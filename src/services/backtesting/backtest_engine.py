@@ -44,6 +44,20 @@ def _secs(t) -> int:
     return t.hour * 3600 + t.minute * 60 + t.second
 
 
+_EXTENDED_FROM = np.datetime64(constant.MARKET_CLOSE_EXTENDED_FROM)
+
+
+def _session_close(day) -> int:
+    """Close of ONE trading day in seconds since midnight: 15:30 before
+    MARKET_CLOSE_EXTENDED_FROM, 15:40 from that session on."""
+    return constant.MARKET_CLOSE_SECS if np.datetime64(day) >= _EXTENDED_FROM else constant.MARKET_CLOSE_SECS_BEFORE
+
+
+def _session_close_of(dates: np.ndarray) -> np.ndarray:
+    """Per-row close for a datetime64 trade_date array (vectorized _session_close)."""
+    return np.where(dates >= _EXTENDED_FROM, constant.MARKET_CLOSE_SECS, constant.MARKET_CLOSE_SECS_BEFORE)
+
+
 def _parse_hms(raw) -> int:
     return _secs(datetime.strptime(str(raw), "%H:%M:%S"))
 
@@ -61,7 +75,6 @@ class BacktestEngine:
     # close; Day-2 carryover handling starts from the SECOND candle of the day
     # (label 09:17 = 09:16:00-09:16:59, AlgoTest's "9:16"): the opening candle's
     # prints are never judged (decided 2026-11-01).
-    _DEFAULT_DAY1_MARKET_CLOSE = "15:30:00"
     _DEFAULT_DAY2_MARKET_OPEN = "09:17:00"
 
     # How old a last traded price may be and still be matched by the
@@ -112,7 +125,11 @@ class BacktestEngine:
 
         self.is_delay_restart = bool(self.strategy.get("is_delay_restart"))
         if self._is_multiday:
-            self.day1_market_close = self._parse_day1_market_close()
+            # Day-1 close is PER DAY (15:30 before MARKET_CLOSE_EXTENDED_FROM, 15:40 from it):
+            # _set_day_close(trade_date) refreshes it before each BTST day / positional cycle.
+            # Until then it holds the later close, which also serves as the no-op cutoff for
+            # the already session-masked positional monitor frame.
+            self.day1_market_close = constant.MARKET_CLOSE_SECS
             self.day2_market_open = self._parse_day2_market_open()
             # Delay-restart: when enabled, carry-day monitoring of overnight
             # positions resumes at delay_restart_time instead of the second
@@ -171,8 +188,14 @@ class BacktestEngine:
         return _secs(exit_dt)
 
 
-    def _parse_day1_market_close(self) -> int:
-        return _parse_hms(self._DEFAULT_DAY1_MARKET_CLOSE)
+    def _set_day_close(self, day) -> None:
+        """BTST / positional: point the day-1 close and the entry-day scan
+        cutoff at THIS day's session close (15:30 or 15:40, see _session_close)
+        so SL/target, momentum, range-breakout and entry scans run to the
+        real last candle of the entry day."""
+        if self._is_multiday:
+            self.day1_market_close = _session_close(day)
+            self.entry_day_cutoff = self.day1_market_close
 
 
     def _parse_day2_market_open(self) -> int:
@@ -409,6 +432,7 @@ class BacktestEngine:
                 self._day_expiry_map = self._build_day_expiry_map(trade_date, day_df)
                 self._snapshot_cache = {}
                 self._reentry_frame_cache = {}
+                self._set_day_close(trade_date)
                 if self.strategy_type == "btst":
                     self.process_day_btst(trade_date, day_df)
                 else:
@@ -634,7 +658,9 @@ class BacktestEngine:
                 & (frame["strike"] == strike)
                 & frame["expiration_date"].isin(cycle["expiry_labels"])
             ]
-        rows = rows.loc[rows["trade_time"] <= self.day1_market_close].sort_values("datetime_utc")
+        # each cycle day ends at ITS OWN close (15:30 / 15:40)
+        rows = rows.loc[rows["trade_time"].to_numpy() <= _session_close_of(rows["trade_date"].to_numpy())]
+        rows = rows.sort_values("datetime_utc")
         self._cycle_ticker_cache[key] = rows
         return rows
 
@@ -646,6 +672,7 @@ class BacktestEngine:
         self._underlying_series_cache = None
         self._snapshot_cache = {}
         self._cycle_ticker_cache = {}
+        self._set_day_close(entry_date)
 
         entry_frame = self._cycle_frame(entry_date, entry_date)
         if entry_frame.empty:
@@ -719,7 +746,7 @@ class BacktestEngine:
         dates = frame["trade_date"].to_numpy()
         times = frame["trade_time"].to_numpy()
         entry_date, exit_date = np.datetime64(cycle["entry_date"]), np.datetime64(cycle["exit_date"])
-        in_session = times <= self.day1_market_close
+        in_session = times <= _session_close_of(dates)     # per-day close (15:30 / 15:40)
         if cycle["entry_date"] == cycle["exit_date"]:
             mask = (dates == entry_date) & (times >= self.entry_time) & (times <= self.exit_time)
         else:
@@ -2947,8 +2974,9 @@ class BacktestEngine:
             # Positional hands in an already session-masked multi-day frame
             # (entry day from entry_time, carry days from the delay-restart
             # start, exit day up to exit_time), so its time cutoff must be a
-            # no-op -- the frame IS the window. Intraday keeps exit_time.
-            cutoff = self.day1_market_close if self.is_positional else self.exit_time
+            # no-op -- the frame IS the window (the later close bounds every
+            # session). Intraday keeps exit_time.
+            cutoff = constant.MARKET_CLOSE_SECS if self.is_positional else self.exit_time
             return self._run_overall_risk_cycles(
                 day_df, result, active_legs, has_sl, has_target, cutoff=cutoff
             )

@@ -1,6 +1,7 @@
 from psycopg2.extras import RealDictCursor
 from src.core.config import Database
 from src.core.logger import get_logger
+from src.core.constant import DEFAULT_ENTRY_TIME, DEFAULT_EXIT_TIME
 
 logger = get_logger(__name__)
 
@@ -254,9 +255,9 @@ class GetStrategyService:
             "is_trail_sl_break_even": v(row, "is_trail_sl_break_even", bool, False),
             "trail_sl_break_even_type": v(row, "trail_sl_break_even_type", str, "POINTS"),
             "strategy_type": v(row, "strategy_type", str, "INTRADAY"),
-            "entry_time": v(row, "entry_time", str, "09:30:00"),
+            "entry_time": v(row, "entry_time", str, DEFAULT_ENTRY_TIME),
             "entry_delay": v(row, "entry_delay", int, 0),
-            "exit_time": v(row, "exit_time", str, "15:30:00"),
+            "exit_time": v(row, "exit_time", str, DEFAULT_EXIT_TIME),
             "exit_delay": v(row, "exit_delay", int, 0),
             "is_delay_restart": v(row, "is_delay_restart", bool, False),
             "delay_restart_time": v(row, "delay_restart_time", str),

@@ -10,10 +10,14 @@ COST_BUFFER_PCT = 0.05
 PREMIUM_MATCH_TOLERANCE = 0.30
 
 MARKET_OPEN_SECS = 9 * 3600 + 15 * 60        # 09:15:00
-MARKET_CLOSE_SECS = 15 * 3600 + 30 * 60      # 15:30:00
+MARKET_CLOSE_SECS = 15 * 3600 + 40 * 60      # 15:40:00 -- BSE F&O close since MARKET_CLOSE_EXTENDED_FROM (the live worker's close)
+MARKET_CLOSE_SECS_BEFORE = 15 * 3600 + 30 * 60   # 15:30:00 -- close of every session before MARKET_CLOSE_EXTENDED_FROM
+MARKET_CLOSE_EXTENDED_FROM = "2026-08-03"    # first session traded to 15:40 (backtest day-1 close switches here)
 OVERNIGHT_PAUSE_SECS = 15 * 3600 + 45 * 60   # BTST / positional holds pause at 15:45
-ENTRY_TIME_WINDOW = ("09:15:15", "15:29:00")   # AlgoTest's activation dialog limits
-EXIT_TIME_WINDOW = ("09:15:05", "15:29:30")
+ENTRY_TIME_WINDOW = ("09:15:15", "15:39:00")   # AlgoTest's activation dialog limits (close - 1 min)
+EXIT_TIME_WINDOW = ("09:15:05", "15:39:30")
+DEFAULT_ENTRY_TIME = "09:16:00"
+DEFAULT_EXIT_TIME = "15:30:00"
 
 SUPPORTED_STRATEGY_TYPES = ("intraday", "sequential", "btst", "positional")
 MULTIDAY_TYPES = ("btst", "positional")
