@@ -20,8 +20,7 @@ EXIT_TIME_RANGE = (parse_hms(EXIT_TIME_WINDOW[0]), parse_hms(EXIT_TIME_WINDOW[1]
 
 
 def _secs(strategy: dict, key: str) -> int:
-    return parse_hms(strategy.get(f"{key}_time") or ("09:30:00" if key == "entry" else "15:15:00")) \
-        + int(strategy.get(f"{key}_delay") or 0) * 60
+    return parse_hms(strategy[f"{key}_time"]) + int(strategy.get(f"{key}_delay") or 0) * 60
 
 logger = get_logger(__name__)
 
@@ -102,10 +101,11 @@ class LiveTradeService:
             raise LiveValidationError("Only cash strategies can be traded live")
         if not legs:
             raise LiveValidationError("Strategy has no selected legs")
-        if stype == "intraday" and parse_hms(strategy.get("exit_time", "15:15:00")) <= parse_hms(strategy.get("entry_time", "09:30:00")):
+        entry_clock, exit_clock = parse_hms(strategy["entry_time"]), parse_hms(strategy["exit_time"])
+        if stype == "intraday" and exit_clock <= entry_clock:
             raise LiveValidationError("exit_time must be after entry_time")
         if settings is not None and settings.strategy_execution_time:
-            entry_secs = parse_hms(strategy.get("entry_time", "09:30:00")) + int(strategy.get("entry_delay") or 0) * 60
+            entry_secs = _secs(strategy, "entry")
             try:
                 exec_secs = parse_hms(settings.strategy_execution_time)
             except (ValueError, IndexError):
@@ -125,7 +125,7 @@ class LiveTradeService:
             exit_day = int(strategy.get("positional_exit_day") or 0)
             if entry_day < exit_day:
                 raise LiveValidationError("positional_entry_day must be >= positional_exit_day (days before expiry)")
-            if entry_day == exit_day and parse_hms(strategy.get("exit_time", "15:15:00")) <= parse_hms(strategy.get("entry_time", "09:30:00")):
+            if entry_day == exit_day and exit_clock <= entry_clock:
                 raise LiveValidationError("positional entry and exit fall on the same day: exit_time must be after entry_time")
 
         def check_leg(leg: dict, label: str, nested: bool = False):
@@ -142,8 +142,7 @@ class LiveTradeService:
                     raise LiveValidationError(f"{label}: range_end_time is required for range breakout")
                 if str(leg.get("range_breakout_type") or "instrument").lower() not in ("instrument", "underlying"):
                     raise LiveValidationError(f"{label}: range_breakout_type must be instrument or underlying")
-                if stype in ("intraday", "sequential") and \
-                        parse_hms(leg["range_end_time"]) <= parse_hms(strategy.get("entry_time", "09:30:00")):
+                if stype in ("intraday", "sequential") and parse_hms(leg["range_end_time"]) <= entry_clock:
                     raise LiveValidationError(
                         f"{label}: range_end_time {leg['range_end_time']} must be after entry_time "
                         f"{strategy.get('entry_time')} -- the range is built between the two")
@@ -269,7 +268,6 @@ class LiveTradeService:
             raise LiveValidationError("Exit time must be after the entry time")
         if exit_date == today and secs_now() >= exit_secs:
             raise LiveValidationError(f"Exit time {strategy.get('exit_time')} has already passed today")
-        # DTE mode is judged by the worker (it needs the expiry calendar); weekdays here
         if settings.execution_days_mode == "weekdays" and weekday_code(entry_date) not in settings.execution_days:
             raise LiveValidationError(f"{weekday_code(entry_date)} is not in the strategy's execution days {list(settings.execution_days)}")
         # A still-active deployment that ends on/before the new entry day is a predecessor: the

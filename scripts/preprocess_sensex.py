@@ -87,7 +87,8 @@ def build_datetime(df: pd.DataFrame) -> pd.Series:
     close price actually exists. This makes every engine time comparison
     look-ahead free: 'entry 09:20' acts on the candle completed at 09:19:59,
     'exit 15:15' on the candle completed at 15:14:59. Session labels run
-    09:16:00-15:30:00. All timestamps are IST wall-clock; the column is
+    09:16:00-15:30:00 (15:40:00 since the 2026-08-03 close extension). All
+    timestamps are IST wall-clock; the column is
     named datetime_utc because the backtest engine expects that name."""
     time_map = {
         t: pd.Timedelta(hours=t.hour, minutes=t.minute + 1)

@@ -53,7 +53,7 @@ from src.live.timeutil import (
 
 logger = get_logger(__name__)
 
-LAST_EXIT_SECS = MARKET_CLOSE_SECS - 30           # never plan an exit after 15:29:30
+LAST_EXIT_SECS = MARKET_CLOSE_SECS - 30           # never plan an exit later than 30 s before the close (15:39:30)
 RESTART_EARLIEST_SECS = MARKET_OPEN_SECS + 5
 
 
@@ -182,7 +182,7 @@ class DeploymentRunner:
         self.is_positional = self.strategy_type.startswith("positional")
         self.is_btst = self.strategy_type == "btst"
         self.is_multiday = self.is_btst or self.is_positional
-        self.entry_secs = parse_hms(self.strategy.get("entry_time", "09:30:00")) \
+        self.entry_secs = parse_hms(self.strategy["entry_time"]) \
             + int(self.strategy.get("entry_delay") or 0) * 60
         # Strategy execution time: advance the entry by up to 59 s (AlgoTest rule).
         # "Delay entry by" is applied per leg when its order is placed.
@@ -198,7 +198,7 @@ class DeploymentRunner:
                 self._exec_time_note = (f"strategy_execution_time {self.settings.strategy_execution_time} ignored: it must be "
                                         f"within 59 s before the entry time {hms(self.entry_secs)}")
         self._leg_settings: dict[int, ExecutionSettings] = {}
-        self.exit_secs = min(parse_hms(self.strategy.get("exit_time", "15:15:00"))
+        self.exit_secs = min(parse_hms(self.strategy["exit_time"])
                              + int(self.strategy.get("exit_delay") or 0) * 60, LAST_EXIT_SECS)
         self.entry_dt = at(self.trade_date, self.entry_secs)
         self.exit_dt = at(self.exit_date, self.exit_secs)
@@ -754,7 +754,7 @@ class DeploymentRunner:
             await self.squareoff("resume after exit time")
             return
         if not is_trading_day(now.date()) or not (MARKET_OPEN_SECS <= secs_now() < MARKET_CLOSE_SECS):
-            raise ValueError("market is closed -- Resume between 09:15 and 15:30 on a trading day")
+            raise ValueError(f"market is closed -- Resume between {hms(MARKET_OPEN_SECS)[:5]} and {hms(MARKET_CLOSE_SECS)[:5]} on a trading day")
         deadline = min(now + timedelta(seconds=self.RESUME_RETRY_SECS), at(now.date(), MARKET_CLOSE_SECS), self.exit_dt)
         retry, self.failed_legs = self.failed_legs, []
         self._resuming, self._resume_until = True, deadline
