@@ -254,6 +254,8 @@ class SaveStrategyService:
                     exit_delay,
                     is_delay_restart,
                     delay_restart_time,
+                    is_stop_monitoring,
+                    stop_monitoring_time,
                     positional_expire_on,
                     positional_entry_day,
                     positional_exit_day,
@@ -280,7 +282,7 @@ class SaveStrategyService:
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 RETURNING id;
             """
@@ -305,6 +307,8 @@ class SaveStrategyService:
                     strategy["exit_delay"],
                     strategy.get("is_delay_restart", False),
                     strategy.get("delay_restart_time"),
+                    strategy.get("is_stop_monitoring", False),
+                    strategy.get("stop_monitoring_time") or None,
                     strategy.get("positional_expire_on"),
                     strategy.get("positional_entry_day"),
                     strategy.get("positional_exit_day"),

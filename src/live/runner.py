@@ -22,7 +22,11 @@ Feature parity with the backtest engine, same rules, live prices:
   * overall SL / target / trailing on combined MTM, overall re-entry
     RE_ASAP / RE_MOMENTUM (+REVERSE, flipping the side held at the breach);
   * BTST / positional carry days: monitoring resumes at delay_restart_time
-    when is_delay_restart is on; square-off at exit_time on exit_date.
+    when is_delay_restart is on; square-off at exit_time on exit_date;
+  * stop monitoring (is_stop_monitoring + stop_monitoring_time): from that
+    clock time to the end of each day nothing is monitored and nothing
+    enters; resting / open orders are cancelled, waits sleep until the next
+    carry day's restart; open legs exit at exit_time.
 
 Price-driven work happens inside feed callbacks on the event loop; order
 placement runs in tasks so a slow broker never blocks a tick. Persistence
@@ -206,6 +210,10 @@ class DeploymentRunner:
         self.delay_restart_secs = None
         if self.is_multiday and self.strategy.get("is_delay_restart") and self.strategy.get("delay_restart_time"):
             self.delay_restart_secs = parse_hms(self.strategy["delay_restart_time"])
+        self.stop_secs = None
+        if self.strategy.get("is_stop_monitoring") and self.strategy.get("stop_monitoring_time"):
+            self.stop_secs = parse_hms(self.strategy["stop_monitoring_time"])
+        self._stopped_on: date | None = None      # the day whose stop-monitoring clean-up already ran
 
         self.status: str = dep["status"]
         self.status_reason: str | None = dep.get("status_reason")
@@ -440,6 +448,8 @@ class DeploymentRunner:
             "trade_date": str(self.trade_date), "exit_date": str(self.exit_date),
             "cycle_expiry": str(self.cycle_expiry) if self.cycle_expiry else None,
             "entry_time": hms(self.entry_secs), "exit_time": hms(self.exit_secs),
+            "stop_monitoring_time": hms(self.stop_secs) if self.stop_secs is not None else None,
+            "monitoring_stopped": self._monitoring_stopped(),
             "realised_pnl": round(self.realised, 2), "unrealised_pnl": round(unreal, 2),
             "mtm": round(self.realised + unreal, 2), "legs": legs, "updated": self.updated,
             "last_unpaused": self.last_unpaused.strftime("%Y-%m-%d %H:%M:%S") if self.last_unpaused else None,
@@ -755,6 +765,8 @@ class DeploymentRunner:
             return
         if not is_trading_day(now.date()) or not (MARKET_OPEN_SECS <= secs_now() < MARKET_CLOSE_SECS):
             raise ValueError(f"market is closed -- Resume between {hms(MARKET_OPEN_SECS)[:5]} and {hms(MARKET_CLOSE_SECS)[:5]} on a trading day")
+        if self._monitoring_stopped():
+            raise ValueError(f"stop monitoring time {hms(self.stop_secs)[:5]} has passed -- no entry for the rest of the day")
         deadline = min(now + timedelta(seconds=self.RESUME_RETRY_SECS), at(now.date(), MARKET_CLOSE_SECS), self.exit_dt)
         retry, self.failed_legs = self.failed_legs, []
         self._resuming, self._resume_until = True, deadline
@@ -819,6 +831,10 @@ class DeploymentRunner:
         if self._squaring or now_ist() >= self.exit_dt:
             leg.status, leg.error = "skipped", "exit time reached before entry"
             return
+        if self._monitoring_stopped():                           # AlgoTest: no entry after the stop monitoring time
+            leg.status, leg.error = "skipped", f"stop monitoring time {hms(self.stop_secs)} reached before entry"
+            self._event(f"Leg {leg.leg_number}: {leg.error}", "warn")
+            return
         if self.halted and leg.entry_mode != "RESUME":          # AlgoTest: no leg is fired while in error
             leg.status, leg.error = "error", "strategy in error -- not fired; Resume retries it"
             leg.live_leg_id = await asyncio.to_thread(store.insert_leg, self._leg_row(leg))
@@ -865,6 +881,11 @@ class DeploymentRunner:
         upd = await self._await_fill(leg, app_id, payload, convert,
                                      ls.entry_limit_buffer, ls.buffer_kind("entry"), order_type, timeout=timeout)
         if upd is None or upd.status != "Filled" or upd.filled_qty <= 0:
+            if self._monitoring_stopped():                       # cancelled by _stop_monitoring_today: not an error
+                leg.status, leg.error = "skipped", f"entry order cancelled at the stop monitoring time {hms(self.stop_secs)}"
+                self._event(f"Leg {leg.leg_number}: {leg.error}", "warn")
+                self._persist_leg(leg)
+                return
             reason = (upd.reason if upd else "") or (f"not filled within {int(timeout or self.ORDER_TIMEOUT_SECS)}s" if upd is None
                                                     else upd.status.lower())
             leg.status, leg.error = "error", f"entry {reason}"
@@ -1062,11 +1083,20 @@ class DeploymentRunner:
         self.db.submit(store.upsert_wait, row)
 
     def _check_waits(self, key: Key, price: float, ts: float):
-        if not self._waiting or self._squaring or self.paused or not self._gate_open():
+        if not self._waiting or self._squaring or self.paused:
             return
+        can_fire = self._gate_open()
         now = now_ist()
         for leg in list(self._waiting):
             if leg.watch_key != key or leg.status != "waiting":
+                continue
+            if leg.wait == "range" and now <= leg.range_end_dt:
+                leg.range_hi = price if leg.range_hi is None else max(leg.range_hi, price)
+                leg.range_lo = price if leg.range_lo is None else min(leg.range_lo, price)
+                if ts - leg.wait_saved_at >= self.WAIT_SAVE_EVERY_SECS:
+                    self._persist_wait(leg, "waiting")
+                continue
+            if not can_fire:
                 continue
             if leg.wait_deadline and now >= leg.wait_deadline:
                 self._waiting.remove(leg)
@@ -1080,12 +1110,6 @@ class DeploymentRunner:
             elif leg.wait == "cost":
                 hit = price >= leg.trigger if leg.trigger_up else price <= leg.trigger
             elif leg.wait == "range":
-                if now <= leg.range_end_dt:
-                    leg.range_hi = price if leg.range_hi is None else max(leg.range_hi, price)
-                    leg.range_lo = price if leg.range_lo is None else min(leg.range_lo, price)
-                    if ts - leg.wait_saved_at >= self.WAIT_SAVE_EVERY_SECS:
-                        self._persist_wait(leg, "waiting")
-                    continue
                 if leg.range_hi is None:
                     continue
                 hit = price >= leg.range_hi if leg.range_high_side else price <= leg.range_lo
@@ -1246,9 +1270,16 @@ class DeploymentRunner:
         self._listening.clear()
         self._armed = False
 
+    def _monitoring_stopped(self) -> bool:
+        """Past stop_monitoring_time for today: no SL / target / trailing / overall check,
+        no entry or re-entry until the next trading day (AlgoTest 'Stop Monitoring After')."""
+        return self.stop_secs is not None and secs_now() >= self.stop_secs
+
     def _gate_open(self) -> bool:
-        """Carry days of a BTST / positional hold: monitoring resumes at
-        delay_restart_time when is_delay_restart is on (else at the open)."""
+        """Monitoring is on: not past today's stop-monitoring time and, on the
+        carry days of a BTST / positional hold, past the open or delay_restart_time."""
+        if self._monitoring_stopped():
+            return False
         if not self.is_multiday:
             return True
         today = today_ist()
@@ -1409,7 +1440,8 @@ class DeploymentRunner:
         await self._squareoff_all(reason)
         if not self.active:                # a manual square-off finished the deployment meanwhile
             return
-        if self._overall_reentry_left > 0 and now_ist() < self.exit_dt - timedelta(seconds=self.REENTRY_CUTOFF_SECS):
+        if self._overall_reentry_left > 0 and not self._monitoring_stopped() \
+                and now_ist() < self.exit_dt - timedelta(seconds=self.REENTRY_CUTOFF_SECS):
             self._overall_reentry_left -= 1
             self._event(f"Overall re-entry {self._overall_mode} ({self._overall_reentry_left} left)")
             self._squaring = False
@@ -1557,6 +1589,7 @@ class DeploymentRunner:
         lists StopLimit; otherwise the stop stays in software."""
         ls = self._ls(leg.leg_number)
         return (leg.sl is not None and leg.status == "open" and not leg.sl_order_id
+                and not self._monitoring_stopped()           # past the stop monitoring time: no resting stop today
                 and str(leg.meta.get("stoploss_type") or "POINTS").upper() in PREMIUM_TYPES
                 and ls.exit_order_type == "LIMIT"            # MPP exits: AlgoTest keeps the stop in software, no SL-L / buffers
                 and ls.sl_order_at_broker                    # premium stops are tick-judged in BOTH monitoring modes
@@ -1664,7 +1697,7 @@ class DeploymentRunner:
         m = leg.meta
         mode = str(m.get("reentry_sl_type" if reason == "stoploss" else "reentry_target_type") or "").upper()
         left = leg.reentry_sl_left if reason == "stoploss" else leg.reentry_tgt_left
-        if left <= 0 or not mode or self.paused or self._squaring or self.halted \
+        if left <= 0 or not mode or self.paused or self._squaring or self.halted or self._monitoring_stopped() \
                 or now_ist() >= self.exit_dt - timedelta(seconds=self.REENTRY_CUTOFF_SECS):
             return
         sl_left = leg.reentry_sl_left - (1 if reason == "stoploss" else 0)
@@ -1713,6 +1746,9 @@ class DeploymentRunner:
                 await self._squareoff_all("exit_time")
                 self._finish("squared_off", "exit_time")
                 break
+            if self.stop_secs is not None and self._stopped_on != now.date() and secs_now() >= self.stop_secs:
+                self._stopped_on = now.date()
+                await self._stop_monitoring_today()
             if self.is_multiday and not self.paused and now.date() < self.exit_date and secs_now() >= OVERNIGHT_PAUSE_SECS:
                 await self._pause_overnight()
             if self.mode == "live" and time.time() - self._last_reconcile >= self.RECONCILE_EVERY_SECS \
@@ -1728,6 +1764,42 @@ class DeploymentRunner:
                 self._finish("completed", "all legs closed")
                 break
             await asyncio.sleep(min(1.0, max(0.05, (self.exit_dt - now).total_seconds())))
+
+    async def _stop_monitoring_today(self):
+        """AlgoTest 'Stop Monitoring After' (once per day, from _monitor_until_exit): the
+        resting SL-L orders and any open entry order are cancelled; _gate_open is closed
+        for the rest of the day, so no stop / target / trailing / overall check and no
+        (re-)entry fires. Waiting legs (momentum / range / at-cost, deferred candle-close
+        actions) stay armed but asleep: on a BTST / positional carry day they resume on
+        the first tick after the restart, an intraday one is skipped at exit_time as usual.
+        Open legs stay as they are and still square off at exit_time; the morning restart
+        (_go_live) puts the SL-L orders back."""
+        cancelled = []
+        for leg in self.legs:
+            if leg.status == "open" and leg.sl_order_id:
+                try:
+                    await self.broker.cancel(leg.sl_order_id, "")
+                except XTSError as e:
+                    self._event(f"Leg {leg.leg_number}: SL-L order {leg.sl_order_id} could not be cancelled ({e}) "
+                                f"-- cancel it at the {self.venue}", "warn")
+                leg.sl_order_id = leg.sl_payload = None
+                self._persist_leg(leg)
+                cancelled.append(leg.leg_number)
+            elif leg.status == "entering" and leg.entry_order_id:
+                try:
+                    await self.broker.cancel(leg.entry_order_id, leg.entry_payload.get("orderUniqueIdentifier", ""))
+                except XTSError:
+                    pass                                # _place_entry books the outcome as skipped
+        asleep = [l.leg_number for l in self._waiting if l.status == "waiting"]
+        detail = []
+        if cancelled:
+            detail.append(f"SL-L order(s) of leg(s) {', '.join(map(str, cancelled))} cancelled")
+        if asleep:
+            detail.append(f"pending entry of leg(s) {', '.join(map(str, asleep))} "
+                          + ("resumes after the restart" if self.is_multiday and today_ist() < self.exit_date else "is void"))
+        self._event(f"Stop monitoring time {hms(self.stop_secs)} reached -- no stop-loss / target / entry "
+                    f"monitoring for the rest of the day; open position exits at {hms(self.exit_secs)} on {self.exit_date}"
+                    + (" (" + "; ".join(detail) + ")" if detail else ""), "warn")
 
     async def _restore(self):
         rows = await asyncio.to_thread(store.list_legs, self.id)

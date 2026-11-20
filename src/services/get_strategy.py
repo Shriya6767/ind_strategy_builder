@@ -47,6 +47,8 @@ class GetStrategyService:
                 exit_delay,
                 is_delay_restart,
                 delay_restart_time,
+                is_stop_monitoring,
+                stop_monitoring_time,
                 positional_expire_on,
                 positional_entry_day,
                 positional_exit_day,
@@ -261,6 +263,8 @@ class GetStrategyService:
             "exit_delay": v(row, "exit_delay", int, 0),
             "is_delay_restart": v(row, "is_delay_restart", bool, False),
             "delay_restart_time": v(row, "delay_restart_time", str),
+            "is_stop_monitoring": v(row, "is_stop_monitoring", bool, False),
+            "stop_monitoring_time": v(row, "stop_monitoring_time", str),
 
             "positional_expire_on": v(row, "positional_expire_on", str),
             "positional_entry_day": v(row, "positional_entry_day", int),
