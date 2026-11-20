@@ -104,6 +104,17 @@ class LiveTradeService:
         entry_clock, exit_clock = parse_hms(strategy["entry_time"]), parse_hms(strategy["exit_time"])
         if stype == "intraday" and exit_clock <= entry_clock:
             raise LiveValidationError("exit_time must be after entry_time")
+        if strategy.get("is_stop_monitoring"):
+            if not strategy.get("stop_monitoring_time"):
+                raise LiveValidationError("stop_monitoring_time is required when is_stop_monitoring is on")
+            try:
+                stop_clock = parse_hms(strategy["stop_monitoring_time"])
+            except (ValueError, IndexError):
+                raise LiveValidationError("stop_monitoring_time must be HH:MM:SS")
+            if stop_clock <= entry_clock:
+                raise LiveValidationError("stop_monitoring_time must be after entry_time")
+            if stype in ("intraday", "sequential") and stop_clock >= exit_clock:
+                raise LiveValidationError("stop_monitoring_time must be before exit_time")
         if settings is not None and settings.strategy_execution_time:
             entry_secs = _secs(strategy, "entry")
             try:

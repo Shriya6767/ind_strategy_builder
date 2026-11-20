@@ -148,6 +148,21 @@ class BacktestEngine:
         # permanently empty.
         self.entry_day_cutoff = self.day1_market_close if self._is_multiday else self.exit_time
 
+        # AlgoTest "Stop Monitoring After" (is_stop_monitoring + stop_monitoring_time T)
+        self.stop_monitoring_secs = None
+        if self.strategy.get("is_stop_monitoring") and self.strategy.get("stop_monitoring_time"):
+            self.stop_monitoring_secs = _parse_hms(self.strategy["stop_monitoring_time"])
+            if self.stop_monitoring_secs <= self.entry_time:
+                raise ValueError(
+                    f"stop_monitoring_time ({_hms(self.stop_monitoring_secs)}) must be after "
+                    f"entry_time ({_hms(self.entry_time)})."
+                )
+            if not self._is_multiday and self.stop_monitoring_secs >= self.exit_time:
+                logger.warning(
+                    f"stop_monitoring_time {_hms(self.stop_monitoring_secs)} is not before exit_time "
+                    f"{_hms(self.exit_time)} -- it has no effect on an intraday strategy."
+                )
+
         # Precompute leg metadata
         self.legs_meta = self._prepare_legs_meta()
         self._lot_size_by_leg = {
@@ -196,6 +211,25 @@ class BacktestEngine:
         if self._is_multiday:
             self.day1_market_close = _session_close(day)
             self.entry_day_cutoff = self.day1_market_close
+
+
+    def _monitor_until(self, cutoff: int) -> int:
+        """Last clock second a day's SL/target/entry scan may look at: the
+        given cutoff, or stop_monitoring_time when that comes first. On a
+        multi-day frame the clock test clips every day at the same time."""
+        stop = self.stop_monitoring_secs
+        return cutoff if stop is None or stop >= cutoff else stop
+
+
+    def _monitored(self, series: pd.DataFrame) -> pd.DataFrame:
+        """The bars a scan may judge -- a leg's SL/target/trailing, or a
+        pending momentum / at-cost / range-breach fill: all of them, or only
+        those up to stop_monitoring_time of each day. On a multi-day series
+        the clock test drops the tail of every day, so a wait pending at T
+        simply resumes on the next day's first monitored bar."""
+        if self.stop_monitoring_secs is None or series.empty:
+            return series
+        return series.loc[series["trade_time"].to_numpy() <= self.stop_monitoring_secs]
 
 
     def _parse_day2_market_open(self) -> int:
@@ -827,11 +861,14 @@ class BacktestEngine:
         hi = scan_dts.searchsorted(exit_cutoff_dt, side="right")
         if lo >= hi:
             return None
-        scan_ref = (rows["underlying_price"] if is_underlying else rows["close"]).to_numpy()[lo:hi]
+        scan = self._monitored(rows.iloc[int(lo):int(hi)])
+        if scan.empty:
+            return None
+        scan_ref = (scan["underlying_price"] if is_underlying else scan["close"]).to_numpy()
         hit = scan_ref >= trigger_price if watch_high else scan_ref <= trigger_price
         if not hit.any():
             return None
-        return rows.iloc[int(lo) + int(hit.argmax())]
+        return scan.iloc[int(hit.argmax())]
 
 
     def _evaluate_leg_exit_positional(self, leg_meta, leg_result, day_df=None):
@@ -869,14 +906,18 @@ class BacktestEngine:
             })
             return leg_result
 
+        # SL/target/trailing judge only the monitored bars (stop monitoring
+        # clips each day); the exit-time square-off below reads the full series.
+        watched = self._monitored(series)
+
         # first monitored bar of every LATER day: the overnight gap candle.
+        series_dates = watched["trade_date"].to_numpy()
+        day_first = np.empty(len(watched), dtype=bool)
+        if len(watched):
+            day_first[0] = series_dates[0] != entry_d64
+            day_first[1:] = series_dates[1:] != series_dates[:-1]
 
-        series_dates = series["trade_date"].to_numpy()
-        day_first = np.empty(len(series), dtype=bool)
-        day_first[0] = series_dates[0] != entry_d64
-        day_first[1:] = series_dates[1:] != series_dates[:-1]
-
-        hit = self._check_sl_target_hit(leg_meta, leg_result, series, day_first_mask=day_first)
+        hit = self._check_sl_target_hit(leg_meta, leg_result, watched, day_first_mask=day_first)
         if hit is not None:
             exit_row, exit_reason, exit_fill_price = hit
             leg_result["exit_datetime"] = exit_row["datetime_utc"]
@@ -1477,7 +1518,7 @@ class BacktestEngine:
         ].sort_values("datetime_utc")
 
         if not subset.empty:
-            hit = self._check_sl_target_hit(leg_meta, leg_result, subset)
+            hit = self._check_sl_target_hit(leg_meta, leg_result, self._monitored(subset))
             if hit is not None:
                 exit_row, exit_reason, exit_fill_price = hit
                 leg_result["exit_datetime"] = exit_row["datetime_utc"]
@@ -1521,7 +1562,7 @@ class BacktestEngine:
         subset = day_df.loc[
             (day_df["ticker"] == leg_result["ticker"])
             & (day_df["datetime_utc"] > entry_datetime)
-            & (day_df["trade_time"] <= self.day1_market_close)
+            & (day_df["trade_time"] <= self._monitor_until(self.day1_market_close))
         ].sort_values("datetime_utc")
 
         if subset.empty:
@@ -1610,7 +1651,7 @@ class BacktestEngine:
             leg_result["status"] = "OPEN_NO_EXIT_SIGNAL"
             return leg_result
 
-        hit = self._check_sl_target_hit(leg_meta, leg_result, used_series)
+        hit = self._check_sl_target_hit(leg_meta, leg_result, self._monitored(used_series))
         if hit is not None:
             exit_row, exit_reason, exit_fill_price = hit
             leg_result["exit_datetime"] = exit_row["datetime_utc"]
@@ -2303,7 +2344,7 @@ class BacktestEngine:
             & (day_df["expiration_date"] == reference["expiration_date"])
             & (day_df["datetime_utc"] > snapshot_time)
             & (day_df["datetime_utc"] <= window_end)
-            & (day_df["trade_time"] <= self.entry_day_cutoff)
+            & (day_df["trade_time"] <= self._monitor_until(self.entry_day_cutoff))
             & ((day_df["close"] - premium_value).abs() <= tolerance)
         ]
         if candidates.empty:
@@ -2453,6 +2494,7 @@ class BacktestEngine:
             & (day_df["datetime_utc"] > strike_row["datetime_utc"])
             & (day_df["trade_time"] <= self.entry_day_cutoff)
         ].sort_values("datetime_utc")
+        series = self._monitored(series)
 
         if series.empty:
             return None
@@ -2591,11 +2633,11 @@ class BacktestEngine:
         trade_time = ticker_series["trade_time"]
 
         lo = np.searchsorted(trade_time, range_end, side="right")
-        hi = np.searchsorted(trade_time, self.entry_day_cutoff, side="right")
+        hi = np.searchsorted(trade_time, self._monitor_until(self.entry_day_cutoff), side="right")
         if lo >= hi:
             logger.warning(
                 f"Leg {leg_meta['leg_number']}: no candles available between "
-                f"range_end_time and exit_time for ticker {strike_row['ticker']} -- skipping leg"
+                f"range_end_time and the monitoring cutoff for ticker {strike_row['ticker']} -- skipping leg"
             )
             return None
 
@@ -2669,7 +2711,7 @@ class BacktestEngine:
         scan = next_day_df.loc[
             (next_day_df["ticker"] == ticker)
             & (next_day_df["trade_time"] > range_end)
-            & (next_day_df["trade_time"] <= self.exit_time)
+            & (next_day_df["trade_time"] <= self._monitor_until(self.exit_time))
         ].sort_values("datetime_utc")
         if scan.empty:
             return None
@@ -2736,6 +2778,7 @@ class BacktestEngine:
             & (day_df["datetime_utc"] > prev_result["exit_datetime"])
             & (day_df["trade_time"] <= self.entry_day_cutoff)
         ].sort_values("datetime_utc")
+        series = self._monitored(series)
 
         if series.empty:
             return None
@@ -3187,7 +3230,7 @@ class BacktestEngine:
         subset = day_df.loc[
             (day_df["ticker"].isin(tickers))
             & (day_df["datetime_utc"] >= start_dt)
-            & (day_df["trade_time"] <= cutoff)
+            & (day_df["trade_time"] <= self._monitor_until(cutoff))
         ]
         if subset.empty:
             return None
