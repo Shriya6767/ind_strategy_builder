@@ -1,10 +1,13 @@
 from src.core.modules import pd, np, datetime, date, timedelta
+from src.core import constant
 from src.core.constant import REENTRY_MODES, OVERALL_REENTRY_MODES, QUANTITY, COST_BUFFER_PCT
-from src.core.logger import get_logger
+from src.core.logger import get_logger, OncePerRunFilter
 from src.services.backtesting.report_builder import BacktestReportBuilder
 from enum import Enum
 
 logger = get_logger(__name__)
+_once_per_run = OncePerRunFilter()
+logger.addFilter(_once_per_run)
 
 def _sanitize(obj):
     """Recursively replaces NaN/NaT/np.nan floats with None and formats
@@ -41,6 +44,20 @@ def _secs(t) -> int:
     return t.hour * 3600 + t.minute * 60 + t.second
 
 
+_EXTENDED_FROM = np.datetime64(constant.MARKET_CLOSE_EXTENDED_FROM)
+
+
+def _session_close(day) -> int:
+    """Close of ONE trading day in seconds since midnight: 15:30 before
+    MARKET_CLOSE_EXTENDED_FROM, 15:40 from that session on."""
+    return constant.MARKET_CLOSE_SECS if np.datetime64(day) >= _EXTENDED_FROM else constant.MARKET_CLOSE_SECS_BEFORE
+
+
+def _session_close_of(dates: np.ndarray) -> np.ndarray:
+    """Per-row close for a datetime64 trade_date array (vectorized _session_close)."""
+    return np.where(dates >= _EXTENDED_FROM, constant.MARKET_CLOSE_SECS, constant.MARKET_CLOSE_SECS_BEFORE)
+
+
 def _parse_hms(raw) -> int:
     return _secs(datetime.strptime(str(raw), "%H:%M:%S"))
 
@@ -55,13 +72,17 @@ class BacktestEngine:
     # Sensex session is 09:15-15:30 IST. Bars are labeled by their
     # COMPLETION minute (the 09:15:00-09:15:59 candle is stamped 09:16:00),
     # so labels run 09:16:00-15:30:00. BTST Day-1 monitoring runs until the
-    # close; Day-2 carryover handling starts from the first completed bar.
-    _DEFAULT_DAY1_MARKET_CLOSE = "15:30:00"
-    _DEFAULT_DAY2_MARKET_OPEN = "09:16:00"
+    # close; Day-2 carryover handling starts from the SECOND candle of the day
+    # (label 09:17 = 09:16:00-09:16:59, AlgoTest's "9:16"): the opening candle's
+    # prints are never judged (decided 2026-11-01).
+    _DEFAULT_DAY2_MARKET_OPEN = "09:17:00"
 
     # How old a last traded price may be and still be matched by the
     # premium-based strike criteria. See _recently_priced.
     PREMIUM_MAX_PRICE_AGE_MINUTES = 15
+
+    PREMIUM_MATCH_TOLERANCE = constant.PREMIUM_MATCH_TOLERANCE
+    PREMIUM_MATCH_WAIT_MINUTES = 60
 
     # Sensex options quote in 5-paisa ticks.
     TICK_SIZE = 0.05
@@ -70,6 +91,7 @@ class BacktestEngine:
     _FALLBACK_STRIKE_STEP = 100
 
     def __init__(self, df: pd.DataFrame, request: dict):
+        _once_per_run.reset()
         # Shallow: the engine only replaces datetime_utc and appends
         # trade_date / trade_time (see prepare_dataframe), and pandas'
         # copy-on-write gives those writes their own storage without
@@ -103,11 +125,15 @@ class BacktestEngine:
 
         self.is_delay_restart = bool(self.strategy.get("is_delay_restart"))
         if self._is_multiday:
-            self.day1_market_close = self._parse_day1_market_close()
+            # Day-1 close is PER DAY (15:30 before MARKET_CLOSE_EXTENDED_FROM, 15:40 from it):
+            # _set_day_close(trade_date) refreshes it before each BTST day / positional cycle.
+            # Until then it holds the later close, which also serves as the no-op cutoff for
+            # the already session-masked positional monitor frame.
+            self.day1_market_close = constant.MARKET_CLOSE_SECS
             self.day2_market_open = self._parse_day2_market_open()
             # Delay-restart: when enabled, carry-day monitoring of overnight
-            # positions resumes at delay_restart_time instead of the market
-            # open. Like every other clock time in the engine it is a
+            # positions resumes at delay_restart_time instead of the second
+            # candle. Like every other clock time in the engine it is a
             # completion label: 09:16 means the first candle judged is the
             # one completed at 09:16 (09:15:00-09:15:59). AlgoTest reads its
             # "9:16" as the candle STARTING at 09:16, i.e. our 09:17 -- a
@@ -121,6 +147,21 @@ class BacktestEngine:
         # than entry_time, which would make a `trade_time <= exit_time` scan
         # permanently empty.
         self.entry_day_cutoff = self.day1_market_close if self._is_multiday else self.exit_time
+
+        # AlgoTest "Stop Monitoring After" (is_stop_monitoring + stop_monitoring_time T)
+        self.stop_monitoring_secs = None
+        if self.strategy.get("is_stop_monitoring") and self.strategy.get("stop_monitoring_time"):
+            self.stop_monitoring_secs = _parse_hms(self.strategy["stop_monitoring_time"])
+            if self.stop_monitoring_secs <= self.entry_time:
+                raise ValueError(
+                    f"stop_monitoring_time ({_hms(self.stop_monitoring_secs)}) must be after "
+                    f"entry_time ({_hms(self.entry_time)})."
+                )
+            if not self._is_multiday and self.stop_monitoring_secs >= self.exit_time:
+                logger.warning(
+                    f"stop_monitoring_time {_hms(self.stop_monitoring_secs)} is not before exit_time "
+                    f"{_hms(self.exit_time)} -- it has no effect on an intraday strategy."
+                )
 
         # Precompute leg metadata
         self.legs_meta = self._prepare_legs_meta()
@@ -139,7 +180,11 @@ class BacktestEngine:
         self._next_day = None            # (date, frame) of the day after the one being processed
         self._day_expiry_map = {}  # expiry_type label -> expiry date, rebuilt per trading day
         self._snapshot_day_df = None     # frame the current chain snapshot was built from
+        self._strike_miss_status = "STRIKE_NOT_FOUND"  # why select_strike last returned None
         self._current_cycle = None       # active positional expiry cycle
+        self._prev_trade_date = {}       # trading date -> the previous one (premium diff)
+        self._premium_diff_cache = {}    # (date, strike, expiry) -> straddle values
+        self._day_candle_cache = {}      # trading date -> (Sensex open, Sensex close)
 
 
     def _parse_entry_time(self) -> int:
@@ -159,8 +204,33 @@ class BacktestEngine:
         return _secs(exit_dt)
 
 
-    def _parse_day1_market_close(self) -> int:
-        return _parse_hms(self._DEFAULT_DAY1_MARKET_CLOSE)
+    def _set_day_close(self, day) -> None:
+        """BTST / positional: point the day-1 close and the entry-day scan
+        cutoff at THIS day's session close (15:30 or 15:40, see _session_close)
+        so SL/target, momentum, range-breakout and entry scans run to the
+        real last candle of the entry day."""
+        if self._is_multiday:
+            self.day1_market_close = _session_close(day)
+            self.entry_day_cutoff = self.day1_market_close
+
+
+    def _monitor_until(self, cutoff: int) -> int:
+        """Last clock second a day's SL/target/entry scan may look at: the
+        given cutoff, or stop_monitoring_time when that comes first. On a
+        multi-day frame the clock test clips every day at the same time."""
+        stop = self.stop_monitoring_secs
+        return cutoff if stop is None or stop >= cutoff else stop
+
+
+    def _monitored(self, series: pd.DataFrame) -> pd.DataFrame:
+        """The bars a scan may judge -- a leg's SL/target/trailing, or a
+        pending momentum / at-cost / range-breach fill: all of them, or only
+        those up to stop_monitoring_time of each day. On a multi-day series
+        the clock test drops the tail of every day, so a wait pending at T
+        simply resumes on the next day's first monitored bar."""
+        if self.stop_monitoring_secs is None or series.empty:
+            return series
+        return series.loc[series["trade_time"].to_numpy() <= self.stop_monitoring_secs]
 
 
     def _parse_day2_market_open(self) -> int:
@@ -180,6 +250,21 @@ class BacktestEngine:
             meta["option_type"] = self._map_option_type(leg)
             if leg.get("is_range_breakout"):
                 meta["_range_end_parsed"] = _parse_hms(leg.get("range_end_time"))
+            if leg.get("is_premium_diff"):
+                mode = str(leg.get("premium_diff_mode") or "").strip().lower()
+                operator = str(leg.get("premium_diff_operator") or "").strip()
+                if mode not in ("open", "close") or operator not in (">=", "<="):
+                    raise ValueError(
+                        f"Leg {index}: premium_diff_mode must be 'open'/'close' and "
+                        f"premium_diff_operator '>='/'<=' (got {mode!r}, {operator!r})."
+                    )
+                meta["premium_diff_mode"] = mode
+                meta["premium_diff_operator"] = operator
+            if leg.get("is_prev_day_candle"):
+                colour = str(leg.get("prev_day_candle") or "").strip().lower()
+                if colour not in ("green", "red"):
+                    raise ValueError(f"Leg {index}: prev_day_candle must be 'green' or 'red' (got {colour!r}).")
+                meta["_prev_day_candle"] = colour
 
             sequential_leg_config = leg.get("sequential_leg")
             if sequential_leg_config:
@@ -322,7 +407,8 @@ class BacktestEngine:
         if self.strategy_type == "btst":
             self._flush_unclosed_final_holds()
             self._regroup_btst_by_entry_date()
-        logger.info("Backtest Completed.")
+        repeats = _once_per_run.repeats()
+        logger.info("Backtest Completed." + (f" {repeats} repeated message(s) not printed." if repeats else ""))
         return _sanitize({
             "trade_results": self.trade_results,
             **BacktestReportBuilder(
@@ -378,22 +464,19 @@ class BacktestEngine:
         # day, and nothing that grows with the years loaded.
         days = iter(grouped)
         current = self._as_day(next(days, None))
-        day_no = 0
         try:
             while current is not None:
                 upcoming = self._as_day(next(days, None))
                 self._next_day = upcoming
                 trade_date, day_df = current
-                day_no += 1
                 self._day_expiry_map = self._build_day_expiry_map(trade_date, day_df)
                 self._snapshot_cache = {}
                 self._reentry_frame_cache = {}
+                self._set_day_close(trade_date)
                 if self.strategy_type == "btst":
                     self.process_day_btst(trade_date, day_df)
                 else:
                     self.process_day_intraday(trade_date, day_df)
-                if day_no % 50 == 0 or day_no == total_days:
-                    logger.info(f"Processed {day_no}/{total_days} trading days (up to {trade_date})")
                 current = upcoming
         finally:
             self._next_day = None
@@ -615,7 +698,9 @@ class BacktestEngine:
                 & (frame["strike"] == strike)
                 & frame["expiration_date"].isin(cycle["expiry_labels"])
             ]
-        rows = rows.loc[rows["trade_time"] <= self.day1_market_close].sort_values("datetime_utc")
+        # each cycle day ends at ITS OWN close (15:30 / 15:40)
+        rows = rows.loc[rows["trade_time"].to_numpy() <= _session_close_of(rows["trade_date"].to_numpy())]
+        rows = rows.sort_values("datetime_utc")
         self._cycle_ticker_cache[key] = rows
         return rows
 
@@ -627,6 +712,7 @@ class BacktestEngine:
         self._underlying_series_cache = None
         self._snapshot_cache = {}
         self._cycle_ticker_cache = {}
+        self._set_day_close(entry_date)
 
         entry_frame = self._cycle_frame(entry_date, entry_date)
         if entry_frame.empty:
@@ -700,7 +786,7 @@ class BacktestEngine:
         dates = frame["trade_date"].to_numpy()
         times = frame["trade_time"].to_numpy()
         entry_date, exit_date = np.datetime64(cycle["entry_date"]), np.datetime64(cycle["exit_date"])
-        in_session = times <= self.day1_market_close
+        in_session = times <= _session_close_of(dates)     # per-day close (15:30 / 15:40)
         if cycle["entry_date"] == cycle["exit_date"]:
             mask = (dates == entry_date) & (times >= self.entry_time) & (times <= self.exit_time)
         else:
@@ -781,11 +867,14 @@ class BacktestEngine:
         hi = scan_dts.searchsorted(exit_cutoff_dt, side="right")
         if lo >= hi:
             return None
-        scan_ref = (rows["underlying_price"] if is_underlying else rows["close"]).to_numpy()[lo:hi]
+        scan = self._monitored(rows.iloc[int(lo):int(hi)])
+        if scan.empty:
+            return None
+        scan_ref = (scan["underlying_price"] if is_underlying else scan["close"]).to_numpy()
         hit = scan_ref >= trigger_price if watch_high else scan_ref <= trigger_price
         if not hit.any():
             return None
-        return rows.iloc[int(lo) + int(hit.argmax())]
+        return scan.iloc[int(hit.argmax())]
 
 
     def _evaluate_leg_exit_positional(self, leg_meta, leg_result, day_df=None):
@@ -823,14 +912,18 @@ class BacktestEngine:
             })
             return leg_result
 
+        # SL/target/trailing judge only the monitored bars (stop monitoring
+        # clips each day); the exit-time square-off below reads the full series.
+        watched = self._monitored(series)
+
         # first monitored bar of every LATER day: the overnight gap candle.
+        series_dates = watched["trade_date"].to_numpy()
+        day_first = np.empty(len(watched), dtype=bool)
+        if len(watched):
+            day_first[0] = series_dates[0] != entry_d64
+            day_first[1:] = series_dates[1:] != series_dates[:-1]
 
-        series_dates = series["trade_date"].to_numpy()
-        day_first = np.empty(len(series), dtype=bool)
-        day_first[0] = series_dates[0] != entry_d64
-        day_first[1:] = series_dates[1:] != series_dates[:-1]
-
-        hit = self._check_sl_target_hit(leg_meta, leg_result, series, day_first_mask=day_first)
+        hit = self._check_sl_target_hit(leg_meta, leg_result, watched, day_first_mask=day_first)
         if hit is not None:
             exit_row, exit_reason, exit_fill_price = hit
             leg_result["exit_datetime"] = exit_row["datetime_utc"]
@@ -1124,10 +1217,18 @@ class BacktestEngine:
 
     def execute_leg(self, leg_meta, entry_snapshot: pd.DataFrame, day_df: pd.DataFrame):
         """Execute entry logic for a single leg. Shared by INTRADAY and BTST."""
-        
+
         sequential_leg_meta = leg_meta.get("_sequential_leg_meta")
         if sequential_leg_meta is not None:
             return self._execute_observation_leg(leg_meta, sequential_leg_meta, entry_snapshot, day_df)
+
+        if leg_meta.get("_prev_day_candle") and not self._prev_day_candle_matches(leg_meta, day_df):
+            return {
+                "leg": leg_meta["leg_number"],
+                "position": leg_meta["position_type"],
+                "option": leg_meta["option_type"],
+                "status": "PREV_DAY_CANDLE_SKIPPED",
+            }
 
         expiry = self._resolve_leg_expiry(leg_meta)
         if expiry is None:
@@ -1166,7 +1267,18 @@ class BacktestEngine:
                 "leg": leg_meta["leg_number"],
                 "position": leg_meta["position_type"],
                 "option": leg_meta["option_type"],
-                "status": "STRIKE_NOT_FOUND",
+                "status": self._strike_miss_status,
+            }
+
+        if leg_meta.get("is_premium_diff") and self._premium_diff_blocks(leg_meta, strike_row):
+            return {
+                "leg": leg_meta["leg_number"],
+                "position": leg_meta["position_type"],
+                "option": leg_meta["option_type"],
+                "ticker": strike_row["ticker"],
+                "strike": strike_row["strike"],
+                "moneyness": strike_row["moneyness"],
+                "status": "PREMIUM_DIFF_SKIPPED",
             }
 
         if leg_meta.get("is_simple_momentum"):
@@ -1201,6 +1313,80 @@ class BacktestEngine:
         )
         entry_result["status"] = "ENTRY_DONE"
         return entry_result
+
+
+    def _premium_diff_blocks(self, leg_meta, strike_row) -> bool:
+        """Premium-diff filter: the selected strike's straddle (CE + PE) on
+        today's FIRST candle (open or close) compared with its value at
+        yesterday's LAST candle close. The leg is skipped when
+        `today <op> yesterday` holds. No data on either day -> enter."""
+        today = pd.Timestamp(strike_row["datetime_utc"]).date()
+        if not self._prev_trade_date:
+            dates = self._trading_dates()
+            self._prev_trade_date = dict(zip(dates[1:], dates))
+        yesterday = self._prev_trade_date.get(today)
+        if yesterday is None:
+            return False
+        strike, expiry = strike_row["strike"], strike_row["expiration_date"]
+        key = (today, strike, expiry)
+        values = self._premium_diff_cache.get(key)
+        if values is None:
+            values = self._premium_diff_values(yesterday, today, strike, expiry)
+            self._premium_diff_cache[key] = values
+        prev_close, first_open, first_close = values
+        if prev_close is None:
+            logger.warning(
+                f"Leg {leg_meta['leg_number']}: premium diff -- no CE+PE bars for strike {strike} "
+                f"on {yesterday}/{today}, entering normally"
+            )
+            return False
+        mode = str(leg_meta.get("premium_diff_mode") or "close").strip().lower()
+        current = first_open if mode == "open" else first_close
+        operator = str(leg_meta.get("premium_diff_operator") or ">=").strip()
+        return current >= prev_close if operator == ">=" else current <= prev_close
+
+
+    def _prev_day_candle_matches(self, leg_meta, day_df) -> bool:
+        """Previous trading day's Sensex candle: green when close >= open, red
+        when close <= open. No previous day in the loaded range -> enter."""
+        today = pd.Timestamp(day_df["datetime_utc"].iloc[0]).date()
+        if not self._prev_trade_date:
+            dates = self._trading_dates()
+            self._prev_trade_date = dict(zip(dates[1:], dates))
+        yesterday = self._prev_trade_date.get(today)
+        if yesterday is None:
+            logger.warning(f"Leg {leg_meta['leg_number']}: no trading day before {today} in the loaded range -- entering normally")
+            return True
+        candle = self._day_candle_cache.get(yesterday)
+        if candle is None:
+            frame = self._cycle_frame(yesterday, yesterday)
+            candle = (float(frame["underlying_open"].iloc[0]), float(frame["underlying_price"].iloc[-1])) if len(frame) else (np.nan, np.nan)
+            self._day_candle_cache[yesterday] = candle
+        day_open, day_close = candle
+        if np.isnan(day_open) or np.isnan(day_close):
+            return True
+        return day_close >= day_open if leg_meta["_prev_day_candle"] == "green" else day_close <= day_open
+
+
+    def _premium_diff_values(self, yesterday, today, strike, expiry):
+        def straddle(date, pick):
+            frame = self._cycle_frame(date, date)
+            rows = frame.loc[(frame["strike"] == strike) & (frame["expiration_date"] == expiry)]
+            total_open = total_close = 0.0
+            for option_type in ("CE", "PE"):
+                side = rows.loc[rows["option_type"] == option_type]
+                if side.empty:
+                    return None
+                bar = side.iloc[pick]
+                total_open += float(bar["open"])
+                total_close += float(bar["close"])
+            return total_open, total_close
+
+        prev = straddle(yesterday, -1)
+        first = straddle(today, 0)
+        if prev is None or first is None:
+            return (None, None, None)
+        return (prev[1], first[0], first[1])
 
 
     @staticmethod
@@ -1270,7 +1456,7 @@ class BacktestEngine:
                 "leg": observation_meta["leg_number"],
                 "position": observation_meta["position_type"],
                 "option": observation_meta["option_type"],
-                "status": "STRIKE_NOT_FOUND",
+                "status": self._strike_miss_status,
             }
 
         trigger_row = self._resolve_observation_trigger(observation_meta, day_df, obs_strike_row)
@@ -1368,7 +1554,7 @@ class BacktestEngine:
         ].sort_values("datetime_utc")
 
         if not subset.empty:
-            hit = self._check_sl_target_hit(leg_meta, leg_result, subset)
+            hit = self._check_sl_target_hit(leg_meta, leg_result, self._monitored(subset))
             if hit is not None:
                 exit_row, exit_reason, exit_fill_price = hit
                 leg_result["exit_datetime"] = exit_row["datetime_utc"]
@@ -1412,7 +1598,7 @@ class BacktestEngine:
         subset = day_df.loc[
             (day_df["ticker"] == leg_result["ticker"])
             & (day_df["datetime_utc"] > entry_datetime)
-            & (day_df["trade_time"] <= self.day1_market_close)
+            & (day_df["trade_time"] <= self._monitor_until(self.day1_market_close))
         ].sort_values("datetime_utc")
 
         if subset.empty:
@@ -1501,7 +1687,7 @@ class BacktestEngine:
             leg_result["status"] = "OPEN_NO_EXIT_SIGNAL"
             return leg_result
 
-        hit = self._check_sl_target_hit(leg_meta, leg_result, used_series)
+        hit = self._check_sl_target_hit(leg_meta, leg_result, self._monitored(used_series))
         if hit is not None:
             exit_row, exit_reason, exit_fill_price = hit
             leg_result["exit_datetime"] = exit_row["datetime_utc"]
@@ -1544,7 +1730,6 @@ class BacktestEngine:
         REMOVED from trade_results entirely, instead of shown as UNCLOSED.
         """
         if not self.held_from_previous_day:
-            logger.info("No unclosed overnight positions at end of backtest")
             return
 
         unresolved_leg_ids = {
@@ -1935,11 +2120,13 @@ class BacktestEngine:
         #   * an intraday gap bar fills at the bar's open, the first print --
         #     matches AlgoTest (verified 47/47 on 2026 underlying stops).
         #   * a BTST position held overnight whose FIRST monitored Day-2
-        #     candle (the market open, or delay_restart_time when
-        #     is_delay_restart is on) opens through its stop or target:
+        #     candle (the second candle of the day, label 09:17, or
+        #     delay_restart_time when is_delay_restart is on) opens through
+        #     its stop or target:
         #       - delay-restart ON : fill at that candle's adverse extreme --
         #         a BUY sells at the low, a SELL buys back at the high.
-        #       - delay-restart OFF: fill at that candle's CLOSE.
+        #       - delay-restart OFF: fill at that candle's OPEN, its first
+        #         print (the 09:16 opening candle is never judged).
         gap_fill = candle_open
         # A carry-day's FIRST monitored candle: BTST identifies it as the
         # first bar of its single Day-2 series; positional monitors many days
@@ -1953,11 +2140,8 @@ class BacktestEngine:
                 and exit_idx == 0
                 and pd.Timestamp(leg_result["entry_datetime"]).date() < exit_row["datetime_utc"].date()
             )
-        if overnight_gap_candle:
-            if self.is_delay_restart:
-                gap_fill = float(low[exit_idx]) if position_type == "BUY" else float(high[exit_idx])
-            else:
-                gap_fill = float(close[exit_idx])
+        if overnight_gap_candle and self.is_delay_restart:
+            gap_fill = float(low[exit_idx]) if position_type == "BUY" else float(high[exit_idx])
 
         if target_hit_mask[exit_idx] and (target_gapped_open or not stoploss_hit_mask[exit_idx]):
             exit_reason = "TARGET_HIT"
@@ -1989,7 +2173,9 @@ class BacktestEngine:
    
     def select_strike(self, leg_meta: dict, leg_chain: pd.DataFrame):
         """Dispatches to the strike-selection function matching
-        strike_criteria."""
+        strike_criteria. A None result means no contract; the reason is left
+        in _strike_miss_status for the caller's status field."""
+        self._strike_miss_status = "STRIKE_NOT_FOUND"
         strike_criteria = leg_meta.get("strike_criteria")
 
         if strike_criteria == "based on points":
@@ -2151,10 +2337,74 @@ class BacktestEngine:
         if leg_chain.empty:
             return None
 
+        premium_value = float(premium_value)
+        tolerance = premium_value * self.PREMIUM_MATCH_TOLERANCE
+
         leg_chain = self._recently_priced(leg_chain, leg_meta)
         premium_distance = (leg_chain["close"] - premium_value).abs()
         closest_index = premium_distance.idxmin()
-        return leg_chain.loc[closest_index]
+        if premium_distance.loc[closest_index] <= tolerance:
+            return leg_chain.loc[closest_index]
+
+        # Nothing priced near the request has printed yet. This is the thin
+        # morning chain: on an expiry day BTST trades NEXT week's series, and
+        # at 09:20 that series may have one or two deep-ITM prints -- on
+        # 2024-05-31 "closest to 40" among {865} bought the 865 contract.
+        # Rather than take whatever exists, wait for a contract within
+        # tolerance to print and enter at that minute (no look-ahead: the
+        # entry is stamped when the price became available).
+        return self._wait_for_premium_match(leg_meta, leg_chain, premium_value, tolerance)
+
+
+    def _wait_for_premium_match(self, leg_meta: dict, leg_chain: pd.DataFrame,
+                                premium_value: float, tolerance: float):
+        """First bar, within PREMIUM_MATCH_WAIT_MINUTES of the entry minute and
+        before the entry-day cutoff, on which a contract of the leg's expiry
+        and type printed within `tolerance` of `premium_value`. Returns that
+        bar as the strike row (its datetime is the entry time), or None with
+        _strike_miss_status = NO_PREMIUM_MATCH.
+
+        One vectorised pass over the day frame, and only on the rare miss
+        path -- the common case returns from the snapshot above untouched.
+        """
+        day_df = self._snapshot_day_df
+        reference = leg_chain.iloc[0]
+        snapshot_time = reference["datetime_utc"]
+        if day_df is None:
+            self._strike_miss_status = "NO_PREMIUM_MATCH"
+            return None
+
+        window_end = snapshot_time + pd.Timedelta(minutes=self.PREMIUM_MATCH_WAIT_MINUTES)
+        candidates = day_df.loc[
+            (day_df["option_type"] == reference["option_type"])
+            & (day_df["expiration_date"] == reference["expiration_date"])
+            & (day_df["datetime_utc"] > snapshot_time)
+            & (day_df["datetime_utc"] <= window_end)
+            & (day_df["trade_time"] <= self._monitor_until(self.entry_day_cutoff))
+            & ((day_df["close"] - premium_value).abs() <= tolerance)
+        ]
+        if candidates.empty:
+            logger.warning(
+                f"Leg {leg_meta['leg_number']}: no {reference['option_type']} on "
+                f"{pd.Timestamp(reference['expiration_date']).date()} printed within "
+                f"{self.PREMIUM_MATCH_TOLERANCE:.0%} of premium {premium_value:g} in the "
+                f"{self.PREMIUM_MATCH_WAIT_MINUTES} min after {_hms(_secs(snapshot_time))} "
+                f"-- NO_PREMIUM_MATCH"
+            )
+            self._strike_miss_status = "NO_PREMIUM_MATCH"
+            return None
+
+        # Earliest qualifying minute; if several contracts qualify on that
+        # minute, the one nearest the request.
+        first_time = candidates["datetime_utc"].min()
+        at_first = candidates.loc[candidates["datetime_utc"] == first_time]
+        row = at_first.loc[(at_first["close"] - premium_value).abs().idxmin()].copy()
+        logger.info(
+            f"Leg {leg_meta['leg_number']}: premium {premium_value:g} not available at "
+            f"{_hms(_secs(snapshot_time))} (nearest {float(leg_chain['close'].loc[(leg_chain['close'] - premium_value).abs().idxmin()]):.2f}); "
+            f"entered {row['ticker']} @ {float(row['close']):.2f} at {_hms(_secs(first_time))}"
+        )
+        return row
 
 
     def _select_strike_premium_range(self, leg_meta: dict, leg_chain: pd.DataFrame):
@@ -2243,9 +2493,6 @@ class BacktestEngine:
 
         return leg_chain.loc[closest_index]
 
-    # ======================================================================
-    # Momentum & Range Breakout
-    # ======================================================================
 
     def _resolve_momentum_fill(self, leg_meta, day_df, strike_row):
         """Strike is already fixed (strike_row, picked at entry_time). Scans
@@ -2283,6 +2530,7 @@ class BacktestEngine:
             & (day_df["datetime_utc"] > strike_row["datetime_utc"])
             & (day_df["trade_time"] <= self.entry_day_cutoff)
         ].sort_values("datetime_utc")
+        series = self._monitored(series)
 
         if series.empty:
             return None
@@ -2421,11 +2669,11 @@ class BacktestEngine:
         trade_time = ticker_series["trade_time"]
 
         lo = np.searchsorted(trade_time, range_end, side="right")
-        hi = np.searchsorted(trade_time, self.entry_day_cutoff, side="right")
+        hi = np.searchsorted(trade_time, self._monitor_until(self.entry_day_cutoff), side="right")
         if lo >= hi:
             logger.warning(
                 f"Leg {leg_meta['leg_number']}: no candles available between "
-                f"range_end_time and exit_time for ticker {strike_row['ticker']} -- skipping leg"
+                f"range_end_time and the monitoring cutoff for ticker {strike_row['ticker']} -- skipping leg"
             )
             return None
 
@@ -2499,7 +2747,7 @@ class BacktestEngine:
         scan = next_day_df.loc[
             (next_day_df["ticker"] == ticker)
             & (next_day_df["trade_time"] > range_end)
-            & (next_day_df["trade_time"] <= self.exit_time)
+            & (next_day_df["trade_time"] <= self._monitor_until(self.exit_time))
         ].sort_values("datetime_utc")
         if scan.empty:
             return None
@@ -2566,6 +2814,7 @@ class BacktestEngine:
             & (day_df["datetime_utc"] > prev_result["exit_datetime"])
             & (day_df["trade_time"] <= self.entry_day_cutoff)
         ].sort_values("datetime_utc")
+        series = self._monitored(series)
 
         if series.empty:
             return None
@@ -2804,8 +3053,9 @@ class BacktestEngine:
             # Positional hands in an already session-masked multi-day frame
             # (entry day from entry_time, carry days from the delay-restart
             # start, exit day up to exit_time), so its time cutoff must be a
-            # no-op -- the frame IS the window. Intraday keeps exit_time.
-            cutoff = self.day1_market_close if self.is_positional else self.exit_time
+            # no-op -- the frame IS the window (the later close bounds every
+            # session). Intraday keeps exit_time.
+            cutoff = constant.MARKET_CLOSE_SECS if self.is_positional else self.exit_time
             return self._run_overall_risk_cycles(
                 day_df, result, active_legs, has_sl, has_target, cutoff=cutoff
             )
@@ -2989,18 +3239,19 @@ class BacktestEngine:
             step_move = instrument_moves
             step_gain = stoploss_moves
         elif trail_sl_type == "PERCENT":
-            step_move = round(sl_threshold * instrument_moves / 100, 2)
-            step_gain = round(sl_threshold * stoploss_moves / 100, 2)
+            step_move = np.round(sl_threshold * instrument_moves / 100, 2)
+            step_gain = np.round(sl_threshold * stoploss_moves / 100, 2)
         else:
             logger.warning(f"Unsupported overall_trail_sl_type '{trail_sl_type}'")
             return sl_threshold
 
-        if not step_move or step_move <= 0:
+        step_move = np.asarray(step_move, dtype=float)
+        if not (step_move > 0).any():
             return sl_threshold
 
         best_so_far = np.maximum.accumulate(combined_mtm)
         favorable_move = np.clip(best_so_far, a_min=0, a_max=None)
-        steps = np.floor(favorable_move / step_move)
+        steps = np.floor(np.divide(favorable_move, step_move, out=np.zeros(len(favorable_move)), where=step_move > 0))
 
         return np.clip(sl_threshold - steps * step_gain, a_min=0, a_max=None)
 
@@ -3015,7 +3266,7 @@ class BacktestEngine:
         subset = day_df.loc[
             (day_df["ticker"].isin(tickers))
             & (day_df["datetime_utc"] >= start_dt)
-            & (day_df["trade_time"] <= cutoff)
+            & (day_df["trade_time"] <= self._monitor_until(cutoff))
         ]
         if subset.empty:
             return None

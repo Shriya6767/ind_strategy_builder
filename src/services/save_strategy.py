@@ -43,6 +43,11 @@ LEG_INSERT_QUERY = """
         range_end_day,
         range_end_time,
         range_on,
+        is_premium_diff,
+        premium_diff_mode,
+        premium_diff_operator,
+        is_prev_day_candle,
+        prev_day_candle,
         version,
         is_lazy_leg,
         is_sequential,
@@ -54,7 +59,7 @@ LEG_INSERT_QUERY = """
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-        %s, %s
+        %s, %s, %s, %s, %s, %s, %s
     )
     RETURNING leg_id;
 """
@@ -113,6 +118,11 @@ def insert_legs(cursor, strategy_id, version, request) -> int:
                 str(leg.get("range_end_day")) if leg.get("range_end_day") is not None else None,
                 leg.get("range_end_time"),
                 leg.get("range_on"),
+                bool(leg.get("is_premium_diff")),
+                leg.get("premium_diff_mode"),
+                leg.get("premium_diff_operator"),
+                bool(leg.get("is_prev_day_candle")),
+                leg.get("prev_day_candle"),
                 version,
                 is_lazy_leg,
                 is_sequential,
@@ -157,6 +167,30 @@ def insert_legs(cursor, strategy_id, version, request) -> int:
     return inserted
 
 
+def clean_name(raw) -> str:
+    """A strategy/portfolio name as stored: stripped, never empty."""
+    name = str(raw or "").strip()
+    if not name:
+        raise ValueError("Name is required.")
+    return name
+
+
+def strategy_name_taken(cursor, user_id: int, name: str, exclude_strategy_id=None) -> bool:
+    """True when the caller already has ANOTHER strategy (any version) with this
+    name, compared case-insensitively. A strategy's own id is excluded so saving
+    a new version or updating it under its current name passes."""
+    cursor.execute(
+        """
+        SELECT 1 FROM strategy
+        WHERE user_id = %s AND lower(trim(strategy_name)) = lower(trim(%s))
+          AND (%s::bigint IS NULL OR strategy_id <> %s)
+        LIMIT 1;
+        """,
+        (user_id, name, exclude_strategy_id, exclude_strategy_id)
+    )
+    return cursor.fetchone() is not None
+
+
 class SaveStrategyService:
     @staticmethod
     def save_strategy(request, user_id: int):
@@ -171,6 +205,13 @@ class SaveStrategyService:
             legs = request["legs"]
 
             strategy_id = strategy.get("strategy_id")
+            try:
+                strategy["strategy_name"] = clean_name(strategy.get("strategy_name"))
+            except ValueError:
+                return {"status": False, "message": "Strategy name is required."}
+            if strategy_name_taken(cursor, user_id, strategy["strategy_name"], strategy_id):
+                return {"status": False, "conflict": True,
+                        "message": f"Strategy name '{strategy['strategy_name']}' already exists. Enter a different name."}
 
             if strategy_id is None:
                 cursor.execute(
@@ -217,6 +258,8 @@ class SaveStrategyService:
                     exit_delay,
                     is_delay_restart,
                     delay_restart_time,
+                    is_stop_monitoring,
+                    stop_monitoring_time,
                     positional_expire_on,
                     positional_entry_day,
                     positional_exit_day,
@@ -243,7 +286,7 @@ class SaveStrategyService:
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 RETURNING id;
             """
@@ -268,6 +311,8 @@ class SaveStrategyService:
                     strategy["exit_delay"],
                     strategy.get("is_delay_restart", False),
                     strategy.get("delay_restart_time"),
+                    strategy.get("is_stop_monitoring", False),
+                    strategy.get("stop_monitoring_time") or None,
                     strategy.get("positional_expire_on"),
                     strategy.get("positional_entry_day"),
                     strategy.get("positional_exit_day"),

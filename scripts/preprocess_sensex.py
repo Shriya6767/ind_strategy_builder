@@ -1,3 +1,5 @@
+#venv/bin/python scripts/preprocess_sensex.py
+
 """One-time batch preprocessor for Sensex 1-min data.
 
 Reads the raw daily spot + F&O parquet files, derives every column the
@@ -85,7 +87,8 @@ def build_datetime(df: pd.DataFrame) -> pd.Series:
     close price actually exists. This makes every engine time comparison
     look-ahead free: 'entry 09:20' acts on the candle completed at 09:19:59,
     'exit 15:15' on the candle completed at 15:14:59. Session labels run
-    09:16:00-15:30:00. All timestamps are IST wall-clock; the column is
+    09:16:00-15:30:00 (15:40:00 since the 2026-08-03 close extension). All
+    timestamps are IST wall-clock; the column is
     named datetime_utc because the backtest engine expects that name."""
     time_map = {
         t: pd.Timedelta(hours=t.hour, minutes=t.minute + 1)
@@ -246,12 +249,16 @@ def main():
             converted += 1
         except Exception as exc:
             failed += 1
+            print(f"  !! {date.date()}: {exc}")
             continue
 
         if converted % 50 == 0:
             rate = converted / (time.perf_counter() - t0)
+            print(f"  ... {converted} days merged ({rate:.1f} days/s)")
 
     elapsed = time.perf_counter() - t0
+    print(f"merged {converted} days in {elapsed:.0f}s; skipped {skipped} already built, "
+          f"{missing_spot} without a spot file, {failed} failed")
     if failed:
         sys.exit(1)
 

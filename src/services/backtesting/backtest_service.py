@@ -1,5 +1,6 @@
 from src.core.data_store import DataStore
 from src.core.config import Database
+from src.services.backtesting.load_data import DataLoader
 from src.core.backtest_result_store import ResultStore, VersionedResultStore
 from src.core.executor import run_backtest_isolated
 from src.services.backtesting.slippage_service import SlippageService
@@ -25,6 +26,7 @@ class BacktestService:
         if strategy_id is None or strategy_id == "":
             raise ValueError("strategy_id can not be empty or null.")
 
+        DataLoader.ensure_range(start_date, end_date)
         lo, hi = DataStore.bounds(start_date, end_date)
         if lo >= hi:
             avail = DataStore.loaded_range

@@ -206,6 +206,8 @@ def save_strategy(request: dict, user=Depends(get_current_user)):
         result = SaveStrategyService.save_strategy(request, user["user_id"])
         if not result["status"] and result.get("not_found"):
             raise HTTPException(status_code=404, detail={"status": False, "message": result["message"]})
+        if not result["status"] and result.get("conflict"):
+            raise HTTPException(status_code=409, detail={"status": False, "message": result["message"]})
         return {
             "status": result["status"],
             "message": "Strategy saved successfully." if result["status"] else result["message"],
@@ -231,7 +233,7 @@ def update_strategy(request: dict, user=Depends(get_current_user)):
         result = UpdateStrategyService.update_strategy(request, user["user_id"])
         if not result["status"]:
             raise HTTPException(
-                status_code=404 if result.get("not_found") else 400,
+                status_code=404 if result.get("not_found") else 409 if result.get("conflict") else 400,
                 detail={"status": False, "message": result["message"]}
             )
         return {
@@ -333,12 +335,16 @@ def save_portfolio(request: dict, user=Depends(get_current_user)):
     try:
         save_portfolio_service = SavePortfolioService()
         result = save_portfolio_service.save_portfolio(request, user["user_id"])
+        if not result["status"] and result.get("conflict"):
+            raise HTTPException(status_code=409, detail={"status": False, "message": result["message"]})
         return {
             "status": result["status"],
             "message": result["message"],
             "portfolio_id": result.get("portfolio_id"),
             "portfolio_name": result.get("portfolio_name")
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Unexpected error in save_portfolio: {e}")
         raise HTTPException(
@@ -375,6 +381,8 @@ def run_portfolio_backtest(request: dict, user=Depends(get_current_user)):
     try:
         portfolio_service = PortfolioBacktestService()
         return ORJSONResponse(portfolio_service.run_portfolio(request, user["user_id"]))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 

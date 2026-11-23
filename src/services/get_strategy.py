@@ -1,6 +1,7 @@
 from psycopg2.extras import RealDictCursor
 from src.core.config import Database
 from src.core.logger import get_logger
+from src.core.constant import DEFAULT_ENTRY_TIME, DEFAULT_EXIT_TIME
 
 logger = get_logger(__name__)
 
@@ -14,7 +15,7 @@ class GetStrategyService:
         Fetch complete strategy data from database by ID and name.
         Args:
             strategy_id: Unique identifier for the strategy
-            strategy_name: Strategy name (used for verification)
+            strategy_name: Strategy name (used for verification; None = match by id + version only)
             version: Strategy version
             user_id: owner; when given, another user's strategy is "not found"
         Returns:
@@ -46,6 +47,8 @@ class GetStrategyService:
                 exit_delay,
                 is_delay_restart,
                 delay_restart_time,
+                is_stop_monitoring,
+                stop_monitoring_time,
                 positional_expire_on,
                 positional_entry_day,
                 positional_exit_day,
@@ -68,9 +71,12 @@ class GetStrategyService:
                 leg_count,
                 version
             FROM strategy
-            WHERE strategy_id = %s AND strategy_name = %s AND version = %s
+            WHERE strategy_id = %s AND version = %s
             """
-            params = [strategy_id, strategy_name, version]
+            params = [strategy_id, version]
+            if strategy_name is not None:
+                strategy_query += " AND strategy_name = %s"
+                params.append(strategy_name)
             if user_id is not None:
                 strategy_query += " AND user_id = %s"
                 params.append(user_id)
@@ -126,6 +132,11 @@ class GetStrategyService:
                 range_end_day,
                 range_end_time,
                 range_on,
+                is_premium_diff,
+                premium_diff_mode,
+                premium_diff_operator,
+                is_prev_day_candle,
+                prev_day_candle,
                 is_lazy_leg,
                 is_sequential,
                 leg_name,
@@ -151,7 +162,7 @@ class GetStrategyService:
                 "success": True,
                 "data": {
                     "strategy_id": strategy_id,
-                    "strategy_name": strategy_name,
+                    "strategy_name": row["strategy_name"],
                     "strategy": strategy_data,
                     "legs": selected_legs,
                     "unselected_legs": unselected_legs
@@ -248,12 +259,14 @@ class GetStrategyService:
             "is_trail_sl_break_even": v(row, "is_trail_sl_break_even", bool, False),
             "trail_sl_break_even_type": v(row, "trail_sl_break_even_type", str, "POINTS"),
             "strategy_type": v(row, "strategy_type", str, "INTRADAY"),
-            "entry_time": v(row, "entry_time", str, "09:30:00"),
+            "entry_time": v(row, "entry_time", str, DEFAULT_ENTRY_TIME),
             "entry_delay": v(row, "entry_delay", int, 0),
-            "exit_time": v(row, "exit_time", str, "15:30:00"),
+            "exit_time": v(row, "exit_time", str, DEFAULT_EXIT_TIME),
             "exit_delay": v(row, "exit_delay", int, 0),
             "is_delay_restart": v(row, "is_delay_restart", bool, False),
             "delay_restart_time": v(row, "delay_restart_time", str),
+            "is_stop_monitoring": v(row, "is_stop_monitoring", bool, False),
+            "stop_monitoring_time": v(row, "stop_monitoring_time", str),
 
             "positional_expire_on": v(row, "positional_expire_on", str),
             "positional_entry_day": v(row, "positional_entry_day", int),
@@ -311,7 +324,9 @@ class GetStrategyService:
             "premium_value": v(row, "premium_value", int, 0),
             "lower_range": v(row, "lower_range", int, 0),
             "upper_range": v(row, "upper_range", int, 0),
-            "multiplier_percentage": v(row, "multiplier_percentage", int, 0),
+            # NUMERIC(10,2) in the DB: int() here truncated 0.5 to 0, so
+            # "ATM + 0.5%" silently resolved to the ATM strike itself.
+            "multiplier_percentage": v(row, "multiplier_percentage", float, 0.0),
 
             "is_target": v(row, "is_target", bool, False),
             "target_type": v(row, "target_type", str, "POINTS"),
@@ -343,6 +358,11 @@ class GetStrategyService:
             "range_end_day": v(row, "range_end_day", str),
             "range_end_time": v(row, "range_end_time", str),
             "range_on": v(row, "range_on"),
+            "is_premium_diff": v(row, "is_premium_diff", bool, False),
+            "premium_diff_mode": v(row, "premium_diff_mode", str, "close"),
+            "premium_diff_operator": v(row, "premium_diff_operator", str, ">="),
+            "is_prev_day_candle": v(row, "is_prev_day_candle", bool, False),
+            "prev_day_candle": v(row, "prev_day_candle", str, "green"),
             "is_lazy_leg": v(row, "is_lazy_leg", bool, False),
             "is_sequential": v(row, "is_sequential", bool, False),
             "leg_name": v(row, "leg_name", str, ""),
