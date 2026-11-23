@@ -184,6 +184,7 @@ class BacktestEngine:
         self._current_cycle = None       # active positional expiry cycle
         self._prev_trade_date = {}       # trading date -> the previous one (premium diff)
         self._premium_diff_cache = {}    # (date, strike, expiry) -> straddle values
+        self._day_candle_cache = {}      # trading date -> (Sensex open, Sensex close)
 
 
     def _parse_entry_time(self) -> int:
@@ -259,6 +260,11 @@ class BacktestEngine:
                     )
                 meta["premium_diff_mode"] = mode
                 meta["premium_diff_operator"] = operator
+            if leg.get("is_prev_day_candle"):
+                colour = str(leg.get("prev_day_candle") or "").strip().lower()
+                if colour not in ("green", "red"):
+                    raise ValueError(f"Leg {index}: prev_day_candle must be 'green' or 'red' (got {colour!r}).")
+                meta["_prev_day_candle"] = colour
 
             sequential_leg_config = leg.get("sequential_leg")
             if sequential_leg_config:
@@ -1211,10 +1217,18 @@ class BacktestEngine:
 
     def execute_leg(self, leg_meta, entry_snapshot: pd.DataFrame, day_df: pd.DataFrame):
         """Execute entry logic for a single leg. Shared by INTRADAY and BTST."""
-        
+
         sequential_leg_meta = leg_meta.get("_sequential_leg_meta")
         if sequential_leg_meta is not None:
             return self._execute_observation_leg(leg_meta, sequential_leg_meta, entry_snapshot, day_df)
+
+        if leg_meta.get("_prev_day_candle") and not self._prev_day_candle_matches(leg_meta, day_df):
+            return {
+                "leg": leg_meta["leg_number"],
+                "position": leg_meta["position_type"],
+                "option": leg_meta["option_type"],
+                "status": "PREV_DAY_CANDLE_SKIPPED",
+            }
 
         expiry = self._resolve_leg_expiry(leg_meta)
         if expiry is None:
@@ -1330,6 +1344,28 @@ class BacktestEngine:
         current = first_open if mode == "open" else first_close
         operator = str(leg_meta.get("premium_diff_operator") or ">=").strip()
         return current >= prev_close if operator == ">=" else current <= prev_close
+
+
+    def _prev_day_candle_matches(self, leg_meta, day_df) -> bool:
+        """Previous trading day's Sensex candle: green when close >= open, red
+        when close <= open. No previous day in the loaded range -> enter."""
+        today = pd.Timestamp(day_df["datetime_utc"].iloc[0]).date()
+        if not self._prev_trade_date:
+            dates = self._trading_dates()
+            self._prev_trade_date = dict(zip(dates[1:], dates))
+        yesterday = self._prev_trade_date.get(today)
+        if yesterday is None:
+            logger.warning(f"Leg {leg_meta['leg_number']}: no trading day before {today} in the loaded range -- entering normally")
+            return True
+        candle = self._day_candle_cache.get(yesterday)
+        if candle is None:
+            frame = self._cycle_frame(yesterday, yesterday)
+            candle = (float(frame["underlying_open"].iloc[0]), float(frame["underlying_price"].iloc[-1])) if len(frame) else (np.nan, np.nan)
+            self._day_candle_cache[yesterday] = candle
+        day_open, day_close = candle
+        if np.isnan(day_open) or np.isnan(day_close):
+            return True
+        return day_close >= day_open if leg_meta["_prev_day_candle"] == "green" else day_close <= day_open
 
 
     def _premium_diff_values(self, yesterday, today, strike, expiry):
